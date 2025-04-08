@@ -1,0 +1,118 @@
+# Security Policy
+
+The Bitcredit team takes security very seriously.
+
+If you believe you have identified a security vulnerability or security related bug please make every effort to contact us privately using one of the contact options below. Please do not open an issue, do not notify us in public, and do not disclose this issue to third parties.
+
+## Reporting a Vulnerability
+
+Several contact options exist however it's important you specifically use a security contact method when reporting a security vulnerability or security related bug. These methods are clearly documented below.
+
+### GitHub Security
+
+Users can utilize GitHub's security vulnerability system to privately [report a vulnerability](https://github.com/BitcreditProtocol/.github/security/advisories/new
+).
+
+### Email
+
+Users can utilize the [security@bitcr.org](mailto:security@bitcr.org) email address to privately report a vulnerability. 
+
+This email address is only accessible by members of the core team for the purpose of disclosing security vulnerabilities and issues within the code base.
+
+#### PGP
+You can send us PGP-encrypted email using the following PGP public key:
+
+https://keys.openpgp.org/search?q=security@bitcr.org
+
+
+KEY ID: [71B3AD6F47D571E7](https://keys.openpgp.org/search?q=71B3AD6F47D571E7)
+
+```
+3D7B 65CC 3D73 4BF5 EEE6  BC52 71B3 AD6F 47D5 71E7
+```
+
+
+
+```
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+Comment: 3D7B 65CC 3D73 4BF5 EEE6  BC52 71B3 AD6F 47D5 71E7
+Comment: bugbounty bitcr <bugbounty@bitcr.org>
+Comment: security@bitcr.org <security@bitcr.org>
+
+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
+G8ZG0pF+h5bD3w==
+=qx0C
+-----END PGP PUBLIC KEY BLOCK-----
+```
