@@ -7,7 +7,7 @@ so creating or archiving a repository needs no change here.
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
-| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE, `dependabot.yml`, empty wikis, security configuration |
+| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE, `dependabot.yml`, empty wikis, security configuration, open Dependabot alerts |
 
 Both accept a `dry_run` input on manual runs, which prints the intended changes
 without writing anything.
@@ -49,6 +49,7 @@ permissions, install it on **all** repositories, then record its credentials:
 | Issues | **write** | creating and updating labels |
 | Administration | **write** | setting topics |
 | Contents | read | detecting `LICENSE` and `dependabot.yml` |
+| Dependabot alerts | read | the open-alert summary |
 
 - organisation **variable** `AUTOMATION_APP_ID` — the App's numeric ID
 - organisation **secret** `AUTOMATION_APP_PRIVATE_KEY` — the App's private key
