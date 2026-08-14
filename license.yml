@@ -1,0 +1,16 @@
+# Who the LICENSE files in this organisation name as the copyright holder.
+#
+# Read by .github/workflows/audit-repo-settings.yml. Nothing is written to any
+# repository from this file — a licence is a legal statement, so the audit
+# reports a mismatch and a human decides. Missing licences are reported by the
+# same job.
+
+holder: Bitcredit Protocol
+
+# Repositories whose LICENSE names someone else, because the code is derived
+# from their project. Rewriting a third party's copyright notice is not ours to
+# do. The expected holder is recorded rather than the repository merely skipped,
+# so that a change to *their* notice is still noticed.
+third_party:
+  - repository: nostr-postgres-db
+    holder: Rust Nostr Developers

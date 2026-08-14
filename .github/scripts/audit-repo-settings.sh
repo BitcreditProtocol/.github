@@ -11,7 +11,8 @@
 # itself and an archived one drops out.
 #
 # Env: ORG (required), GH_TOKEN (required), BASELINE_CONFIG (required),
-#      DRY_RUN (default false)
+#      DRY_RUN (default false), LICENSE_JSON (optional, skips the yaml
+#      conversion — used when testing)
 
 set -eu
 
@@ -25,6 +26,13 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+if [ -n "${LICENSE_JSON:-}" ]; then
+  cp "$LICENSE_JSON" "$WORK/license.json"
+else
+  yq -o=json '.' "$(dirname "$0")/../../license.yml" > "$WORK/license.json"
+fi
+HOLDER=$(jq -r '.holder' "$WORK/license.json")
 
 gh api "orgs/$ORG/repos?per_page=100" --paginate --slurp > "$WORK/repos.json"
 jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WORK/repos"
@@ -70,8 +78,20 @@ while IFS= read -r repo; do
   [ "$(echo "$meta" | jq -r '.description // ""')" = "" ] &&
     echo "$repo|no description" >> "$WORK/findings"
 
-  gh api "repos/$ORG/$repo/license" >/dev/null 2>&1 ||
+  # LICENSE: present at all, and naming the holder we expect
+  if ! gh api "repos/$ORG/$repo/license" --jq '.content' 2>/dev/null | base64 -d > "$WORK/lic" 2>/dev/null \
+     || [ ! -s "$WORK/lic" ]; then
     echo "$repo|no LICENSE ($(echo "$meta" | jq -r .visibility))" >> "$WORK/findings"
+  else
+    line=$(grep -i -m1 '^copyright' "$WORK/lic" || true)
+    expected=$(jq -r --arg r "$repo" '.third_party // [] | map(select(.repository == $r)) | .[0].holder // ""' "$WORK/license.json")
+    [ -n "$expected" ] || expected="$HOLDER"
+    case "$line" in
+      *"$expected"*) : ;;
+      "") echo "$repo|LICENSE has no copyright line" >> "$WORK/findings" ;;
+      *)  echo "$repo|LICENSE names '${line#*) }' — expected '$expected'" >> "$WORK/findings" ;;
+    esac
+  fi
 
   gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" >/dev/null 2>&1 ||
     echo "$repo|no .github/dependabot.yml" >> "$WORK/findings"
