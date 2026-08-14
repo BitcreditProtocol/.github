@@ -7,7 +7,7 @@ so creating or archiving a repository needs no change here.
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
-| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE, `dependabot.yml`, empty wikis, security configuration, open Dependabot alerts |
+| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE and its copyright holder, `dependabot.yml`, empty wikis, security configuration, open Dependabot alerts |
 
 Both accept a `dry_run` input on manual runs, which prints the intended changes
 without writing anything.
@@ -60,6 +60,17 @@ on selected repositories rather than all of them.
 
 Prefer this App over the long-lived `FE_REPO_ACCESS_PAT` organisation secret —
 App tokens expire after an hour and are scoped per run.
+
+## Editing the licence expectations
+
+`license.yml` at the repository root names the copyright holder every LICENSE
+should carry, and records the repositories that legitimately carry someone
+else's because the code is derived from their project.
+
+Those exceptions record the *expected* third-party holder rather than merely
+skipping the repository, so a change to their notice is still noticed. Nothing
+is ever written to a LICENSE from here — a licence is a legal statement, so a
+mismatch is reported and a human decides.
 
 ## Editing the label set
 
