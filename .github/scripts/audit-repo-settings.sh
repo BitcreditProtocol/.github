@@ -91,6 +91,28 @@ while IFS= read -r repo; do
     echo "$repo|security configuration is '$attached', expected '$BASELINE_CONFIG'" >> "$WORK/findings"
 done < "$WORK/repos"
 
+# Dependabot backlog. Not drift, so it is reported rather than counted as a
+# finding — alerts come and go with upstream advisories and would keep the issue
+# open forever. Needs the App's "Dependabot alerts: read"; if that is ever
+# withdrawn the section says so instead of failing the whole audit.
+if gh api "orgs/$ORG/dependabot/alerts?state=open&per_page=100" --paginate --slurp > "$WORK/alerts.json" 2>/dev/null \
+   && jq -e 'type == "array"' "$WORK/alerts.json" >/dev/null 2>&1; then
+  jq -r '[.[][]] as $a
+    | if ($a|length) == 0 then "No open Dependabot alerts."
+      else
+        "- open alerts: **\($a|length)** — "
+        + ([$a[].security_advisory.severity] | group_by(.)
+           | sort_by(-length) | map("\(.[0]) \(length)") | join(" · "))
+        + "\n- with a published fix: **\([$a[] | select(.security_vulnerability.first_patched_version != null)] | length)**"
+        + " — merging Dependabot'"'"'s pull requests clears those\n\n"
+        + "| repository | alerts |\n| --- | --- |\n"
+        + ([$a[].repository.name] | group_by(.) | sort_by(-length)
+           | map("| `\(.[0])` | \(length) |") | join("\n"))
+      end' "$WORK/alerts.json" > "$WORK/dependabot.md"
+else
+  echo "Could not read Dependabot alerts — the App is missing \`Dependabot alerts: read\`." > "$WORK/dependabot.md"
+fi
+
 {
   echo "- repositories audited: **$total**"
   echo "- topics corrected: **$n_topics**"
@@ -104,6 +126,10 @@ done < "$WORK/repos"
   else
     echo "No drift found."
   fi
+  echo
+  echo "### Dependabot"
+  echo
+  cat "$WORK/dependabot.md"
   echo
   if [ -n "${GITHUB_RUN_ID:-}" ]; then
     echo "[Run](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) · reruns every Monday."
