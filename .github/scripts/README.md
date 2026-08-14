@@ -7,7 +7,7 @@ so creating or archiving a repository needs no change here.
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
-| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics | description, LICENSE, `dependabot.yml`, empty wikis, security configuration |
+| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE, `dependabot.yml`, empty wikis, security configuration |
 
 Both accept a `dry_run` input on manual runs, which prints the intended changes
 without writing anything.
@@ -24,7 +24,9 @@ Neither workflow deletes a label. Deleting one strips it from every issue and
 pull request that carries it, and there is no undo. Labels outside the manifest
 are listed in the job summary so a human can decide.
 
-`audit-repo-settings.sh` only writes topics. Everything else it finds is
+`audit-repo-settings.sh` writes only topics and merge settings — every merge
+flag it sets is enabling, so a repository can gain a merge method or branch
+cleanup but never lose one. Everything else it finds is
 reported, because a wiki that looks empty may have been enabled deliberately a
 minute earlier, and a missing LICENSE is a legal decision rather than a setting.
 
