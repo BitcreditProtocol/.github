@@ -31,7 +31,7 @@ jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WO
 total=$(wc -l < "$WORK/repos" | tr -d ' ')
 echo "Auditing $total non-archived repositories (dry_run=$DRY_RUN)"
 
-n_topics=0
+n_topics=0; n_merge=0
 : > "$WORK/findings"
 
 while IFS= read -r repo; do
@@ -50,6 +50,20 @@ while IFS= read -r repo; do
       | jq -Rs 'split("\n") | map(select(length > 0)) | {names: .}' > "$WORK/topics.json"
     [ "$DRY_RUN" = "true" ] || gh api -X PUT "repos/$ORG/$repo/topics" --input "$WORK/topics.json" >/dev/null
     n_topics=$((n_topics + 1))
+  fi
+
+  # --- enforce: merge settings. Every flag here only enables something, so a
+  # repository can gain a merge method or branch cleanup but never lose one.
+  drift=$(echo "$meta" | jq -r '
+    {allow_merge_commit, allow_squash_merge, allow_rebase_merge,
+     delete_branch_on_merge, allow_update_branch}
+    | to_entries | map(select(.value != true) | .key) | join(", ")')
+  if [ -n "$drift" ]; then
+    echo "  $repo: enabling $drift"
+    [ "$DRY_RUN" = "true" ] || gh api -X PATCH "repos/$ORG/$repo" \
+      -F allow_merge_commit=true -F allow_squash_merge=true -F allow_rebase_merge=true \
+      -F delete_branch_on_merge=true -F allow_update_branch=true >/dev/null
+    n_merge=$((n_merge + 1))
   fi
 
   # --- report only
@@ -80,6 +94,7 @@ done < "$WORK/repos"
 {
   echo "- repositories audited: **$total**"
   echo "- topics corrected: **$n_topics**"
+  echo "- merge settings corrected: **$n_merge**"
   [ "$DRY_RUN" = "true" ] && echo "- dry run: nothing was written"
   echo
   if [ -s "$WORK/findings" ]; then
