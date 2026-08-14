@@ -28,6 +28,11 @@ are listed in the job summary so a human can decide.
 reported, because a wiki that looks empty may have been enabled deliberately a
 minute earlier, and a missing LICENSE is a legal decision rather than a setting.
 
+The empty-wiki check runs on public repositories only. An App installation token
+cannot read a wiki, so for an internal or private repository "no content" and "no
+access" are indistinguishable — checking those reported the repositories that
+actually use their wiki as empty.
+
 ## Setup
 
 Both workflows need an organisation-scoped token. `GITHUB_TOKEN` cannot be used

@@ -62,8 +62,13 @@ while IFS= read -r repo; do
   gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" >/dev/null 2>&1 ||
     echo "$repo|no .github/dependabot.yml" >> "$WORK/findings"
 
-  if [ "$(echo "$meta" | jq -r '.has_wiki')" = "true" ]; then
-    git ls-remote "https://x-access-token:$GH_TOKEN@github.com/$ORG/$repo.wiki.git" >/dev/null 2>&1 ||
+  # Only public repositories: an App installation token cannot read a wiki, so
+  # for an internal or private one "no content" and "no access" look identical.
+  # Checking those reported the two repositories that actually use their wiki as
+  # empty, which is worse than not checking at all.
+  if [ "$(echo "$meta" | jq -r '.has_wiki')" = "true" ] &&
+     [ "$(echo "$meta" | jq -r '.visibility')" = "public" ]; then
+    git ls-remote "https://github.com/$ORG/$repo.wiki.git" >/dev/null 2>&1 ||
       echo "$repo|wiki enabled but empty" >> "$WORK/findings"
   fi
 
