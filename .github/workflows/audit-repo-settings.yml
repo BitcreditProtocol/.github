@@ -1,0 +1,38 @@
+name: Audit repository settings
+
+# Reports configuration drift across every non-archived repository and keeps
+# the organisation topics in place. Everything else is reported, not applied.
+
+on:
+  schedule:
+    - cron: '43 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report without writing topics
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mint an org-scoped token
+        id: token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Audit
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          BASELINE_CONFIG: Bitcredit baseline
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: bash .github/scripts/audit-repo-settings.sh
