@@ -35,6 +35,20 @@ fi
 
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
+# A colour written without quotes can be swallowed by the YAML parser as a
+# number — `008672` comes back as `8672.0`, which is not a colour and would be
+# pushed to every repository. Fail loudly rather than corrupt anything.
+bad=$(jq -r '
+  [(.required // [])[], (.managed // [])[]]
+  | .[]
+  | select((.color | type) != "string" or (.color | test("^[0-9a-fA-F]{6}$") | not))
+  | "  " + .name + " = " + (.color | tostring)' "$WORK/manifest.json")
+if [ -n "$bad" ]; then
+  echo "labels.yml: colour values must be quoted six-digit hex strings." >&2
+  echo "$bad" >&2
+  exit 1
+fi
+
 jq -r '.renames  // {} | to_entries[] | @base64' "$WORK/manifest.json" > "$WORK/renames"
 jq -r '.required // [] | .[] | @base64'          "$WORK/manifest.json" > "$WORK/required"
 jq -r '.managed  // [] | .[] | @base64'          "$WORK/manifest.json" > "$WORK/managed"
