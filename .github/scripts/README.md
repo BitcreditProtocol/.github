@@ -12,6 +12,12 @@ so creating or archiving a repository needs no change here.
 Both accept a `dry_run` input on manual runs, which prints the intended changes
 without writing anything.
 
+`audit-repo-settings` also mirrors its findings into a single issue titled
+**Repository settings drift** in this repository. The issue is updated in place
+on every run and closed automatically once nothing is left to report, so the
+weekly schedule does not pile up duplicates. A summary that only exists inside a
+workflow log is a report nobody reads.
+
 ## What they will not do
 
 Neither workflow deletes a label. Deleting one strips it from every issue and
