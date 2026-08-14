@@ -73,19 +73,53 @@ while IFS= read -r repo; do
 done < "$WORK/repos"
 
 {
-  echo "## Repository settings audit"
-  echo
   echo "- repositories audited: **$total**"
   echo "- topics corrected: **$n_topics**"
   [ "$DRY_RUN" = "true" ] && echo "- dry run: nothing was written"
   echo
   if [ -s "$WORK/findings" ]; then
-    echo "### Needs a human"
-    echo
     echo "| repository | finding |"
     echo "| --- | --- |"
     sort "$WORK/findings" | awk -F'|' '{printf "| `%s` | %s |\n", $1, $2}'
   else
     echo "No drift found."
   fi
-} >> "$SUMMARY"
+  echo
+  if [ -n "${GITHUB_RUN_ID:-}" ]; then
+    echo "[Run](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) · reruns every Monday."
+  fi
+} > "$WORK/report.md"
+
+{ echo "## Repository settings audit"; echo; cat "$WORK/report.md"; } >> "$SUMMARY"
+
+# A summary buried in a workflow log is a report nobody reads. Mirror it into a
+# single issue that is updated in place, and closed once the drift is gone —
+# opening a fresh one every Monday would just be noise.
+[ "$DRY_RUN" = "true" ] && exit 0
+
+REPORT_REPO="${GITHUB_REPOSITORY:-$ORG/.github}"
+TITLE="Repository settings drift"
+
+# Matched by listing open issues rather than through the search API, whose
+# index lags behind writes by minutes and would open duplicates.
+existing=$(gh api "repos/$REPORT_REPO/issues?state=open&per_page=100" --paginate --slurp \
+  | jq -r --arg t "$TITLE" 'add | map(select(.pull_request == null and .title == $t)) | .[0].number // empty')
+
+if [ -s "$WORK/findings" ]; then
+  count=$(wc -l < "$WORK/findings" | tr -d ' ')
+  { echo "$count findings across $total repositories."; echo; cat "$WORK/report.md"; } > "$WORK/issue.md"
+  if [ -n "$existing" ]; then
+    jq -Rs '{body: .}' < "$WORK/issue.md" \
+      | gh api -X PATCH "repos/$REPORT_REPO/issues/$existing" --input - >/dev/null
+    echo "Updated issue #$existing ($count findings)"
+  else
+    n=$(jq -Rs --arg t "$TITLE" '{title: $t, body: .}' < "$WORK/issue.md" \
+      | gh api -X POST "repos/$REPORT_REPO/issues" --input - --jq '.number')
+    echo "Opened issue #$n ($count findings)"
+  fi
+elif [ -n "$existing" ]; then
+  gh api -X POST "repos/$REPORT_REPO/issues/$existing/comments" \
+    -f "body=No drift found across $total repositories. Closing; it will reopen if anything drifts again." >/dev/null
+  gh api -X PATCH "repos/$REPORT_REPO/issues/$existing" -f state=closed >/dev/null
+  echo "Closed issue #$existing — no findings"
+fi
