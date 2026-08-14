@@ -27,31 +27,31 @@ renames:
 # nothing unused is pushed anywhere.
 required:
   - name: bug
-    color: d73a4a
+    color: 'd73a4a'
     description: Something isn't working
   - name: documentation
-    color: 0075ca
+    color: '0075ca'
     description: Improvements or additions to documentation
   - name: duplicate
-    color: cfd3d7
+    color: 'cfd3d7'
     description: This issue or pull request already exists
   - name: enhancement
-    color: a2eeef
+    color: 'a2eeef'
     description: New feature or request
   - name: good first issue
-    color: 7057ff
+    color: '7057ff'
     description: Good for newcomers
   - name: help wanted
-    color: 008672
+    color: '008672'
     description: Extra attention is needed
   - name: invalid
-    color: e4e669
+    color: 'e4e669'
     description: This doesn't seem right
   - name: question
-    color: d876e3
+    color: 'd876e3'
     description: Further information is requested
   - name: wontfix
-    color: ffffff
+    color: 'ffffff'
     description: This will not be worked on
 
 # Corrected where present, never created. Either repository-specific or
@@ -59,45 +59,45 @@ required:
 managed:
   # created by Dependabot on its first pull request
   - name: dependencies
-    color: AD07B5
+    color: 'AD07B5'
     description: Pull request that updates dependencies
   - name: github-actions
-    color: 1f0657
+    color: '1f0657'
     description: Pull request that updates GitHub Actions
 
   # cross-cutting, used by some teams
   - name: blocked
-    color: b60205
+    color: 'b60205'
     description: Blocked by other work that needs to be done first
   - name: design
-    color: 2f7496
+    color: '2f7496'
     description: Design work
   - name: improvements
-    color: 82cb3f
+    color: '82cb3f'
     description: Improvement of existing code
   - name: devops
-    color: fbca04
+    color: 'fbca04'
     description: DevOps tasks
   - name: devtools
-    color: 798EC1
+    color: '798EC1'
     description: Related to development tooling
   - name: breaking
     color: '892627'
     description: Breaking change
   - name: i18n
-    color: c2e0c6
+    color: 'c2e0c6'
     description: Internationalization
   - name: staff only
-    color: 2D024A
+    color: '2D024A'
     description: Requires infrastructure access or institutional knowledge
   - name: ui library
-    color: faf3d2
+    color: 'faf3d2'
     description: Related to the shared UI library
   - name: awaiting triage
-    color: 628E85
+    color: '628E85'
     description: Has not been triaged by a maintainer
   - name: ticket work required
-    color: 6E58CA
+    color: '6E58CA'
     description: Needs additional work before it is ready to be taken up
 
   # Dependabot ecosystem labels, recorded at their current values so the sync
@@ -108,6 +108,6 @@ managed:
   - name: javascript
     color: '168700'
   - name: npm
-    color: 8ca81b
+    color: '8ca81b'
   - name: ruby
-    color: ce2d2d
+    color: 'ce2d2d'
