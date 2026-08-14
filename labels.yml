@@ -111,3 +111,9 @@ managed:
     color: '8ca81b'
   - name: ruby
     color: 'ce2d2d'
+  - name: dart
+    color: '00B4AB'
+    description: Pull request that updates Dart dependencies
+  - name: terraform
+    color: '7B42BC'
+    description: Pull request that updates Terraform dependencies
