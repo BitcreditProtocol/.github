@@ -1,0 +1,41 @@
+# Who is assigned to Dependabot pull requests, per repository.
+#
+# Dependabot assigns nobody by default, and the setting lives inside each
+# repository's own .github/dependabot.yml. A new repository therefore starts
+# with no reviewer and nothing notices — which is how helm-charts ended up with
+# an unassigned configuration, and how every cargo, npm and pub update block in
+# the organisation ended up with none while the github-actions blocks had one.
+#
+# This file is the source of truth. audit-repo-settings reports any repository
+# whose dependabot.yml disagrees with it, any repository that has a
+# configuration but no entry here, and any entry here for a repository that no
+# longer has a configuration.
+#
+# Adding a repository: add the line here, then set assignees on every update
+# block in that repository's dependabot.yml. The audit will tell you if you
+# only do one of the two.
+
+assignees:
+  ".github": cleot
+  AI-Credit: cleot
+  bcr-common: zupzup
+  bcr-load-tests: zupzup
+  bcr-relay: zupzup
+  bit.cr: JulianVIE
+  bitcr-chat-widget: cleot
+  bitcr.org: JulianVIE
+  Bitcredit-Core: zupzup
+  Clowder: stefanbitcr
+  docker-external: cleot
+  docs-bitcr: cleot
+  E-Bill-frontend: JulianVIE
+  helm-charts: cleot
+  infrastructure: cleot
+  nostr-postgres-db: cleot
+  ui: JulianVIE
+  wallet: JulianVIE
+  Wallet-Core: zupzup
+  Wildcat: codingpeanut157
+  Wildcat-Auxiliary: codingpeanut157
+  wildcat-dashboard-ui: JulianVIE
+  Wildcat-deployment: cleot
