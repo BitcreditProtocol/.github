@@ -7,7 +7,7 @@ so creating or archiving a repository needs no change here.
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
-| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE and its copyright holder, missing `dependabot.yml` where a manifest exists, empty wikis, security configuration, open Dependabot alerts |
+| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE and its copyright holder, missing `dependabot.yml` where a manifest exists, Dependabot assignees, empty wikis, security configuration, open Dependabot alerts |
 
 Both accept a `dry_run` input on manual runs, which prints the intended changes
 without writing anything.
@@ -71,6 +71,28 @@ Those exceptions record the *expected* third-party holder rather than merely
 skipping the repository, so a change to their notice is still noticed. Nothing
 is ever written to a LICENSE from here — a licence is a legal statement, so a
 mismatch is reported and a human decides.
+
+## Editing the Dependabot assignees
+
+`dependabot-assignees.yml` at the repository root maps each repository to the
+person who gets its Dependabot pull requests.
+
+The setting itself lives in each repository's own `.github/dependabot.yml`, and
+Dependabot assigns nobody by default — so an unassigned configuration is
+invisible unless something compares it against a list. It stayed invisible for a
+while: `assignees` had only ever been set on the `github-actions` block, so every
+cargo, npm and pub pull request in the organisation opened with no assignee at
+all, thirty-nine of them at once.
+
+The audit reads **every update block** rather than the first. A repository with
+one assigned block and one unassigned block looks fine to any check that stops at
+the first, and that was the state nearly everywhere. It reports in both
+directions: a repository with a configuration and no entry here, and an entry
+pointing at a repository that is no longer active.
+
+Nothing is written to a `dependabot.yml` from here. Adding a repository means
+adding the line here *and* setting `assignees` on every update block in that
+repository — the audit says so if only one of the two is done.
 
 ## Editing the label set
 
