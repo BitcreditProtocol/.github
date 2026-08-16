@@ -34,6 +34,12 @@ else
 fi
 HOLDER=$(jq -r '.holder' "$WORK/license.json")
 
+if [ -n "${ASSIGNEES_JSON:-}" ]; then
+  cp "$ASSIGNEES_JSON" "$WORK/assignees.json"
+else
+  yq -o=json '.' "$(dirname "$0")/../../dependabot-assignees.yml" > "$WORK/assignees.json"
+fi
+
 gh api "orgs/$ORG/repos?per_page=100" --paginate --slurp > "$WORK/repos.json"
 jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WORK/repos"
 total=$(wc -l < "$WORK/repos" | tr -d ' ')
@@ -119,6 +125,34 @@ while IFS= read -r repo; do
     if [ -n "$eco" ]; then
       echo "$repo|no .github/dependabot.yml, but has$eco" >> "$WORK/findings"
     fi
+
+  # Dependabot assigns nobody by default, and the setting lives in each
+  # repository's own file — so an unassigned configuration is invisible unless
+  # something compares it against a list. That is how helm-charts stayed
+  # unassigned, and how every cargo, npm and pub block in the organisation ended
+  # up with no assignee while the github-actions blocks had one.
+  else
+    gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" --jq '.content' 2>/dev/null \
+      | base64 -d > "$WORK/db.yml" 2>/dev/null || : > "$WORK/db.yml"
+    want=$(jq -r --arg r "$repo" '.assignees[$r] // ""' "$WORK/assignees.json")
+    if [ -z "$want" ]; then
+      echo "$repo|has dependabot.yml but no entry in dependabot-assignees.yml" >> "$WORK/findings"
+    elif ! yq -o=json '.' "$WORK/db.yml" > "$WORK/db.json" 2>/dev/null; then
+      echo "$repo|.github/dependabot.yml does not parse as YAML" >> "$WORK/findings"
+    else
+      # Every update block, not just the first: the blocks are what produce pull
+      # requests, and a repository can easily have one assigned and one not.
+      wrong=$(jq -r --arg w "$want" '
+        [ .updates[]
+          | (.assignees // [])
+          | if . == [$w] then empty
+            elif length == 0 then "nobody"
+            else join("+") end ]
+        | unique | join(", ")' "$WORK/db.json")
+      if [ -n "$wrong" ]; then
+        echo "$repo|Dependabot assignee should be $want on every update block, found: $wrong" >> "$WORK/findings"
+      fi
+    fi
   fi
 
   # Only public repositories: an App installation token cannot read a wiki, so
@@ -135,6 +169,15 @@ while IFS= read -r repo; do
   [ "$attached" = "$BASELINE_CONFIG" ] ||
     echo "$repo|security configuration is '$attached', expected '$BASELINE_CONFIG'" >> "$WORK/findings"
 done < "$WORK/repos"
+
+# The other direction: an entry left behind by a rename, an archive or a
+# deletion. A mapping that quietly points at nothing stops being trusted, and an
+# untrusted mapping is worse than no mapping at all.
+jq -r '.assignees | keys[]' "$WORK/assignees.json" | while IFS= read -r listed; do
+  if ! grep -qxF "$listed" "$WORK/repos"; then
+    echo "$listed|listed in dependabot-assignees.yml but not an active repository" >> "$WORK/findings"
+  fi
+done
 
 # Dependabot backlog. Not drift, so it is reported rather than counted as a
 # finding — alerts come and go with upstream advisories and would keep the issue
