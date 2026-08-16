@@ -93,8 +93,33 @@ while IFS= read -r repo; do
     esac
   fi
 
-  gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" >/dev/null 2>&1 ||
-    echo "$repo|no .github/dependabot.yml" >> "$WORK/findings"
+  # Reported only where there is something for Dependabot to update. Six
+  # repositories carry no package manifest at all — documentation and asset
+  # repositories — and flagging them every week would keep the issue permanently
+  # open and train everyone to ignore it. Detection is by manifest, not by a list
+  # of repository names, so a repository that later gains a manifest starts being
+  # reported without anyone editing this script.
+  if ! gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" >/dev/null 2>&1; then
+    branch=$(echo "$meta" | jq -r '.default_branch')
+    gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
+      --jq '[.tree[]? | select(.type == "blob") | .path] | join("\n")' 2>/dev/null > "$WORK/tree" || : > "$WORK/tree"
+    eco=""
+    grep -qiE '(^|/)Cargo\.toml$'                      "$WORK/tree" && eco="$eco cargo"
+    grep -qiE '(^|/)package\.json$'                    "$WORK/tree" && eco="$eco npm"
+    grep -qiE '(^|/)pubspec\.yaml$'                    "$WORK/tree" && eco="$eco pub"
+    grep -qiE '(^|/)go\.mod$'                          "$WORK/tree" && eco="$eco gomod"
+    grep -qiE '(^|/)(requirements.*\.txt|pyproject\.toml)$' "$WORK/tree" && eco="$eco pip"
+    grep -qiE '(^|/)Gemfile$'                          "$WORK/tree" && eco="$eco bundler"
+    grep -qiE '(^|/)composer\.json$'                   "$WORK/tree" && eco="$eco composer"
+    grep -qiE '(^|/)Dockerfile|docker-compose.*\.ya?ml$' "$WORK/tree" && eco="$eco docker"
+    grep -qiE '\.tf$'                                  "$WORK/tree" && eco="$eco terraform"
+    # workflows need no manifest: the github-actions ecosystem updates the
+    # action versions pinned inside them
+    grep -qE '^\.github/workflows/.*\.ya?ml$'          "$WORK/tree" && eco="$eco github-actions"
+    if [ -n "$eco" ]; then
+      echo "$repo|no .github/dependabot.yml, but has$eco" >> "$WORK/findings"
+    fi
+  fi
 
   # Only public repositories: an App installation token cannot read a wiki, so
   # for an internal or private one "no content" and "no access" look identical.
