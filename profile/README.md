@@ -2,7 +2,7 @@
 
 The Bitcoin Credit Money Layer for the Real Economy.
 
-**[bit.cr](https://www.bit.cr)** · **[Documentation](https://docs.bitcr.org/)** · **[Specifications](https://github.com/BitcreditProtocol/cats)**
+**[bitcr.org](https://www.bitcr.org)** · **[bit.cr](https://www.bit.cr)** · **[Documentation](https://docs.bitcr.org/)** · **[Specifications](https://github.com/BitcreditProtocol/cats)**
 
 ## Where to start
 
