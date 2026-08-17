@@ -72,6 +72,22 @@ while IFS= read -r repo; do
   [ -z "$repo" ] && continue
   gh api "repos/$ORG/$repo/labels?per_page=100" --jq '.' > "$WORK/current"
 
+  # Labels this repository's own dependabot.yml asks for. Dependabot applies only
+  # labels that already exist and silently drops the rest, so a configuration
+  # naming a label the repository lacks produces unlabelled pull requests. That is
+  # how seven repositories ended up with Dependabot pull requests carrying no
+  # label at all while their configuration asked for two.
+  #
+  # Read per repository from the API rather than from a list, so a new repository
+  # arriving with a cargo block gets `rust` on the next run and a Flutter one
+  # still never does.
+  : > "$WORK/dblabels"
+  gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" --jq '.content' 2>/dev/null \
+    | base64 -d > "$WORK/db.yml" 2>/dev/null || : > "$WORK/db.yml"
+  if [ -s "$WORK/db.yml" ] && yq -o=json '.' "$WORK/db.yml" > "$WORK/db.json" 2>/dev/null; then
+    jq -r '[.updates[]? | .labels[]?] | unique | .[]' "$WORK/db.json" > "$WORK/dblabels"
+  fi
+
   # 1. renames, only when the old label exists and the new one does not
   while IFS= read -r row; do
     [ -z "$row" ] && continue
@@ -88,7 +104,7 @@ while IFS= read -r repo; do
   done < "$WORK/renames"
 
   # 2. required: create when missing, correct when drifted
-  # 3. managed:  correct when present, never create
+  # 3. managed:  correct when present; created only where dependabot.yml asks
   for tier in required managed; do
     while IFS= read -r row; do
       [ -z "$row" ] && continue
@@ -101,7 +117,9 @@ while IFS= read -r repo; do
       [ "$desc" = "$OMIT" ] || set -- "$@" -f "description=$desc"
 
       if [ -z "$existing" ]; then
-        [ "$tier" = "managed" ] && continue
+        if [ "$tier" = "managed" ] && ! grep -Fxq "$name" "$WORK/dblabels"; then
+          continue
+        fi
         echo "  $repo: create '$name'"
         apply -X POST "repos/$ORG/$repo/labels" -f "name=$name" "$@"
         n_create=$((n_create + 1))

@@ -54,10 +54,15 @@ required:
     color: 'ffffff'
     description: This will not be worked on
 
-# Corrected where present, never created. Either repository-specific or
-# bot-generated, so forcing them everywhere would only add unused labels.
+# Corrected where present. Created only in a repository whose own
+# .github/dependabot.yml asks for the label — never pushed everywhere, since
+# these are repository-specific and a Flutter repository has no use for `rust`.
+#
+# The creation rule exists because Dependabot applies only labels that already
+# exist and silently drops the rest: a configuration asking for a label the
+# repository lacks produces unlabelled pull requests, with nothing anywhere
+# reporting it.
 managed:
-  # created by Dependabot on its first pull request
   - name: dependencies
     color: 'AD07B5'
     description: Pull request that updates dependencies
