@@ -1,0 +1,51 @@
+name: Prune package versions
+
+# Reports container package versions that nothing references any more. Packages
+# are discovered from the API on every run, so a new one is covered without any
+# change here.
+#
+# The schedule NEVER deletes. Deleting a version cannot be undone and the image
+# cannot be rebuilt by hand, so removal needs a manual run with dry_run unticked.
+
+on:
+  schedule:
+    - cron: '37 6 * * 2'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be deleted without deleting anything
+        type: boolean
+        default: true
+      keep_days:
+        description: Keep every version newer than this many days, whatever its tags
+        type: string
+        default: '30'
+      only_package:
+        description: Restrict to a single package, for a first careful run
+        type: string
+        default: ''
+
+permissions: {}
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Mint an org-scoped token
+        id: token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Report unreferenced package versions
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          DRY_RUN: ${{ inputs.dry_run == false && 'false' || 'true' }}
+          KEEP_DAYS: ${{ inputs.keep_days || '30' }}
+          ONLY_PACKAGE: ${{ inputs.only_package || '' }}
+        run: bash .github/scripts/prune-package-versions.sh
