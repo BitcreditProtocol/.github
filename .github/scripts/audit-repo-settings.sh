@@ -48,6 +48,16 @@ echo "Auditing $total non-archived repositories (dry_run=$DRY_RUN)"
 n_topics=0; n_merge=0
 : > "$WORK/findings"
 
+# The organisation copies of the inherited community files, fetched once. A
+# repository carrying a byte-identical copy is inheriting nothing and gains a file
+# that can silently drift; three of these existed and differed only by a trailing
+# newline, which is exactly how long a duplicate stays identical.
+mkdir -p "$WORK/org"
+for f in CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md; do
+  gh api "repos/$ORG/.github/contents/$f" -H "Accept: application/vnd.github.raw" \
+    > "$WORK/org/$f" 2>/dev/null || : > "$WORK/org/$f"
+done
+
 while IFS= read -r repo; do
   [ -z "$repo" ] && continue
   meta=$(gh api "repos/$ORG/$repo")
@@ -105,23 +115,31 @@ while IFS= read -r repo; do
   # open and train everyone to ignore it. Detection is by manifest, not by a list
   # of repository names, so a repository that later gains a manifest starts being
   # reported without anyone editing this script.
+  branch=$(echo "$meta" | jq -r '.default_branch')
+  gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
+    --jq '[.tree[]? | select(.type == "blob") | .path] | join("\n")' 2>/dev/null > "$WORK/tree.all" || : > "$WORK/tree.all"
+
+  # Vendored and generated paths carry manifests that are not ours to update.
+  # Dependabot pointed at a vendored copy would diverge it from upstream, so a
+  # manifest in here is not evidence of a missing ecosystem.
+  grep -vE '(^|/)(node_modules|vendor|target|build|\.dart_tool|cargokit|crowdin_sdk)/' \
+    "$WORK/tree.all" > "$WORK/tree" || : > "$WORK/tree"
+
+  eco=""
+  grep -qiE '(^|/)Cargo\.toml$'                      "$WORK/tree" && eco="$eco cargo"
+  grep -qiE '(^|/)package\.json$'                    "$WORK/tree" && eco="$eco npm"
+  grep -qiE '(^|/)pubspec\.yaml$'                    "$WORK/tree" && eco="$eco pub"
+  grep -qiE '(^|/)go\.mod$'                          "$WORK/tree" && eco="$eco gomod"
+  grep -qiE '(^|/)(requirements.*\.txt|pyproject\.toml)$' "$WORK/tree" && eco="$eco pip"
+  grep -qiE '(^|/)Gemfile$'                          "$WORK/tree" && eco="$eco bundler"
+  grep -qiE '(^|/)composer\.json$'                   "$WORK/tree" && eco="$eco composer"
+  grep -qiE '(^|/)Dockerfile|docker-compose.*\.ya?ml$' "$WORK/tree" && eco="$eco docker"
+  grep -qiE '\.tf$'                                  "$WORK/tree" && eco="$eco terraform"
+  # workflows need no manifest: the github-actions ecosystem updates the
+  # action versions pinned inside them
+  grep -qE '^\.github/workflows/.*\.ya?ml$'          "$WORK/tree" && eco="$eco github-actions"
+
   if ! gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" >/dev/null 2>&1; then
-    branch=$(echo "$meta" | jq -r '.default_branch')
-    gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
-      --jq '[.tree[]? | select(.type == "blob") | .path] | join("\n")' 2>/dev/null > "$WORK/tree" || : > "$WORK/tree"
-    eco=""
-    grep -qiE '(^|/)Cargo\.toml$'                      "$WORK/tree" && eco="$eco cargo"
-    grep -qiE '(^|/)package\.json$'                    "$WORK/tree" && eco="$eco npm"
-    grep -qiE '(^|/)pubspec\.yaml$'                    "$WORK/tree" && eco="$eco pub"
-    grep -qiE '(^|/)go\.mod$'                          "$WORK/tree" && eco="$eco gomod"
-    grep -qiE '(^|/)(requirements.*\.txt|pyproject\.toml)$' "$WORK/tree" && eco="$eco pip"
-    grep -qiE '(^|/)Gemfile$'                          "$WORK/tree" && eco="$eco bundler"
-    grep -qiE '(^|/)composer\.json$'                   "$WORK/tree" && eco="$eco composer"
-    grep -qiE '(^|/)Dockerfile|docker-compose.*\.ya?ml$' "$WORK/tree" && eco="$eco docker"
-    grep -qiE '\.tf$'                                  "$WORK/tree" && eco="$eco terraform"
-    # workflows need no manifest: the github-actions ecosystem updates the
-    # action versions pinned inside them
-    grep -qE '^\.github/workflows/.*\.ya?ml$'          "$WORK/tree" && eco="$eco github-actions"
     if [ -n "$eco" ]; then
       echo "$repo|no .github/dependabot.yml, but has$eco" >> "$WORK/findings"
     fi
@@ -152,8 +170,69 @@ while IFS= read -r repo; do
       if [ -n "$wrong" ]; then
         echo "$repo|Dependabot assignee should be $want on every update block, found: $wrong" >> "$WORK/findings"
       fi
+
+      # Existence is not coverage. Five repositories had a dependabot.yml that
+      # updated their actions and ignored their code -- three Rust workspaces with
+      # no cargo block at all -- so 32 alerts had no route to a fix while every
+      # check here passed. Compared by ecosystem rather than by directory, because
+      # a vendored manifest is deliberately left uncovered.
+      configured=$(jq -r '[.updates[]?."package-ecosystem"] | unique | join(" ")' "$WORK/db.json")
+      uncovered=""
+      for e in $eco; do
+        case " $configured " in *" $e "*) ;; *) uncovered="$uncovered $e" ;; esac
+      done
+      if [ -n "$uncovered" ]; then
+        echo "$repo|dependabot.yml does not cover:$uncovered (has: $configured)" >> "$WORK/findings"
+      fi
+
+      # Dependabot applies only labels that already exist and silently drops the
+      # rest. Fifteen of twenty-two configured repositories named a label they did
+      # not have -- 31 pairs -- so pull requests arrived carrying fewer labels than
+      # the file asked for, and seven arrived with none at all.
+      gh api "repos/$ORG/$repo/labels?per_page=100" --paginate --jq '.[].name' > "$WORK/labels" 2>/dev/null || : > "$WORK/labels"
+      missing_labels=""
+      for l in $(jq -r '[.updates[]?.labels[]?] | unique | .[]' "$WORK/db.json"); do
+        grep -Fxq "$l" "$WORK/labels" || missing_labels="$missing_labels $l"
+      done
+      if [ -n "$missing_labels" ]; then
+        echo "$repo|dependabot.yml asks for labels this repository does not have:$missing_labels" >> "$WORK/findings"
+      fi
     fi
   fi
+
+  # A lock file inside a cargo workspace member is never read: cargo resolves a
+  # member against the workspace-root lock. So it is either stale or a mistake, and
+  # it still produces Dependabot alerts against versions nothing builds with. One
+  # sat there for six months and generated two unactionable alerts.
+  if grep -qxE 'Cargo\.lock' "$WORK/tree"; then
+    nested=$(grep -E '.+/Cargo\.lock$' "$WORK/tree" | tr '\n' ' ')
+    [ -n "$nested" ] &&
+      echo "$repo|lock file inside a cargo workspace, ignored by cargo: $nested" >> "$WORK/findings"
+  fi
+
+  # A write permission that is never exercised. Four workflows granted
+  # attestations: write and produced no attestation, while ten container images
+  # shipped with no provenance at all.
+  while IFS= read -r wf; do
+    [ -z "$wf" ] && continue
+    body=$(gh api "repos/$ORG/$repo/contents/$wf?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null)
+    [ -z "$body" ] && continue
+    case "$body" in *"attestations: write"*) ;; *) continue ;; esac
+    case "$body" in *attest-build-provenance*) continue ;; esac
+    echo "$repo|$wf grants attestations: write with no attest step" >> "$WORK/findings"
+  done < <(grep -E '^\.github/workflows/.*\.ya?ml$' "$WORK/tree" || true)
+
+  # A copy of an inherited file that is identical to the organisation version is a
+  # file that drifts later and reports nothing when it does.
+  for f in CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md; do
+    [ -s "$WORK/org/$f" ] || continue
+    grep -qxF "$f" "$WORK/tree" || continue
+    gh api "repos/$ORG/$repo/contents/$f?ref=$branch" -H "Accept: application/vnd.github.raw" \
+      > "$WORK/own.tmp" 2>/dev/null || continue
+    if cmp -s "$WORK/org/$f" "$WORK/own.tmp"; then
+      echo "$repo|$f is byte-identical to the organisation version and could be inherited" >> "$WORK/findings"
+    fi
+  done
 
   # Only public repositories: an App installation token cannot read a wiki, so
   # for an internal or private one "no content" and "no access" look identical.
