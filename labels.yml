@@ -23,8 +23,17 @@ renames:
   github_actions: github-actions
 
 # Created in every repository, and corrected if colour or description drift.
-# Limited to the labels GitHub itself creates with every new repository, so
-# nothing unused is pushed anywhere.
+#
+# Two groups: the nine labels GitHub itself creates, and every label a
+# .github/dependabot.yml can ask for. The second group is here rather than under
+# `managed` because Dependabot applies only labels that already exist and
+# silently drops the rest — a configuration naming a label the repository lacks
+# produces unlabelled pull requests and, worse, an "the following labels could
+# not be found" error that stops the update. Deriving them per repository from
+# its own configuration was tried and is strictly weaker: it leaves the set
+# uneven, so adding an ecosystem to a repository silently needs a label run
+# before it works. Owner decision 2026-08-25: uniform everywhere, and an unused
+# label costs nothing next to a broken Dependabot run.
 required:
   - name: bug
     color: 'd73a4a'
@@ -54,21 +63,37 @@ required:
     color: 'ffffff'
     description: This will not be worked on
 
-# Corrected where present. Created only in a repository whose own
-# .github/dependabot.yml asks for the label — never pushed everywhere, since
-# these are repository-specific and a Flutter repository has no use for `rust`.
-#
-# The creation rule exists because Dependabot applies only labels that already
-# exist and silently drops the rest: a configuration asking for a label the
-# repository lacks produces unlabelled pull requests, with nothing anywhere
-# reporting it.
-managed:
+  # Every label a dependabot.yml can request. `rust`, `npm` and `ruby` keep the
+  # colours Dependabot itself assigned and carry no description, so the sync pins
+  # the colour and leaves whatever description a repository already has.
   - name: dependencies
     color: 'AD07B5'
     description: Pull request that updates dependencies
   - name: github-actions
     color: '1f0657'
     description: Pull request that updates GitHub Actions
+  - name: npm
+    color: '8ca81b'
+  - name: rust
+    color: '000000'
+  - name: dart
+    color: '00B4AB'
+    description: Pull request that updates Dart dependencies
+  - name: ruby
+    color: 'ce2d2d'
+  - name: terraform
+    color: '7B42BC'
+    description: Pull request that updates Terraform dependencies
+  - name: docker
+    color: '2496ED'
+    description: Pull request that updates Docker dependencies
+
+# Corrected where present, never created. Team workflow labels: which of these a
+# repository wants is that team's business, and pushing them everywhere would add
+# labels nobody uses. Anything a dependabot.yml can request is in `required`
+# above instead, because a missing one breaks an update rather than merely
+# looking untidy.
+managed:
 
   # cross-cutting, used by some teams
   - name: blocked
@@ -105,20 +130,7 @@ managed:
     color: '6E58CA'
     description: Needs additional work before it is ready to be taken up
 
-  # Dependabot ecosystem labels, recorded at their current values so the sync
-  # pins them without changing anything today. `rust` is Dependabot's default
-  # black; worth picking a real colour, but that is a decision, not a fix.
-  - name: rust
-    color: '000000'
+  # A language label rather than a Dependabot ecosystem — nothing requests it in a
+  # dependabot.yml, so it stays here.
   - name: javascript
     color: '168700'
-  - name: npm
-    color: '8ca81b'
-  - name: ruby
-    color: 'ce2d2d'
-  - name: dart
-    color: '00B4AB'
-    description: Pull request that updates Dart dependencies
-  - name: terraform
-    color: '7B42BC'
-    description: Pull request that updates Terraform dependencies
