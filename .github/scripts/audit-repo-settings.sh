@@ -133,7 +133,12 @@ while IFS= read -r repo; do
   grep -qiE '(^|/)(requirements.*\.txt|pyproject\.toml)$' "$WORK/tree" && eco="$eco pip"
   grep -qiE '(^|/)Gemfile$'                          "$WORK/tree" && eco="$eco bundler"
   grep -qiE '(^|/)composer\.json$'                   "$WORK/tree" && eco="$eco composer"
-  grep -qiE '(^|/)Dockerfile|docker-compose.*\.ya?ml$' "$WORK/tree" && eco="$eco docker"
+  # Alternation binds looser than the anchors, so a single trailing $ would only
+  # have closed the second branch: '(^|/)Dockerfile|...$' also matched
+  # docs/Dockerfile-notes.md. Each branch is anchored on its own, and the
+  # optional suffix keeps the common Dockerfile.dev convention detected.
+  grep -qiE '(^|/)Dockerfile(\.[A-Za-z0-9_-]+)?$|(^|/)docker-compose.*\.ya?ml$' \
+    "$WORK/tree" && eco="$eco docker"
   grep -qiE '\.tf$'                                  "$WORK/tree" && eco="$eco terraform"
   # workflows need no manifest: the github-actions ecosystem updates the
   # action versions pinned inside them
@@ -179,6 +184,16 @@ while IFS= read -r repo; do
       configured=$(jq -r '[.updates[]?."package-ecosystem"] | unique | join(" ")' "$WORK/db.json")
       uncovered=""
       for e in $eco; do
+        # docker is uncovered on purpose. Nine repositories carry a Dockerfile or
+        # a compose file and no docker block, and that was decided rather than
+        # overlooked: the
+        # ecosystem needs a docker label in labels.yml and would add a notable
+        # volume of pull requests, so it was deferred until after the P2 hoisting
+        # work. Reporting seven repositories every week against a standing
+        # decision is how a report loses its audience. Delete this line when the
+        # docker blocks land, and the check starts covering them again with no
+        # other edit.
+        [ "$e" = docker ] && continue
         case " $configured " in *" $e "*) ;; *) uncovered="$uncovered $e" ;; esac
       done
       if [ -n "$uncovered" ]; then
