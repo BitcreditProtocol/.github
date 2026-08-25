@@ -296,6 +296,46 @@ else
   echo "Could not read Dependabot alerts — the App is missing \`Dependabot alerts: read\`." > "$WORK/dependabot.md"
 fi
 
+# Secret surface. Counts, not findings: this is a standing property of how the
+# estate is configured rather than something that drifts week to week, so it
+# belongs beside the Dependabot backlog and not in the drift table.
+#
+# The distinction the report exists to make visible: environment protection gates
+# only *environment-level* secrets. A repository-level secret is readable by every
+# workflow in the repository, on any branch, whatever environment a job declares
+# or omits -- no reviewer rule can gate it. Twelve environments in
+# Wildcat-deployment were gated in August 2026 and that closed the mint seed,
+# which is environment-level. It did nothing for the repository-level secrets
+# elsewhere, and nothing here counted them, so the audit read as clean while most
+# of the estate's secrets sat behind no approval at all.
+gated=0
+ungated_env=0
+repo_level=0
+: > "$WORK/secsurface"
+while read -r repo; do
+  n=$(gh api "repos/$ORG/$repo/actions/secrets" --jq '.total_count' 2>/dev/null || echo 0)
+  n=${n:-0}
+  repo_level=$((repo_level + n))
+  envs=$(gh api "repos/$ORG/$repo/environments?per_page=100" 2>/dev/null || echo '{}')
+  g=0
+  u=0
+  # protection_rules is empty for an unprotected environment, so its length is the
+  # whole test -- and a count of zero secrets means the environment contributes
+  # nothing either way.
+  while IFS=$'\t' read -r ename prot; do
+    [ -z "$ename" ] && continue
+    es=$(gh api "repos/$ORG/$repo/environments/$ename/secrets" --jq '.total_count' 2>/dev/null || echo 0)
+    es=${es:-0}
+    [ "$es" -eq 0 ] && continue
+    if [ "$prot" = "0" ]; then u=$((u + es)); else g=$((g + es)); fi
+  done < <(printf '%s' "$envs" | jq -r '.environments[]? | [.name, ((.protection_rules//[])|length)] | @tsv')
+  gated=$((gated + g))
+  ungated_env=$((ungated_env + u))
+  if [ $((n + g + u)) -gt 0 ]; then
+    printf '%s\t%s\t%s\t%s\n' "$repo" "$n" "$g" "$u" >> "$WORK/secsurface"
+  fi
+done < "$WORK/repos"
+
 {
   echo "- repositories audited: **$total**"
   echo "- topics corrected: **$n_topics**"
@@ -313,6 +353,19 @@ fi
   echo "### Dependabot"
   echo
   cat "$WORK/dependabot.md"
+  echo
+  echo "### Secrets"
+  echo
+  echo "- behind an approval gate: **$gated** — environment-level, inside an environment that has a protection rule"
+  echo "- behind no gate: **$((repo_level + ungated_env))** — $repo_level repository-level, which no environment rule can gate, plus $ungated_env environment-level in an unprotected environment"
+  echo "- organisation-level: **$(gh api "orgs/$ORG/actions/secrets" --jq '.total_count' 2>/dev/null || echo '?')** — granted per repository, and likewise not gated by any environment"
+  echo
+  if [ -s "$WORK/secsurface" ]; then
+    echo "| repository | ungated | repository-level | environment, gated | environment, ungated |"
+    echo "| --- | --- | --- | --- | --- |"
+    awk -F'\t' '{print ($2+$4) "\t" $0}' "$WORK/secsurface" | sort -rn \
+      | cut -f2- | awk -F'\t' '{printf "| `%s` | %s | %s | %s | %s |\n", $1, $2+$4, $2, $3, $4}'
+  fi
   echo
   if [ -n "${GITHUB_RUN_ID:-}" ]; then
     echo "[Run](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) · reruns every Monday."
