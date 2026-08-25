@@ -24,6 +24,12 @@ DRY_RUN="${DRY_RUN:-false}"
 REQUIRED_TOPICS="bitcoin bitcredit"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
+# How recently a branch must have been pushed for a reference on it to count as
+# live. Used by the orphaned-credential check: a dead branch must not block a
+# deletion, and an active one must. GNU date on the runner, BSD date locally.
+CUTOFF="$(date -u -d '90 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+          || date -u -v-90d '+%Y-%m-%dT%H:%M:%SZ')"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -229,14 +235,93 @@ while IFS= read -r repo; do
   # A write permission that is never exercised. Four workflows granted
   # attestations: write and produced no attestation, while ten container images
   # shipped with no provenance at all.
+  : > "$WORK/wfbody"
   while IFS= read -r wf; do
     [ -z "$wf" ] && continue
     body=$(gh api "repos/$ORG/$repo/contents/$wf?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null)
     [ -z "$body" ] && continue
+    # kept for the credential check below: these bodies are already paid for here
+    printf '%s\n' "$body" >> "$WORK/wfbody"
     case "$body" in *"attestations: write"*) ;; *) continue ;; esac
     case "$body" in *attest-build-provenance*) continue ;; esac
     echo "$repo|$wf grants attestations: write with no attest step" >> "$WORK/findings"
   done < <(grep -E '^\.github/workflows/.*\.ya?ml$' "$WORK/tree" || true)
+
+  # A credential no workflow on the default branch reads any more. Removing the
+  # last consumer orphans a secret silently: nothing fails, and a default-branch
+  # sweep then calls it safe to delete. Wildcat#1001 removed a nightly deploy job
+  # in August 2026 and left a GitHub App private key in exactly that state.
+  #
+  # Which is why the second stage exists. That key was still referenced in
+  # nightly.yml on six other branches, three of them with an open pull request,
+  # so deleting it would have failed create-github-app-token at the start of
+  # their jobs. So the finding says *when* it becomes safe rather than asserting
+  # that it is, and an older precedent argues the same way from the other side:
+  # bcr-common/add-clippy-ci referenced an organisation secret on a branch dead
+  # since January, and granting the secret to satisfy it would have widened the
+  # blast radius for nothing. Live branches block a deletion; dead ones must not
+  # block it. Ninety days is where that line sits.
+  if [ -s "$WORK/wfbody" ]; then
+    { gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate \
+        --jq '.secrets[]?.name' 2>/dev/null
+      gh api "repos/$ORG/$repo/actions/variables?per_page=100" --paginate \
+        --jq '.variables[]?.name' 2>/dev/null
+    } | sort -u > "$WORK/creds" || : > "$WORK/creds"
+    while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      grep -qF -- "$name" "$WORK/wfbody" && continue
+      # Unreferenced on the default branch. Now the second half, and only for the
+      # few names that reach it: which other branches still name it, and are any
+      # of them alive.
+      #
+      # Every branch is scanned, not only recent ones, because a reference on an
+      # old branch still has to be *found* before it can be judged. The date is
+      # then fetched only for the branches that matched -- repos/{r}/branches
+      # returns just {sha, url} under .commit, so the push date is not in the
+      # listing and needs the per-branch endpoint. Blobs are deduplicated by SHA,
+      # so a workflow unchanged across twenty branches is fetched once.
+      : > "$WORK/seen"
+      : > "$WORK/matched"
+      while IFS= read -r bname; do
+        [ -z "$bname" ] && continue
+        [ "$bname" = "$branch" ] && continue
+        while IFS="$(printf '\t')" read -r bpath bsha; do
+          [ -z "$bsha" ] && continue
+          grep -qxF "$bsha" "$WORK/seen" && continue
+          echo "$bsha" >> "$WORK/seen"
+          if gh api "repos/$ORG/$repo/git/blobs/$bsha" --jq '.content' 2>/dev/null \
+             | base64 -d 2>/dev/null | grep -qF -- "$name"; then
+            grep -qxF "$bname" "$WORK/matched" || echo "$bname" >> "$WORK/matched"
+          fi
+        done < <(gh api "repos/$ORG/$repo/git/trees/$bname?recursive=1" \
+                   --jq '.tree[]? | select(.type == "blob")
+                         | select(.path | test("^\\.github/workflows/.*\\.ya?ml$"))
+                         | [.path, .sha] | @tsv' 2>/dev/null)
+      done < <(gh api "repos/$ORG/$repo/branches?per_page=100" --paginate \
+                 --jq '.[].name' 2>/dev/null)
+
+      live=""
+      dead=0
+      while IFS= read -r bname; do
+        [ -z "$bname" ] && continue
+        bdate=$(gh api "repos/$ORG/$repo/branches/$bname" \
+                  --jq '.commit.commit.committer.date // .commit.commit.author.date // ""' 2>/dev/null || echo "")
+        if [ -n "$bdate" ] && [ "$bdate" \> "$CUTOFF" ]; then
+          live="$live $bname"
+        else
+          dead=$((dead + 1))
+        fi
+      done < "$WORK/matched"
+
+      if [ -n "$live" ]; then
+        echo "$repo|$name is read by no workflow on $branch, but is still referenced on:$live — deletable once those merge or rebase" >> "$WORK/findings"
+      elif [ "$dead" -gt 0 ]; then
+        echo "$repo|$name is read by no workflow on $branch, and only by $dead branch(es) with no push in 90 days — safe to delete" >> "$WORK/findings"
+      else
+        echo "$repo|$name is read by no workflow on any branch — safe to delete" >> "$WORK/findings"
+      fi
+    done < "$WORK/creds"
+  fi
 
   # A copy of an inherited file that is identical to the organisation version is a
   # file that drifts later and reports nothing when it does.
