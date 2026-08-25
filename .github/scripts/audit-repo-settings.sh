@@ -184,15 +184,16 @@ while IFS= read -r repo; do
       configured=$(jq -r '[.updates[]?."package-ecosystem"] | unique | join(" ")' "$WORK/db.json")
       uncovered=""
       for e in $eco; do
-        # docker is uncovered on purpose. Nine repositories carry a Dockerfile or
-        # a compose file and no docker block, and that was decided rather than
-        # overlooked: the
-        # ecosystem needs a docker label in labels.yml and would add a notable
-        # volume of pull requests, so it was deferred until after the P2 hoisting
-        # work. Reporting seven repositories every week against a standing
-        # decision is how a report loses its audience. Delete this line when the
-        # docker blocks land, and the check starts covering them again with no
-        # other edit.
+        # docker is uncovered on purpose. Nine repositories carry a Dockerfile
+        # or a compose file and no docker block, and that was a decision rather
+        # than an oversight: the ecosystem needs a docker label in labels.yml
+        # and would add a notable volume of pull requests, so it was deferred
+        # until after the P2 hoisting work. Reporting nine repositories every
+        # week against a standing decision is how a report trains its audience
+        # to ignore it -- the same reasoning as the no-manifest case above.
+        # Delete this line when the docker blocks land and the check covers
+        # them again with no other edit. terraform is deliberately not skipped:
+        # it fires on one repository, and one standing line is a reminder.
         [ "$e" = docker ] && continue
         case " $configured " in *" $e "*) ;; *) uncovered="$uncovered $e" ;; esac
       done
