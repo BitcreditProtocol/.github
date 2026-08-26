@@ -269,7 +269,14 @@ while IFS= read -r repo; do
     } | sort -u > "$WORK/creds" || : > "$WORK/creds"
     while IFS= read -r name; do
       [ -z "$name" ] && continue
-      grep -qF -- "$name" "$WORK/wfbody" && continue
+      # A reference, not a mention. E-Bill-frontend/notify-wallet-repo.yml
+      # sets an env key literally named GH_TOKEN, fed from secrets.GITHUB_TOKEN --
+      # six bare matches for "GH_TOKEN" and none for "secrets.GH_TOKEN". A bare
+      # grep therefore skipped a genuinely orphaned secret of that name. The
+      # trailing class is a portable word boundary: it keeps FOO from matching
+      # secrets.FOO_BAR, and BSD grep has no \b.
+      grep -qE -- "(secrets|vars)\.${name}([^A-Za-z0-9_]|$)" "$WORK/wfbody" \
+        && continue
       # Unreferenced on the default branch. Now the second half, and only for the
       # few names that reach it: which other branches still name it, and are any
       # of them alive.
@@ -290,7 +297,8 @@ while IFS= read -r repo; do
           grep -qxF "$bsha" "$WORK/seen" && continue
           echo "$bsha" >> "$WORK/seen"
           if gh api "repos/$ORG/$repo/git/blobs/$bsha" --jq '.content' 2>/dev/null \
-             | base64 -d 2>/dev/null | grep -qF -- "$name"; then
+             | base64 -d 2>/dev/null \
+             | grep -qE -- "(secrets|vars)\\.${name}([^A-Za-z0-9_]|$)"; then
             grep -qxF "$bname" "$WORK/matched" || echo "$bname" >> "$WORK/matched"
           fi
         done < <(gh api "repos/$ORG/$repo/git/trees/$bname?recursive=1" \
@@ -313,8 +321,34 @@ while IFS= read -r repo; do
         fi
       done < "$WORK/matched"
 
+      # Before telling anyone to delete a credential, look outside
+      # .github/workflows on the default branch. E-Bill-frontend keeps
+      # CROWDIN_PERSONAL_TOKEN in crowdin.yml, and this repository has 37
+      # config files there that no workflow scan can see -- so a workflow-only
+      # sweep would call a live credential orphaned. Telling someone to delete a
+      # working secret is the one false positive this script must never produce,
+      # so the match here is deliberately the loose bare name: over-reporting
+      # "still in use" is the safe direction. Only the few names that would
+      # otherwise reach a delete verdict pay for the extra tree walk.
+      elsewhere=""
+      if [ -z "$live" ]; then
+        while IFS="$(printf '\t')" read -r cpath csha; do
+          [ -z "$csha" ] && continue
+          if gh api "repos/$ORG/$repo/git/blobs/$csha" --jq '.content' 2>/dev/null \
+             | base64 -d 2>/dev/null | grep -qF -- "$name"; then
+            elsewhere="$elsewhere $cpath"
+          fi
+        done < <(gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
+                   --jq '.tree[]? | select(.type == "blob")
+                         | select(.path | test("^\\.github/workflows/") | not)
+                         | select(.path | test("\\.(ya?ml|json|sh|toml)$") or test("\\.env"))
+                         | [.path, .sha] | @tsv' 2>/dev/null)
+      fi
+
       if [ -n "$live" ]; then
         echo "$repo|$name is read by no workflow on $branch, but is still referenced on:$live — deletable once those merge or rebase" >> "$WORK/findings"
+      elif [ -n "$elsewhere" ]; then
+        echo "$repo|$name is read by no workflow, but is referenced outside .github/workflows on $branch:$elsewhere — not safe to delete" >> "$WORK/findings"
       elif [ "$dead" -gt 0 ]; then
         echo "$repo|$name is read by no workflow on $branch, and only by $dead branch(es) with no push in 90 days — safe to delete" >> "$WORK/findings"
       else
