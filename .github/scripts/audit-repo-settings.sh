@@ -164,7 +164,24 @@ while IFS= read -r repo; do
     gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" --jq '.content' 2>/dev/null \
       | base64 -d > "$WORK/db.yml" 2>/dev/null || : > "$WORK/db.yml"
     want=$(jq -r --arg r "$repo" '.assignees[$r] // ""' "$WORK/assignees.json")
-    if [ -z "$want" ]; then
+
+    # A fork's dependabot.yml belongs to the project we forked. crowdin-sdk
+    # arrived in August 2026 as a fork of crowdin/flutter-sdk carrying upstream's
+    # file -- monthly pub, all majors ignored, no assignees -- and demanding our
+    # assignee convention there would mean editing a forked file to diverge from
+    # upstream for no gain. So dependabot-assignees.yml records the exemption
+    # rather than the script testing .fork directly: a list says which repository
+    # and which upstream, and it stops applying when the premise goes, which a
+    # fork test cannot notice. If the repository is no longer a fork, say so --
+    # the same reasoning license.yml gives for third_party.
+    upstream=$(jq -r --arg r "$repo" \
+      '.upstream_config // [] | map(select(.repository == $r)) | .[0].upstream // ""' \
+      "$WORK/assignees.json")
+    if [ -n "$upstream" ] && [ "$(echo "$meta" | jq -r '.fork')" != "true" ]; then
+      echo "$repo|listed in dependabot-assignees.yml upstream_config as forked from $upstream, but is not a fork any more — the exemption has lost its premise" >> "$WORK/findings"
+    fi
+
+    if [ -z "$want" ] && [ -z "$upstream" ]; then
       echo "$repo|has dependabot.yml but no entry in dependabot-assignees.yml" >> "$WORK/findings"
     elif ! yq -o=json '.' "$WORK/db.yml" > "$WORK/db.json" 2>/dev/null; then
       echo "$repo|.github/dependabot.yml does not parse as YAML" >> "$WORK/findings"
@@ -178,7 +195,10 @@ while IFS= read -r repo; do
             elif length == 0 then "nobody"
             else join("+") end ]
         | unique | join(", ")' "$WORK/db.json")
-      if [ -n "$wrong" ]; then
+      # No expected assignee means the repository is exempt above, not that
+      # every block is wrong -- with $want empty the comparison below calls
+      # every block "nobody".
+      if [ -n "$wrong" ] && [ -n "$want" ]; then
         echo "$repo|Dependabot assignee should be $want on every update block, found: $wrong" >> "$WORK/findings"
       fi
 
