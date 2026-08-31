@@ -276,16 +276,56 @@ while IFS= read -r repo; do
   # attestations: write and produced no attestation, while ten container images
   # shipped with no provenance at all.
   : > "$WORK/wfbody"
+  : > "$WORK/prt"
+  : > "$WORK/floating"
   while IFS= read -r wf; do
     [ -z "$wf" ] && continue
     body=$(gh api "repos/$ORG/$repo/contents/$wf?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null)
     [ -z "$body" ] && continue
     # kept for the credential check below: these bodies are already paid for here
     printf '%s\n' "$body" >> "$WORK/wfbody"
+
+    # pull_request_target runs in the base repository's context, with its token and
+    # its secrets, on a pull request from anywhere. It is only an escalation when
+    # something attacker-controlled then executes -- a checkout of the head ref, a
+    # build, a script reading the branch -- so this reports the trigger rather than
+    # asserting a vulnerability, and a reviewer decides. crowdin-sdk acquired one in
+    # August 2026 by being forked with upstream's CI intact; that one reads the
+    # pull-request title from the event payload and checks out nothing, so it is
+    # safe as it stands. The point is that nothing would have said so.
+    #
+    # workflow_run and repository_dispatch are deliberately not reported. Both
+    # exist, both are recorded in the plan, and neither is going to change, so a
+    # weekly line for each would be two permanent findings against no decision.
+    case "$body" in *pull_request_target:*) printf '%s\n' "$wf" >> "$WORK/prt" ;; esac
+
+    # A tag or branch in a uses: reference is a moving target: whoever controls it
+    # can change what runs here, and the reference says nothing about what ran last
+    # time. Every active default branch in this organisation is SHA-pinned -- the
+    # figure Clemens was given when asked to enable sha_pinning_required -- except
+    # the forked repository, whose four inherited workflows carry thirteen floating
+    # references including one into another organisation pinned to @main.
+    # Aggregated per repository: thirteen findings for one repository is a wall,
+    # one finding naming the count is a fact. Local calls are exempt because ./
+    # resolves inside the repository itself.
+    printf '%s\n' "$body" \
+      | grep -oE '^[[:space:]]*(- )?uses:[[:space:]]*[^[:space:]]+' \
+      | sed 's|.*uses:[[:space:]]*||' \
+      | grep -v '^\./' | grep -vE '@[0-9a-f]{40}$' >> "$WORK/floating" || true
+
     case "$body" in *"attestations: write"*) ;; *) continue ;; esac
     case "$body" in *attest-build-provenance*) continue ;; esac
     echo "$repo|$wf grants attestations: write with no attest step" >> "$WORK/findings"
   done < <(grep -E '^\.github/workflows/.*\.ya?ml$' "$WORK/tree" || true)
+
+  if [ -s "$WORK/prt" ]; then
+    echo "$repo|pull_request_target in: $(tr '\n' ' ' < "$WORK/prt" | sed 's/ $//') — runs with this repository's token on a pull request from anywhere" >> "$WORK/findings"
+  fi
+  if [ -s "$WORK/floating" ]; then
+    n_float=$(sort -u "$WORK/floating" | wc -l | tr -d ' ')
+    eg=$(sort -u "$WORK/floating" | head -2 | tr '\n' ' ' | sed 's/ $//')
+    echo "$repo|$n_float uses: reference(s) not pinned to a commit, e.g. $eg" >> "$WORK/findings"
+  fi
 
   # A credential no workflow on the default branch reads any more. Removing the
   # last consumer orphans a secret silently: nothing fails, and a default-branch
