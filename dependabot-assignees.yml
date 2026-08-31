@@ -14,6 +14,8 @@
 # Adding a repository: add the line here, then set assignees on every update
 # block in that repository's dependabot.yml. The audit will tell you if you
 # only do one of the two.
+#
+# A fork is the exception, and upstream_config below is where it is recorded.
 
 assignees:
   ".github": cleot
@@ -39,3 +41,17 @@ assignees:
   Wildcat-Auxiliary: codingpeanut157
   wildcat-dashboard-ui: JulianVIE
   Wildcat-deployment: cleot
+
+# Repositories whose .github/dependabot.yml belongs to an upstream project we
+# forked, so the assignee convention above is deliberately not enforced on it.
+# Setting assignees there would diverge the file from upstream for no gain —
+# the same reason wallet/packages/crowdin_sdk was kept out of Dependabot while
+# it was a verbatim vendored copy.
+#
+# Listed rather than skipped by a fork test, for the reason license.yml gives
+# about third_party: an exemption should say which repository and why, and it
+# should stop applying if the premise changes. audit-repo-settings reports any
+# repository here that is no longer a fork.
+upstream_config:
+  - repository: crowdin-sdk
+    upstream: crowdin/flutter-sdk
