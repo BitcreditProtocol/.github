@@ -1,0 +1,27 @@
+name: Git auth with token
+description: >
+  Configure git to fetch GitHub repositories over authenticated HTTPS, so a
+  cargo or pub dependency pointing at a private repository resolves. Rewrites
+  every URL form a manifest might use, not only https, because a manifest that
+  says git@github.com: fails silently otherwise.
+
+inputs:
+  token:
+    description: >
+      Token with read access to the repositories the dependencies live in.
+      Usually the output of actions/create-github-app-token.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Configure git auth
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        git config --global --add url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+        git config --global --add url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+        git config --global --add url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
+        git config --global --add url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git://github.com/"
+        git config --global --add url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "ssh://github.com/"
