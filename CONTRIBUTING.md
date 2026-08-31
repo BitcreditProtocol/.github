@@ -24,6 +24,43 @@ rulesets, not aspirations.
   a different contact; if the repository has one, that one wins.
 - [The code of conduct][coc] applies everywhere, including reviews.
 
+## Finding something to work on
+
+Work is tracked as **issues on the repository itself**. There are also
+organisation-level project boards, but most of them are private, so if you are
+not a member you will see only part of the picture — the repository's own issue
+list is the reliable place to look.
+
+Four labels are worth knowing. All four are defined in [`labels.yml`][labels],
+which is the only place any of them is described:
+
+| Label | What it means | Where |
+|---|---|---|
+| `good first issue` | open to anyone, and a reasonable starting point | every repository |
+| `help wanted` | open to anyone, not necessarily beginner-friendly | every repository |
+| `blocked` | waiting on other work — do not start it | the repositories that use it |
+| `staff only` | needs infrastructure access or institutional knowledge that cannot practically be handed over — do not start it | the repositories that use it |
+
+The distinction in that last column is real rather than pedantic. The first two
+are created everywhere automatically; the other two are corrected where a
+repository already has them and are never added to a repository that does not,
+because which workflow labels a team wants is that team's business. So a
+repository having no `blocked` label does not mean nothing there is blocked.
+
+The first two are also **applied sparingly** — at the time of writing only a
+couple of open issues carry either, out of several hundred. Their absence is not
+a signal that an issue is unavailable. If an issue interests you and nothing
+marks it as taken, ask in a comment.
+
+Before you start, read the issue's comments. If someone has said they are on it
+and there has been activity in the last week or so, pick something else.
+
+**For anything larger than a small fix, open an issue first** and describe what
+you intend to do and why. This is the maintainers' preference rather than
+something enforced — a one-line change does not need one, a redesign does, and
+agreeing the approach before you write it is cheaper for everybody than
+discovering the disagreement in review.
+
 ## Work out which branch to target first
 
 **The default branch is not always the one to open your pull request against.**
@@ -105,6 +142,11 @@ missed.
 For issues, use the templates — there is one for bug reports and one for feature
 requests.
 
+**Reviewing someone else's pull request is welcome**, whether or not you are the
+assigned reviewer. Review capacity is the thing this organisation is shortest
+of. Be kind and specific about it: say what you would change and why, not just
+that something is wrong.
+
 ## After it merges
 
 Your branch is **deleted automatically** on merge, in every repository. Nothing
@@ -112,7 +154,7 @@ auto-merges anywhere, so a pull request sits until a person merges it.
 
 ## Dependencies
 
-Dependabot is configured in 23 of the 29 active repositories, with grouped
+Dependabot is configured in 24 of the 29 active repositories, with grouped
 updates, a cooldown before a release is offered, and an assignee per ecosystem.
 **Do not hand-bump a dependency it already offers** — you will conflict with an
 open pull request, and the bump will be raised again anyway. If an update needs
@@ -126,13 +168,6 @@ Every repository carries a `stack` custom property — `rust`, `node`, `flutter`
 instructions live in each repository's own `README.md`; this file deliberately
 does not duplicate them.
 
----
-
-Organisation members: additional internal process is in the
-[Contributing Code][contributing] document. It requires a Bitcredit Google
-account, so it is not readable from outside the organisation — everything needed
-to contribute is above.
-
 [security]: https://github.com/BitcreditProtocol/.github/blob/master/SECURITY.md
 [coc]: https://github.com/BitcreditProtocol/.github/blob/master/CODE_OF_CONDUCT.md
-[contributing]: https://docs.google.com/document/d/18468Jb_PT4Sn1YoiwsEIZmWXUb2opxEQzFyGGnwH5VQ/edit?usp=sharing
+[labels]: https://github.com/BitcreditProtocol/.github/blob/master/labels.yml
