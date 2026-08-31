@@ -30,6 +30,12 @@ SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 CUTOFF="$(date -u -d '90 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
           || date -u -v-90d '+%Y-%m-%dT%H:%M:%SZ')"
 
+# How recently a pull request must have moved for its drift to be worth counting
+# as live. Used by the behind-base metric to separate branches somebody is still
+# working on from ones that have been parked.
+CUTOFF30="$(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+            || date -u -v-30d '+%Y-%m-%dT%H:%M:%SZ')"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -53,6 +59,27 @@ gh api "orgs/$ORG/repos?per_page=100" --paginate --slurp > "$WORK/repos.json"
 # rather than --jq for the same reason as the line above: --paginate with --jq
 # returns one array per page and has produced an empty set three times here.
 gh api "orgs/$ORG/properties/values?per_page=100" --paginate --slurp > "$WORK/props.json"
+
+# Organisation membership, for the environment-reviewer check. An approval
+# request cannot be routed to somebody without access, so such a reviewer is
+# dead weight that makes a gate look stronger than it is: bcr-relay/prod
+# appeared to have four approvers and had three.
+gh api "orgs/$ORG/members?per_page=100" --paginate --jq '.[].login' | sort > "$WORK/members"
+
+# Organisation secret names, and which repositories each is granted to. Read
+# once: five secrets, so five extra requests rather than five per repository.
+gh api "orgs/$ORG/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' | sort > "$WORK/orgsecrets"
+: > "$WORK/orggrants"
+while IFS= read -r s; do
+  [ -z "$s" ] && continue
+  gh api "orgs/$ORG/actions/secrets/$s/repositories" --paginate --jq '.repositories[]?.name' 2>/dev/null \
+    | sed "s|^|$s |" >> "$WORK/orggrants"
+done < "$WORK/orgsecrets"
+
+# Counters for the two metrics that are deliberately not findings.
+n_untimed=0; n_agentfiles=0; n_agentrepos=0
+: > "$WORK/untimedrepos"
+: > "$WORK/untimedrepos"
 jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WORK/repos"
 total=$(wc -l < "$WORK/repos" | tr -d ' ')
 echo "Auditing $total non-archived repositories (dry_run=$DRY_RUN)"
@@ -103,6 +130,8 @@ while IFS= read -r repo; do
   fi
 
   # --- report only
+  visibility=$(echo "$meta" | jq -r '.visibility')
+
   [ "$(echo "$meta" | jq -r '.description // ""')" = "" ] &&
     echo "$repo|no description" >> "$WORK/findings"
 
@@ -247,6 +276,23 @@ while IFS= read -r repo; do
         echo "$repo|dependabot.yml does not cover:$uncovered (has: $configured)" >> "$WORK/findings"
       fi
 
+      # One group per code ecosystem. Two -- a patch group and a minor group --
+      # doubles the weekly pull requests for no gain, and none at all means every
+      # dependency arrives separately: that is what produced a 68-pull-request
+      # backlog nobody could filter. github-actions is excluded because its group
+      # is patterns-based and monthly by design. A fork is excluded too: its
+      # dependabot.yml belongs upstream, recorded in upstream_config rather than
+      # tested for here, for the reason license.yml gives about third_party.
+      if [ -z "$upstream" ]; then
+        badgroups=$(jq -r '[.updates[]?
+          | select(."package-ecosystem" != "github-actions")
+          | select(((.groups // {}) | length) != 1)
+          | "\(."package-ecosystem") has \(((.groups // {}) | length)) group(s)"]
+          | unique | join(", ")' "$WORK/db.json")
+        [ -n "$badgroups" ] &&
+          echo "$repo|an ecosystem should have exactly one group: $badgroups" >> "$WORK/findings"
+      fi
+
       # Dependabot applies only labels that already exist and silently drops the
       # rest. Fifteen of twenty-two configured repositories named a label they did
       # not have -- 31 pairs -- so pull requests arrived carrying fewer labels than
@@ -278,6 +324,8 @@ while IFS= read -r repo; do
   : > "$WORK/wfbody"
   : > "$WORK/prt"
   : > "$WORK/floating"
+  : > "$WORK/idtoken"
+  : > "$WORK/noperm"
   while IFS= read -r wf; do
     [ -z "$wf" ] && continue
     body=$(gh api "repos/$ORG/$repo/contents/$wf?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null)
@@ -298,6 +346,45 @@ while IFS= read -r repo; do
     # exist, both are recorded in the plan, and neither is going to change, so a
     # weekly line for each would be two permanent findings against no decision.
     case "$body" in *pull_request_target:*) printf '%s\n' "$wf" >> "$WORK/prt" ;; esac
+
+    # id-token: write lets a workflow mint an OIDC identity. Granted and never
+    # used it is a capability nobody asked for, and the consumers are a closed
+    # list: a cloud login, an npm or PyPI publish with provenance, buildx
+    # provenance, an attestation, cosign. Nine files grant it without one.
+    case "$body" in
+      *"id-token: write"*)
+        printf '%s\n' "$body" | grep -qE 'npm publish|--provenance|provenance:[[:space:]]*true|google-github-actions/auth|aws-actions/configure-aws-credentials|azure/login|attest-build-provenance|cosign|sigstore|pypa/gh-action-pypi|dart-lang/setup-dart' \
+          || printf '%s\n' "$wf" >> "$WORK/idtoken"
+        ;;
+    esac
+
+    # A public repository whose pull_request workflow declares no permissions
+    # inherits whatever the default is, on a run triggered from a fork. The
+    # organisation default is read, so this is a tightening rather than a hole --
+    # but the default is a setting somebody can change, and a workflow that
+    # states its own needs does not depend on that.
+    if [ "$visibility" = "public" ]; then
+      case "$body" in
+        *"pull_request:"*)
+          printf '%s\n' "$body" | grep -qE '^[[:space:]]*permissions:' \
+            || printf '%s\n' "$wf" >> "$WORK/noperm"
+          ;;
+      esac
+    fi
+
+    # Untimed jobs, counted rather than reported: fifty across thirteen
+    # repositories would bury every other finding, and fifteen open pull
+    # requests fix most of it. A job that calls a reusable workflow cannot take
+    # timeout-minutes at all, so those are excluded -- the timeout for that work
+    # belongs inside the called workflow.
+    printf '%s\n' "$body" > "$WORK/wf1.yml"
+    if yq -o=json '.' "$WORK/wf1.yml" > "$WORK/wfjson" 2>/dev/null; then
+      c=$(jq '[.jobs // {} | to_entries[] | select((.value|type)=="object")
+               | select((.value|has("uses")) == false)
+               | select((.value|has("timeout-minutes")) == false)] | length' "$WORK/wfjson" 2>/dev/null || echo 0)
+      n_untimed=$((n_untimed + c))
+      [ "$c" -gt 0 ] && printf '%s\n' "$repo" >> "$WORK/untimedrepos"
+    fi
 
     # A tag or branch in a uses: reference is a moving target: whoever controls it
     # can change what runs here, and the reference says nothing about what ran last
@@ -325,6 +412,12 @@ while IFS= read -r repo; do
     n_float=$(sort -u "$WORK/floating" | wc -l | tr -d ' ')
     eg=$(sort -u "$WORK/floating" | head -2 | tr '\n' ' ' | sed 's/ $//')
     echo "$repo|$n_float uses: reference(s) not pinned to a commit, e.g. $eg" >> "$WORK/findings"
+  fi
+  if [ -s "$WORK/idtoken" ]; then
+    echo "$repo|id-token: write with nothing that mints a token, in: $(tr '\n' ' ' < "$WORK/idtoken" | sed 's/ $//')" >> "$WORK/findings"
+  fi
+  if [ -s "$WORK/noperm" ]; then
+    echo "$repo|public repository, pull_request workflow with no permissions block: $(tr '\n' ' ' < "$WORK/noperm" | sed 's/ $//')" >> "$WORK/findings"
   fi
 
   # A credential no workflow on the default branch reads any more. Removing the
@@ -462,7 +555,118 @@ while IFS= read -r repo; do
   attached=$(gh api "repos/$ORG/$repo/code-security-configuration" --jq '.configuration.name // "none"' 2>/dev/null || echo none)
   [ "$attached" = "$BASELINE_CONFIG" ] ||
     echo "$repo|security configuration is '$attached', expected '$BASELINE_CONFIG'" >> "$WORK/findings"
+
+  # A repository secret whose name also exists at organisation level. Which value
+  # a workflow gets is then not obvious from reading the workflow, and the answer
+  # is the repository one. bcr-relay has its own GCP_SERVICE_ACCOUNT_KEY, last
+  # rotated 2025-09-11, in a repository whose last functional commit was March --
+  # so an eleven-month-old cloud credential sits somewhere nobody is looking, and
+  # narrowing the organisation secret did not touch it.
+  gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' 2>/dev/null \
+    | sort > "$WORK/reposecrets" || : > "$WORK/reposecrets"
+  shadow=$(comm -12 "$WORK/reposecrets" "$WORK/orgsecrets" | tr '\n' ' ' | sed 's/ $//')
+  [ -n "$shadow" ] &&
+    echo "$repo|repository secret shadows an organisation secret of the same name: $shadow" >> "$WORK/findings"
+
+  # A workflow naming an organisation secret this repository was never granted.
+  # The repository's own secrets are subtracted first: bcr-relay references
+  # GCP_SERVICE_ACCOUNT_KEY and holds its own, so the reference resolves and the
+  # naive form of this check reports a repository that is working correctly. The
+  # shadowing check above is the honest way to surface that same fact.
+  notgranted=""
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    grep -qE "secrets\.$s([^A-Za-z0-9_]|\$)" "$WORK/wfbody" || continue
+    grep -qxF "$s" "$WORK/reposecrets" && continue
+    grep -qxF "$s $repo" "$WORK/orggrants" && continue
+    notgranted="$notgranted $s"
+  done < "$WORK/orgsecrets"
+  [ -n "$notgranted" ] &&
+    echo "$repo|references organisation secret(s) it was not granted:$notgranted" >> "$WORK/findings"
+
+  # An environment holding secrets with no protection rule at all. Two are
+  # accepted and named here rather than skipped silently: Wildcat-deployment's
+  # wildcat-dev holds a test seed and stays open so dev iteration is fast, and
+  # wallet's dev cannot take a branch policy because 292 of 343 dispatches of
+  # build-dev.yml come from feature branches -- restricting it would break the
+  # process rather than close a hole. Delete a line here and the check reports it
+  # again, which is the point of a list over a silent skip.
+  gh api "repos/$ORG/$repo/environments?per_page=100" --jq '.environments[]?|select((.protection_rules|length)==0)|.name' 2>/dev/null \
+  | while IFS= read -r env; do
+      [ -z "$env" ] && continue
+      case "$repo/$env" in
+        Wildcat-deployment/wildcat-dev) continue ;;
+        wallet/dev)                     continue ;;
+      esac
+      ns=$(gh api "repos/$ORG/$repo/environments/$env/secrets" --jq '.total_count' 2>/dev/null || echo 0)
+      # if, not [ ] && -- this while is the right-hand side of a pipeline, so its
+      # body's last command is the pipeline's exit status, and a false AND-list
+      # there aborts the whole script under set -e. Demonstrated, not assumed:
+      # `printf 1 | while read x; do [ "$x" -gt 5 ] && echo big; done; echo alive`
+      # never reaches the echo, while the same loop fed by a redirect does.
+      if [ "$ns" != "0" ]; then
+        echo "$repo|environment '$env' holds $ns secret(s) and has no protection rule" >> "$WORK/findings"
+      fi
+    done
+
+  # A required reviewer who is not an organisation member. An approval request
+  # cannot reach them, so the gate has fewer approvers than it appears to --
+  # bcr-relay/prod listed four and had three until tompro was removed.
+  gh api "repos/$ORG/$repo/environments?per_page=100" --jq \
+    '.environments[]?|.name as $e|.protection_rules[]?|select(.type=="required_reviewers")|.reviewers[]?|"\($e)|\(.reviewer.login // .reviewer.name // "?")"' 2>/dev/null \
+  | while IFS='|' read -r env who; do
+      [ -z "$who" ] && continue
+      grep -qxF "$who" "$WORK/members" ||
+        echo "$repo|environment '$env' lists '$who' as a reviewer, who is not an organisation member" >> "$WORK/findings"
+    done
+
+  # Agent-instruction files outside the enterprise ruleset's two globs, counted
+  # rather than reported. The ruleset restricts .github/agents/*.md and
+  # agents/*.md, neither of which exists anywhere, while seventeen files that do
+  # shape agent behaviour -- CLAUDE.md, AGENTS.md, .claude/ -- are uncovered.
+  # Owner decision 2026-08-18: record, do not widen, because file_path_restriction
+  # on a push target would put an enterprise owner in the way of routine .claude/
+  # edits in bit.cr.
+  c=$(grep -cE '(^|/)(CLAUDE|AGENTS)\.md$|(^|/)\.claude/|(^|/)\.github/copilot-instructions\.md$' "$WORK/tree" || true)
+  if [ "$c" -gt 0 ]; then
+    n_agentfiles=$((n_agentfiles + c))
+    n_agentrepos=$((n_agentrepos + 1))
+  fi
 done < "$WORK/repos"
+
+# An open pull request whose head is behind its base. A green tick on a stale
+# branch is a lie: it says the code passed against a base that has since moved.
+#
+# Counted rather than reported, and split three ways, because the raw number is
+# 57 and 39 of those are Dependabot's -- a Dependabot branch self-heals the
+# moment it is recreated from a pinned default branch, so reporting it every
+# Monday is noise. What is left is a dozen branches other teams are actively
+# working on, and the only remedy is update-branch on somebody else's branch,
+# which is not ours to press: tip-commit authorship is not ownership.
+#
+# Two are excluded by an explicit owner decision of 2026-08-25 -- bit.cr#1 and
+# bitcr.org#1 are not to be touched at all, so their drift is the expected state
+# rather than a finding, and keeping a branch level with base is a write to it.
+: > "$WORK/behind"
+while IFS= read -r r; do
+  [ -z "$r" ] && continue
+  gh api "repos/$ORG/$r/pulls?state=open&per_page=100" --paginate \
+    --jq '.[]|"\(.number)|\(.base.ref)|\(.head.ref)|\(.head.repo.full_name // "")|\(.user.login)|\(.updated_at)|\(.draft)"' 2>/dev/null \
+  | while IFS='|' read -r num base head hrepo who upd draft; do
+      [ -z "$num" ] && continue
+      [ "$hrepo" = "$ORG/$r" ] || continue          # a fork's branch is not ours to update
+      case "$r#$num" in "bit.cr#1"|"bitcr.org#1") continue ;; esac
+      n=$(gh api "repos/$ORG/$r/compare/$base...$head" --jq '.behind_by' 2>/dev/null || echo 0)
+      case "$n" in ''|*[!0-9]*) n=0 ;; esac         # a null behind_by is not an integer
+      if [ "$n" -gt 0 ]; then                       # if, not && -- see the note above
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$r" "$num" "$n" "$who" "$upd" "$draft" >> "$WORK/behind"
+      fi
+    done
+done < "$WORK/repos"
+n_behind=$(awk 'END{print NR}' "$WORK/behind")
+n_behind_bot=$(awk -F'\t' '$4 ~ /dependabot/ {c++} END{print c+0}' "$WORK/behind")
+n_behind_live=$(awk -F'\t' -v c="$CUTOFF30" \
+  '$4 !~ /dependabot/ && $6 != "true" && $5 > c {n++} END{print n+0}' "$WORK/behind")
 
 # The other direction: an entry left behind by a rename, an archive or a
 # deletion. A mapping that quietly points at nothing stops being trusted, and an
@@ -553,6 +757,14 @@ done < "$WORK/repos"
   echo
   cat "$WORK/dependabot.md"
   echo
+  echo "### Coverage that is measured rather than reported"
+  echo
+  n_untimed_repos=$(sort -u "$WORK/untimedrepos" | awk 'END{print NR}')
+  echo "- jobs with no \`timeout-minutes\`: **$n_untimed** across **$n_untimed_repos** repositories — a job with none runs to GitHub's six-hour default. Not a finding: fifty lines would bury everything else, and the remainder after the open pull requests merge is deferred for stated reasons — a dormant repository, dispatch-only workflows, one job behind \`if: false\`. Caller jobs are excluded because they cannot take the key at all."
+  echo "- open pull requests behind their base: **$n_behind** — of which **$n_behind_bot** are Dependabot's, which self-heal when the branch is recreated from a pinned default, leaving **$n_behind_live** that are not drafts and were touched in the last 30 days. Not a finding: the remedy is \`update-branch\` on another team's branch, and tip-commit authorship is not ownership. \`bit.cr#1\` and \`bitcr.org#1\` are excluded by the owner's decision of 2026-08-25."
+  echo "- agent-instruction files outside the enterprise ruleset's globs: **$n_agentfiles** across **$n_agentrepos** repositories — the ruleset restricts \`.github/agents/*.md\` and \`agents/*.md\`, and neither directory exists anywhere. Owner decision 2026-08-18: record, do not widen."
+  echo
+
   echo "### Secrets"
   echo
   echo "- behind an approval gate: **$gated** — environment-level, inside an environment that has a protection rule"
