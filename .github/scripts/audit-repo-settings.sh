@@ -47,6 +47,12 @@ else
 fi
 
 gh api "orgs/$ORG/repos?per_page=100" --paginate --slurp > "$WORK/repos.json"
+
+# Custom property values for the whole organisation in one fetch -- 42 rows for
+# 30 active repositories plus 12 archived, well inside a single page. --slurp
+# rather than --jq for the same reason as the line above: --paginate with --jq
+# returns one array per page and has produced an empty set three times here.
+gh api "orgs/$ORG/properties/values?per_page=100" --paginate --slurp > "$WORK/props.json"
 jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WORK/repos"
 total=$(wc -l < "$WORK/repos" | tr -d ' ')
 echo "Auditing $total non-archived repositories (dry_run=$DRY_RUN)"
@@ -99,6 +105,20 @@ while IFS= read -r repo; do
   # --- report only
   [ "$(echo "$meta" | jq -r '.description // ""')" = "" ] &&
     echo "$repo|no description" >> "$WORK/findings"
+
+  # A repository with no stack value. The property is what lets a ruleset or a
+  # report address a group of repositories instead of naming them one by one, so
+  # an unset value silently drops a repository out of every such selection.
+  # "none" is an explicit value for the three repositories that genuinely have no
+  # stack, which is what keeps this check at zero rather than carrying permanent
+  # exceptions -- the failure the dependabot coverage check had until it was
+  # narrowed. It found crowdin-sdk, which arrived as a fork on 2026-08-28 and was
+  # the only active repository without one; the archived twelve are deliberately
+  # unset and never reach here, because the loop filters them.
+  [ "$(jq -r --arg r "$repo" 'add | map(select(.repository_name == $r))
+        | .[0].properties // [] | map(select(.property_name == "stack"))
+        | .[0].value // ""' "$WORK/props.json")" = "" ] &&
+    echo "$repo|no stack custom property" >> "$WORK/findings"
 
   # LICENSE: present at all, and naming the holder we expect
   if ! gh api "repos/$ORG/$repo/license" --jq '.content' 2>/dev/null | base64 -d > "$WORK/lic" 2>/dev/null \
