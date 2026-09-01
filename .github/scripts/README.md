@@ -1,7 +1,8 @@
 # Organisation automation
 
 Three scheduled workflows keep settings from drifting apart across the
-organisation. Both discover repositories from the API and skip archived ones,
+organisation. All three discover repositories from the API and skip archived
+ones,
 so creating or archiving a repository needs no change here.
 
 | Workflow | Script | Writes | Reports |
@@ -10,8 +11,8 @@ so creating or archiving a repository needs no change here.
 | `prune-package-versions.yml` | `prune-package-versions.sh` | nothing on a schedule | container versions nothing references |
 | `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE and its copyright holder, missing `dependabot.yml` where a manifest exists, Dependabot assignees, empty wikis, security configuration, open Dependabot alerts |
 
-Both accept a `dry_run` input on manual runs, which prints the intended changes
-without writing anything.
+All three accept a `dry_run` input on manual runs, which prints the intended
+changes without writing anything.
 
 `audit-repo-settings` also mirrors its findings into a single issue titled
 **Repository settings drift** in this repository. The issue is updated in place
@@ -38,7 +39,7 @@ actually use their wiki as empty.
 
 ## Setup
 
-Both workflows need an organisation-scoped token. `GITHUB_TOKEN` cannot be used
+All three need an organisation-scoped token. `GITHUB_TOKEN` cannot be used
 — it is scoped to this repository alone and cannot touch the others.
 
 Create a GitHub App owned by the organisation with these repository
@@ -159,10 +160,10 @@ is about to press the button rather than only whoever read this file.
 ### Setup
 
 Needs the automation App to hold the organisation **Packages** permission —
-`read` for the report, `write` to delete. **Granted 2026-08-18**, so the listing
-works; the App now holds `administration:write`, `contents:write`, `issues:write`,
-`metadata:read`, `packages:write`, `pull_requests:write` and
-`vulnerability_alerts:read`.
+`read` for the report, `write` to delete. Without it the script stops at the
+package listing and says so, rather than reporting an empty estate. *(Granted on
+this installation as of 2026-09-01; the permission is the requirement, the date
+is only a note.)*
 
 The same token is reused as a registry credential, base64-encoded, as a
 `Bearer` against `ghcr.io/v2/<owner>/<package>/manifests/<tag>`.

@@ -33,6 +33,13 @@ set -eu
 : "${GH_TOKEN:?GH_TOKEN is required}"
 DRY_RUN="${DRY_RUN:-true}"
 KEEP_DAYS="${KEEP_DAYS:-30}"
+# keep_days is a free-text workflow input. A non-numeric value makes `date` print
+# its usage and the run die on that, which reads like a bug in the script rather
+# than a typo in the form -- and this is the input that decides how much of the
+# estate is old enough to delete.
+case "$KEEP_DAYS" in
+  ''|*[!0-9]*) echo "KEEP_DAYS must be a whole number of days; got '$KEEP_DAYS'." >&2; exit 2 ;;
+esac
 ONLY_PACKAGE="${ONLY_PACKAGE:-}"
 
 # The second of two independent guards on "the schedule never deletes". The
@@ -66,8 +73,16 @@ enc() { printf '%s' "$1" | jq -sRr @uri; }
 
 echo "Cutoff for rule 5: $CUTOFF (KEEP_DAYS=$KEEP_DAYS, dry_run=$DRY_RUN)"
 
-gh api "orgs/$ORG/packages?package_type=container&per_page=100" --paginate --slurp \
-  | jq -r 'add | .[] | .name' > "$WORK/packages"
+# Named rather than left to fail inside jq. Without `Packages: read` the error
+# body reaches jq and the run dies on "Cannot iterate over string", which is a
+# true failure reported as the wrong thing.
+if ! gh api "orgs/$ORG/packages?package_type=container&per_page=100" --paginate --slurp \
+       > "$WORK/packages.json" 2>/dev/null \
+   || ! jq -e 'type == "array"' "$WORK/packages.json" >/dev/null 2>&1; then
+  echo "Could not list container packages — the App is missing \`Packages: read\`." >&2
+  exit 1
+fi
+jq -r 'add | .[] | .name' "$WORK/packages.json" > "$WORK/packages"
 
 total_pkgs=0; total_versions=0; total_delete=0; total_deleted=0; skipped=0
 : > "$WORK/rows"
