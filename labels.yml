@@ -88,11 +88,21 @@ required:
     color: '2496ED'
     description: Pull request that updates Docker dependencies
 
+  # Requested by an issue template rather than by a dependabot.yml, and the
+  # argument is the same one. `Governance`'s proposal form applies this on
+  # creation, which is what lets anyone open a proposal without holding the
+  # permission to label it — a contributor with read access cannot apply a label
+  # by hand. A label a template asks for and the repository lacks is dropped in
+  # silence, so the flow would look like it worked and would not have.
+  - name: awaiting triage
+    color: '628E85'
+    description: Has not been triaged by a maintainer
+
 # Corrected where present, never created. Team workflow labels: which of these a
 # repository wants is that team's business, and pushing them everywhere would add
-# labels nobody uses. Anything a dependabot.yml can request is in `required`
-# above instead, because a missing one breaks an update rather than merely
-# looking untidy.
+# labels nobody uses. Anything a configuration can request — a dependabot.yml or
+# an issue template — is in `required` above instead, because a missing one
+# breaks that configuration rather than merely looking untidy.
 managed:
 
   # cross-cutting, used by some teams
@@ -123,9 +133,6 @@ managed:
   - name: ui library
     color: 'faf3d2'
     description: Related to the shared UI library
-  - name: awaiting triage
-    color: '628E85'
-    description: Has not been triaged by a maintainer
   - name: ticket work required
     color: '6E58CA'
     description: Needs additional work before it is ready to be taken up
