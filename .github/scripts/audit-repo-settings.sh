@@ -10,6 +10,26 @@
 # Repositories come from the API on every run, so a new repository shows up by
 # itself and an archived one drops out.
 #
+# App permissions. The App was set up with Metadata, Issues, Administration,
+# Contents and Dependabot alerts, which is what everything above the credential
+# checks needs. The checks added since need more, and none of them is granted at
+# the time of writing:
+#
+#   Members: read                organisation      environment reviewers
+#   Secrets: read                organisation      shadowing, not-granted
+#   Custom properties: read      organisation      the `stack` check
+#   Secrets: read                repository        shadowing, orphaned credentials,
+#                                                  the secret-surface figures
+#   Variables: read              repository        orphaned credentials
+#   Environments: read           repository        unprotected environments,
+#                                                  non-member reviewers
+#
+# Each is probed once at startup rather than assumed, and whatever is missing is
+# named in a "Not measured on this run" section. A check whose input could not be
+# read is skipped, never reported as zero: an unreadable answer and an empty one
+# are indistinguishable, and reporting the second when it was the first is a
+# false all-clear -- on the secret surface it would read as "nothing is ungated".
+#
 # Env: ORG (required), GH_TOKEN (required), BASELINE_CONFIG (required),
 #      DRY_RUN (default false), LICENSE_JSON (optional, skips the yaml
 #      conversion — used when testing)
@@ -58,27 +78,89 @@ gh api "orgs/$ORG/repos?per_page=100" --paginate --slurp > "$WORK/repos.json"
 # 30 active repositories plus 12 archived, well inside a single page. --slurp
 # rather than --jq for the same reason as the line above: --paginate with --jq
 # returns one array per page and has produced an empty set three times here.
-gh api "orgs/$ORG/properties/values?per_page=100" --paginate --slurp > "$WORK/props.json"
+# Every read below is one the audit gained after the App's permissions were last
+# reviewed, and a 403 on any of them is indistinguishable from an empty answer:
+# no members makes every environment reviewer a non-member, no organisation
+# secrets makes the secret-surface table report "behind no gate: 0", which is a
+# false all-clear on its headline number. So each records a named gap and the
+# checks that depend on it are skipped, the same shape the Dependabot section
+# already uses. gh api is kept out of the pipeline so its status stays visible.
+: > "$WORK/gaps"
+gap() { echo "$1" >> "$WORK/gaps"; }
+
+have_props=""
+if gh api "orgs/$ORG/properties/values?per_page=100" --paginate --slurp > "$WORK/props.json" 2>/dev/null \
+   && jq -e 'type == "array"' "$WORK/props.json" >/dev/null 2>&1; then
+  have_props=1
+else
+  echo '[[]]' > "$WORK/props.json"
+  gap "custom property values — needs \`Custom properties: read\`; the \`stack\` check is skipped"
+fi
 
 # Organisation membership, for the environment-reviewer check. An approval
 # request cannot be routed to somebody without access, so such a reviewer is
 # dead weight that makes a gate look stronger than it is: bcr-relay/prod
 # appeared to have four approvers and had three.
-gh api "orgs/$ORG/members?per_page=100" --paginate --jq '.[].login' | sort > "$WORK/members"
+have_members=""
+if gh api "orgs/$ORG/members?per_page=100" --paginate --jq '.[].login' > "$WORK/members.raw" 2>/dev/null; then
+  sort "$WORK/members.raw" > "$WORK/members"; have_members=1
+else
+  : > "$WORK/members"
+  gap "organisation members — needs \`Members: read\`; the environment-reviewer check is skipped"
+fi
 
 # Organisation secret names, and which repositories each is granted to. Read
 # once: five secrets, so five extra requests rather than five per repository.
-gh api "orgs/$ORG/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' | sort > "$WORK/orgsecrets"
+have_orgsecrets=""
 : > "$WORK/orggrants"
-while IFS= read -r s; do
-  [ -z "$s" ] && continue
-  gh api "orgs/$ORG/actions/secrets/$s/repositories" --paginate --jq '.repositories[]?.name' 2>/dev/null \
-    | sed "s|^|$s |" >> "$WORK/orggrants"
-done < "$WORK/orgsecrets"
+if gh api "orgs/$ORG/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' > "$WORK/orgsecrets.raw" 2>/dev/null; then
+  sort "$WORK/orgsecrets.raw" > "$WORK/orgsecrets"
+  have_orgsecrets=1
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    if gh api "orgs/$ORG/actions/secrets/$s/repositories" --paginate --jq '.repositories[]?.name' > "$WORK/grant.raw" 2>/dev/null; then
+      sed "s|^|$s |" "$WORK/grant.raw" >> "$WORK/orggrants"
+    else
+      # One unreadable grant list would make every reference to that secret look
+      # ungranted, so the not-granted check is dropped rather than half-fed.
+      have_orgsecrets=""
+      gap "the repository list for organisation secret \`$s\` — the shadowing and not-granted checks are skipped"
+      break
+    fi
+  done < "$WORK/orgsecrets"
+else
+  : > "$WORK/orgsecrets"
+  gap "organisation secret names — needs \`Secrets: read\` at organisation level; the shadowing and not-granted checks are skipped"
+fi
+
+# Repository-level capability probes. None of these endpoint families is covered
+# by the permissions this App was set up with -- Metadata, Issues,
+# Administration, Contents, Dependabot alerts -- so a 403 is the expected result
+# rather than an exceptional one, and a 403 that reads as an empty answer is
+# worse than having no check at all: no repository secrets makes the surface
+# table report zero, and no environments makes every gate look absent. Probed
+# once against this repository, because the answer describes the token and not
+# the target, and probing per repository would cost 29 requests to learn one
+# fact.
+have_reposecrets=""; have_repovars=""; have_envs=""
+if gh api "repos/$ORG/.github/actions/secrets?per_page=1" >/dev/null 2>&1; then
+  have_reposecrets=1
+else
+  gap "repository secrets — needs \`Secrets: read\`; the shadowing check, the orphaned-credential check and the secret-surface figures are skipped"
+fi
+if gh api "repos/$ORG/.github/actions/variables?per_page=1" >/dev/null 2>&1; then
+  have_repovars=1
+else
+  gap "repository variables — needs \`Variables: read\`; variables are left out of the orphaned-credential check"
+fi
+if gh api "repos/$ORG/.github/environments?per_page=1" >/dev/null 2>&1; then
+  have_envs=1
+else
+  gap "environments — needs \`Environments: read\`; the unprotected-environment check, the non-member-reviewer check and the environment half of the secret surface are skipped"
+fi
 
 # Counters for the two metrics that are deliberately not findings.
 n_untimed=0; n_agentfiles=0; n_agentrepos=0
-: > "$WORK/untimedrepos"
 : > "$WORK/untimedrepos"
 jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WORK/repos"
 total=$(wc -l < "$WORK/repos" | tr -d ' ')
@@ -272,7 +354,15 @@ while IFS= read -r repo; do
         [ "$e" = docker ] && continue
         case " $configured " in *" $e "*) ;; *) uncovered="$uncovered $e" ;; esac
       done
-      if [ -n "$uncovered" ]; then
+      # Gated on upstream_config, like the assignee and groups checks. A fork's
+      # dependabot.yml is upstream's file, so covering an ecosystem there means
+      # diverging from them -- which #31 recorded as an exemption rather than a
+      # fix. The earlier reasoning here, that coverage is about our own alert
+      # exposure and not upstream's conventions, is true but does not justify the
+      # asymmetry: the exemption is an explicit per-repository list, so gating
+      # touches only what is deliberately marked upstream-owned. Revisit if a
+      # fork is ever something we build and deploy ourselves.
+      if [ -n "$uncovered" ] && [ -z "$upstream" ]; then
         echo "$repo|dependabot.yml does not cover:$uncovered (has: $configured)" >> "$WORK/findings"
       fi
 
@@ -298,10 +388,16 @@ while IFS= read -r repo; do
       # not have -- 31 pairs -- so pull requests arrived carrying fewer labels than
       # the file asked for, and seven arrived with none at all.
       gh api "repos/$ORG/$repo/labels?per_page=100" --paginate --jq '.[].name' > "$WORK/labels" 2>/dev/null || : > "$WORK/labels"
+      # while read, not for-in: an unquoted command substitution word-splits, so a
+      # multi-word label -- labels.yml defines five, including `good first issue`
+      # -- would be reported as several missing labels that are all present. No
+      # manifest asks for one today (67 label references across 24 manifests, all
+      # single-word), which is exactly how a defect like this survives review.
       missing_labels=""
-      for l in $(jq -r '[.updates[]?.labels[]?] | unique | .[]' "$WORK/db.json"); do
+      while IFS= read -r l; do
+        [ -z "$l" ] && continue
         grep -Fxq "$l" "$WORK/labels" || missing_labels="$missing_labels $l"
-      done
+      done < <(jq -r '[.updates[]?.labels[]?] | unique | .[]' "$WORK/db.json")
       if [ -n "$missing_labels" ]; then
         echo "$repo|dependabot.yml asks for labels this repository does not have:$missing_labels" >> "$WORK/findings"
       fi
@@ -345,7 +441,14 @@ while IFS= read -r repo; do
     # workflow_run and repository_dispatch are deliberately not reported. Both
     # exist, both are recorded in the plan, and neither is going to change, so a
     # weekly line for each would be two permanent findings against no decision.
-    case "$body" in *pull_request_target:*) printf '%s\n' "$wf" >> "$WORK/prt" ;; esac
+    # Both spellings. `on: [pull_request_target]` carries no colon after the
+    # trigger, so matching only `pull_request_target:` misses it. Nothing in the
+    # estate uses flow style today; the fork that brought us a
+    # pull_request_target at all did not, which is not a reason to rely on it.
+    case "$body" in
+      *pull_request_target:*|*pull_request_target,*|*pull_request_target\]*)
+        printf '%s\n' "$wf" >> "$WORK/prt" ;;
+    esac
 
     # id-token: write lets a workflow mint an OIDC identity. Granted and never
     # used it is a capability nobody asked for, and the consumers are a closed
@@ -434,11 +537,13 @@ while IFS= read -r repo; do
   # since January, and granting the secret to satisfy it would have widened the
   # blast radius for nothing. Live branches block a deletion; dead ones must not
   # block it. Ninety days is where that line sits.
-  if [ -s "$WORK/wfbody" ]; then
+  if [ -s "$WORK/wfbody" ] && [ -n "$have_reposecrets" ]; then
     { gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate \
         --jq '.secrets[]?.name' 2>/dev/null
-      gh api "repos/$ORG/$repo/actions/variables?per_page=100" --paginate \
-        --jq '.variables[]?.name' 2>/dev/null
+      if [ -n "$have_repovars" ]; then
+        gh api "repos/$ORG/$repo/actions/variables?per_page=100" --paginate \
+          --jq '.variables[]?.name' 2>/dev/null
+      fi
     } | sort -u > "$WORK/creds" || : > "$WORK/creds"
     while IFS= read -r name; do
       [ -z "$name" ] && continue
@@ -460,33 +565,60 @@ while IFS= read -r repo; do
       # returns just {sha, url} under .commit, so the push date is not in the
       # listing and needs the per-branch endpoint. Blobs are deduplicated by SHA,
       # so a workflow unchanged across twenty branches is fetched once.
+      # Any fetch that fails here makes the credential look unreferenced, and the
+      # verdict below would then read "safe to delete" -- the one false positive
+      # this script must never produce. At this run's request volume the
+      # installation token hitting a secondary rate limit mid-sweep is realistic,
+      # and a 403 is indistinguishable from an empty answer. So a failure sets
+      # cred_unknown and the credential is reported as unknown instead, which is
+      # the conservatism prune-package-versions.sh already applies to a tag it
+      # cannot resolve. Process substitution hides the producer's exit status,
+      # so each listing goes to a file whose status can be tested.
       : > "$WORK/seen"
       : > "$WORK/matched"
-      while IFS= read -r bname; do
-        [ -z "$bname" ] && continue
-        [ "$bname" = "$branch" ] && continue
-        while IFS="$(printf '\t')" read -r bpath bsha; do
-          [ -z "$bsha" ] && continue
-          grep -qxF "$bsha" "$WORK/seen" && continue
-          echo "$bsha" >> "$WORK/seen"
-          if gh api "repos/$ORG/$repo/git/blobs/$bsha" --jq '.content' 2>/dev/null \
-             | base64 -d 2>/dev/null \
-             | grep -qE -- "(secrets|vars)\\.${name}([^A-Za-z0-9_]|$)"; then
-            grep -qxF "$bname" "$WORK/matched" || echo "$bname" >> "$WORK/matched"
+      cred_unknown=""
+      if ! gh api "repos/$ORG/$repo/branches?per_page=100" --paginate \
+             --jq '.[].name' > "$WORK/brlist" 2>/dev/null; then
+        cred_unknown="the branch listing"
+      else
+        while IFS= read -r bname; do
+          [ -z "$bname" ] && continue
+          [ "$bname" = "$branch" ] && continue
+          if ! gh api "repos/$ORG/$repo/git/trees/$bname?recursive=1" \
+                 --jq '.tree[]? | select(.type == "blob")
+                       | select(.path | test("^\\.github/workflows/.*\\.ya?ml$"))
+                       | [.path, .sha] | @tsv' > "$WORK/btree" 2>/dev/null; then
+            cred_unknown="the tree of branch $bname"
+            break
           fi
-        done < <(gh api "repos/$ORG/$repo/git/trees/$bname?recursive=1" \
-                   --jq '.tree[]? | select(.type == "blob")
-                         | select(.path | test("^\\.github/workflows/.*\\.ya?ml$"))
-                         | [.path, .sha] | @tsv' 2>/dev/null)
-      done < <(gh api "repos/$ORG/$repo/branches?per_page=100" --paginate \
-                 --jq '.[].name' 2>/dev/null)
+          while IFS="$(printf '\t')" read -r bpath bsha; do
+            [ -z "$bsha" ] && continue
+            grep -qxF "$bsha" "$WORK/seen" && continue
+            echo "$bsha" >> "$WORK/seen"
+            if ! gh api "repos/$ORG/$repo/git/blobs/$bsha" --jq '.content' > "$WORK/blob.b64" 2>/dev/null; then
+              cred_unknown="a blob on branch $bname"
+              break
+            fi
+            if base64 -d < "$WORK/blob.b64" 2>/dev/null \
+               | grep -qE -- "(secrets|vars)\\.${name}([^A-Za-z0-9_]|$)"; then
+              grep -qxF "$bname" "$WORK/matched" || echo "$bname" >> "$WORK/matched"
+            fi
+          done < "$WORK/btree"
+          [ -n "$cred_unknown" ] && break
+        done < "$WORK/brlist"
+      fi
 
       live=""
       dead=0
       while IFS= read -r bname; do
         [ -z "$bname" ] && continue
-        bdate=$(gh api "repos/$ORG/$repo/branches/$bname" \
-                  --jq '.commit.commit.committer.date // .commit.commit.author.date // ""' 2>/dev/null || echo "")
+        if ! bdate=$(gh api "repos/$ORG/$repo/branches/$bname" \
+                       --jq '.commit.commit.committer.date // .commit.commit.author.date // ""' 2>/dev/null); then
+          # An unreadable push date would count the branch as dead, which pushes
+          # the verdict toward deletion. Unknown instead.
+          cred_unknown="the push date of branch $bname"
+          break
+        fi
         if [ -n "$bdate" ] && [ "$bdate" \> "$CUTOFF" ]; then
           live="$live $bname"
         else
@@ -504,21 +636,29 @@ while IFS= read -r repo; do
       # "still in use" is the safe direction. Only the few names that would
       # otherwise reach a delete verdict pay for the extra tree walk.
       elsewhere=""
-      if [ -z "$live" ]; then
-        while IFS="$(printf '\t')" read -r cpath csha; do
-          [ -z "$csha" ] && continue
-          if gh api "repos/$ORG/$repo/git/blobs/$csha" --jq '.content' 2>/dev/null \
-             | base64 -d 2>/dev/null | grep -qF -- "$name"; then
-            elsewhere="$elsewhere $cpath"
-          fi
-        done < <(gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
-                   --jq '.tree[]? | select(.type == "blob")
-                         | select(.path | test("^\\.github/workflows/") | not)
-                         | select(.path | test("\\.(ya?ml|json|sh|toml)$") or test("\\.env"))
-                         | [.path, .sha] | @tsv' 2>/dev/null)
+      if [ -z "$live" ] && [ -z "$cred_unknown" ]; then
+        if ! gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
+               --jq '.tree[]? | select(.type == "blob")
+                     | select(.path | test("^\\.github/workflows/") | not)
+                     | select(.path | test("\\.(ya?ml|json|sh|toml)$") or test("\\.env"))
+                     | [.path, .sha] | @tsv' > "$WORK/ctree" 2>/dev/null; then
+          cred_unknown="the default-branch tree"
+        else
+          while IFS="$(printf '\t')" read -r cpath csha; do
+            [ -z "$csha" ] && continue
+            if ! gh api "repos/$ORG/$repo/git/blobs/$csha" --jq '.content' > "$WORK/blob.b64" 2>/dev/null; then
+              cred_unknown="a config blob on $branch"
+              break
+            fi
+            base64 -d < "$WORK/blob.b64" 2>/dev/null | grep -qF -- "$name" \
+              && elsewhere="$elsewhere $cpath"
+          done < "$WORK/ctree"
+        fi
       fi
 
-      if [ -n "$live" ]; then
+      if [ -n "$cred_unknown" ]; then
+        echo "$repo|$name is read by no workflow on $branch, and whether anything else reads it is UNKNOWN — could not read $cred_unknown. Not safe to delete on this run" >> "$WORK/findings"
+      elif [ -n "$live" ]; then
         echo "$repo|$name is read by no workflow on $branch, but is still referenced on:$live — deletable once those merge or rebase" >> "$WORK/findings"
       elif [ -n "$elsewhere" ]; then
         echo "$repo|$name is read by no workflow, but is referenced outside .github/workflows on $branch:$elsewhere — not safe to delete" >> "$WORK/findings"
@@ -533,6 +673,11 @@ while IFS= read -r repo; do
   # A copy of an inherited file that is identical to the organisation version is a
   # file that drifts later and reports nothing when it does.
   for f in CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md; do
+    # Not in .github itself, where the file *is* the organisation version rather
+    # than a copy of it -- comparing it with itself reported all three every run.
+    # Found by running the check rather than by reading it, which is the argument
+    # for running it: the comparison is correct and its subject was wrong.
+    [ "$repo" = ".github" ] && continue
     [ -s "$WORK/org/$f" ] || continue
     grep -qxF "$f" "$WORK/tree" || continue
     gh api "repos/$ORG/$repo/contents/$f?ref=$branch" -H "Accept: application/vnd.github.raw" \
@@ -562,9 +707,13 @@ while IFS= read -r repo; do
   # rotated 2025-09-11, in a repository whose last functional commit was March --
   # so an eleven-month-old cloud credential sits somewhere nobody is looking, and
   # narrowing the organisation secret did not touch it.
-  gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' 2>/dev/null \
-    | sort > "$WORK/reposecrets" || : > "$WORK/reposecrets"
-  shadow=$(comm -12 "$WORK/reposecrets" "$WORK/orgsecrets" | tr '\n' ' ' | sed 's/ $//')
+  : > "$WORK/reposecrets"
+  shadow=""
+  if [ -n "$have_reposecrets" ] && [ -n "$have_orgsecrets" ]; then
+    gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' 2>/dev/null \
+      | sort > "$WORK/reposecrets" || : > "$WORK/reposecrets"
+    shadow=$(comm -12 "$WORK/reposecrets" "$WORK/orgsecrets" | tr '\n' ' ' | sed 's/ $//')
+  fi
   [ -n "$shadow" ] &&
     echo "$repo|repository secret shadows an organisation secret of the same name: $shadow" >> "$WORK/findings"
 
@@ -573,8 +722,11 @@ while IFS= read -r repo; do
   # GCP_SERVICE_ACCOUNT_KEY and holds its own, so the reference resolves and the
   # naive form of this check reports a repository that is working correctly. The
   # shadowing check above is the honest way to surface that same fact.
+  # Gated on have_orgsecrets like the shadowing check above: a partial grants
+  # file makes granted secrets look ungranted, which fault injection caught
+  # after the sibling check had already been gated and this one had not.
   notgranted=""
-  while IFS= read -r s; do
+  while [ -n "$have_orgsecrets" ] && IFS= read -r s; do
     [ -z "$s" ] && continue
     grep -qE "secrets\.$s([^A-Za-z0-9_]|\$)" "$WORK/wfbody" || continue
     grep -qxF "$s" "$WORK/reposecrets" && continue
@@ -591,6 +743,7 @@ while IFS= read -r repo; do
   # build-dev.yml come from feature branches -- restricting it would break the
   # process rather than close a hole. Delete a line here and the check reports it
   # again, which is the point of a list over a silent skip.
+  [ -n "$have_envs" ] &&
   gh api "repos/$ORG/$repo/environments?per_page=100" --jq '.environments[]?|select((.protection_rules|length)==0)|.name' 2>/dev/null \
   | while IFS= read -r env; do
       [ -z "$env" ] && continue
@@ -612,6 +765,7 @@ while IFS= read -r repo; do
   # A required reviewer who is not an organisation member. An approval request
   # cannot reach them, so the gate has fewer approvers than it appears to --
   # bcr-relay/prod listed four and had three until tompro was removed.
+  [ -n "$have_envs" ] && [ -n "$have_members" ] &&
   gh api "repos/$ORG/$repo/environments?per_page=100" --jq \
     '.environments[]?|.name as $e|.protection_rules[]?|select(.type=="required_reviewers")|.reviewers[]?|"\($e)|\(.reviewer.login // .reviewer.name // "?")"' 2>/dev/null \
   | while IFS='|' read -r env who; do
@@ -714,8 +868,10 @@ fi
 gated=0
 ungated_env=0
 repo_level=0
+have_surface=""
 : > "$WORK/secsurface"
-while read -r repo; do
+if [ -n "$have_reposecrets" ] && [ -n "$have_envs" ]; then have_surface=1; fi
+while [ -n "$have_surface" ] && read -r repo; do
   n=$(gh api "repos/$ORG/$repo/actions/secrets" --jq '.total_count' 2>/dev/null || echo 0)
   n=${n:-0}
   repo_level=$((repo_level + n))
@@ -740,6 +896,16 @@ while read -r repo; do
 done < "$WORK/repos"
 
 {
+  if [ -s "$WORK/gaps" ]; then
+    echo "### Not measured on this run"
+    echo
+    echo "Each of these is a read that failed. They are listed rather than counted"
+    echo "as zero: an unreadable answer and an empty one are indistinguishable, and"
+    echo "reporting the second when it was the first is a false all-clear."
+    echo
+    sort -u "$WORK/gaps" | sed 's/^/- could not read /'
+    echo
+  fi
   echo "- repositories audited: **$total**"
   echo "- topics corrected: **$n_topics**"
   echo "- merge settings corrected: **$n_merge**"
@@ -767,15 +933,20 @@ done < "$WORK/repos"
 
   echo "### Secrets"
   echo
-  echo "- behind an approval gate: **$gated** — environment-level, inside an environment that has a protection rule"
-  echo "- behind no gate: **$((repo_level + ungated_env))** — $repo_level repository-level, which no environment rule can gate, plus $ungated_env environment-level in an unprotected environment"
-  echo "- organisation-level: **$(gh api "orgs/$ORG/actions/secrets" --jq '.total_count' 2>/dev/null || echo '?')** — granted per repository, and likewise not gated by any environment"
-  echo
-  if [ -s "$WORK/secsurface" ]; then
-    echo "| repository | ungated | repository-level | environment, gated | environment, ungated |"
-    echo "| --- | --- | --- | --- | --- |"
-    awk -F'\t' '{print ($2+$4) "\t" $0}' "$WORK/secsurface" | sort -rn \
-      | cut -f2- | awk -F'\t' '{printf "| `%s` | %s | %s | %s | %s |\n", $1, $2+$4, $2, $3, $4}'
+  if [ -z "$have_surface" ]; then
+    echo "Not measured on this run — see above. The figures below would read as"
+    echo "zero rather than as unknown, so they are omitted instead."
+  else
+    echo "- behind an approval gate: **$gated** — environment-level, inside an environment that has a protection rule"
+    echo "- behind no gate: **$((repo_level + ungated_env))** — $repo_level repository-level, which no environment rule can gate, plus $ungated_env environment-level in an unprotected environment"
+    echo "- organisation-level: **$(gh api "orgs/$ORG/actions/secrets" --jq '.total_count' 2>/dev/null || echo '?')** — granted per repository, and likewise not gated by any environment"
+    echo
+    if [ -s "$WORK/secsurface" ]; then
+      echo "| repository | ungated | repository-level | environment, gated | environment, ungated |"
+      echo "| --- | --- | --- | --- | --- |"
+      awk -F'\t' '{print ($2+$4) "\t" $0}' "$WORK/secsurface" | sort -rn \
+        | cut -f2- | awk -F'\t' '{printf "| `%s` | %s | %s | %s | %s |\n", $1, $2+$4, $2, $3, $4}'
+    fi
   fi
   echo
   if [ -n "${GITHUB_RUN_ID:-}" ]; then
