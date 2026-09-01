@@ -1,16 +1,18 @@
 # Organisation automation
 
-Two scheduled workflows keep settings from drifting apart across the
-organisation. Both discover repositories from the API and skip archived ones,
+Three scheduled workflows keep settings from drifting apart across the
+organisation. All three discover repositories from the API and skip archived
+ones,
 so creating or archiving a repository needs no change here.
 
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
+| `prune-package-versions.yml` | `prune-package-versions.sh` | nothing on a schedule | container versions nothing references |
 | `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | description, LICENSE and its copyright holder, missing `dependabot.yml` where a manifest exists, Dependabot assignees, empty wikis, security configuration, open Dependabot alerts |
 
-Both accept a `dry_run` input on manual runs, which prints the intended changes
-without writing anything.
+All three accept a `dry_run` input on manual runs, which prints the intended
+changes without writing anything.
 
 `audit-repo-settings` also mirrors its findings into a single issue titled
 **Repository settings drift** in this repository. The issue is updated in place
@@ -37,7 +39,7 @@ actually use their wiki as empty.
 
 ## Setup
 
-Both workflows need an organisation-scoped token. `GITHUB_TOKEN` cannot be used
+All three need an organisation-scoped token. `GITHUB_TOKEN` cannot be used
 — it is scoped to this repository alone and cannot touch the others.
 
 Create a GitHub App owned by the organisation with these repository
@@ -105,3 +107,63 @@ repository — the audit says so if only one of the two is done.
 
 Omit `description` on an entry to pin only its colour and leave whatever
 description each repository already has.
+
+## Pruning package versions
+
+`prune-package-versions.sh` reports container package versions that nothing
+references. The organisation reached **2,974 versions across 21 packages** with no
+cleanup anywhere; `clowder` alone held 752.
+
+**91% of them are untagged, and that is not the same as unused.** A version is
+kept when any of these holds:
+
+1. it carries a real tag — anything not matching `sha256-*`
+2. it carries a `sha256-*` sidecar tag, which is an attestation or signature
+3. its digest is the subject of one: `sha256-<hex>` names `sha256:<hex>`
+4. its digest is a child of a tagged manifest index
+5. it is newer than `keep_days`, default 30
+
+Rule 4 is the one that cannot be skipped. A multi-architecture image carries its
+tag on the index and every per-architecture manifest underneath is untagged, so
+"delete the untagged ones" removes the platforms out of a live tag. The packages
+API cannot see inside a manifest list, so the script resolves each tagged index
+against `ghcr.io/v2/...` directly. Measured here before the script existed: 30 of
+`bcr-wdc-dashboard-ui`'s 443 untagged versions are index children, and 149 of
+`clowder`'s are attestation subjects — a naive policy is wrong by 27% on the
+attested package, irreversibly.
+
+### What it will not do
+
+**The schedule never deletes.** Deleting a version cannot be undone, and unlike a
+label it cannot be recreated by hand — so removal needs a manual run with
+`dry_run` unticked, and `only_package` exists so the first one can be a single
+package.
+
+It never deletes a *package*, only versions. A package whose versions carry no
+real tag at all is **skipped and reported** rather than emptied, because deleting
+every version removes the package itself.
+
+If a tag cannot be resolved against the registry the whole package is skipped, not
+partly processed. An unresolved tag means unknown children, and a partly resolved
+keep-set is how a live image loses an architecture.
+
+**It cannot see a reference from outside the registry.** Every keep rule is
+registry-side, so a deployment manifest that pins an image by digest —
+`image@sha256:…` — is invisible to all five. A version that manifest depends on
+classifies as deletable the moment it is untagged, older than the cutoff and not
+an index child. This is inherent to the approach rather than a gap to close: the
+script has no way to know which repositories deploy what. **Before the first real
+deletion, grep the deploy repositories for `@sha256:` and check the digests
+against the list.** The run summary repeats this, so the warning reaches whoever
+is about to press the button rather than only whoever read this file.
+
+### Setup
+
+Needs the automation App to hold the organisation **Packages** permission —
+`read` for the report, `write` to delete. Without it the script stops at the
+package listing and says so, rather than reporting an empty estate. *(Granted on
+this installation as of 2026-09-01; the permission is the requirement, the date
+is only a note.)*
+
+The same token is reused as a registry credential, base64-encoded, as a
+`Bearer` against `ghcr.io/v2/<owner>/<package>/manifests/<tag>`.
