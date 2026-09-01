@@ -146,12 +146,23 @@ If a tag cannot be resolved against the registry the whole package is skipped, n
 partly processed. An unresolved tag means unknown children, and a partly resolved
 keep-set is how a live image loses an architecture.
 
+**It cannot see a reference from outside the registry.** Every keep rule is
+registry-side, so a deployment manifest that pins an image by digest —
+`image@sha256:…` — is invisible to all five. A version that manifest depends on
+classifies as deletable the moment it is untagged, older than the cutoff and not
+an index child. This is inherent to the approach rather than a gap to close: the
+script has no way to know which repositories deploy what. **Before the first real
+deletion, grep the deploy repositories for `@sha256:` and check the digests
+against the list.** The run summary repeats this, so the warning reaches whoever
+is about to press the button rather than only whoever read this file.
+
 ### Setup
 
 Needs the automation App to hold the organisation **Packages** permission —
-`read` for the report, `write` to delete. It currently holds `administration`,
-`contents`, `issues`, `metadata` and `vulnerability_alerts` only, so the first run
-will fail on the package listing until that is added.
+`read` for the report, `write` to delete. **Granted 2026-08-18**, so the listing
+works; the App now holds `administration:write`, `contents:write`, `issues:write`,
+`metadata:read`, `packages:write`, `pull_requests:write` and
+`vulnerability_alerts:read`.
 
 The same token is reused as a registry credential, base64-encoded, as a
 `Bearer` against `ghcr.io/v2/<owner>/<package>/manifests/<tag>`.

@@ -35,11 +35,27 @@ DRY_RUN="${DRY_RUN:-true}"
 KEEP_DAYS="${KEEP_DAYS:-30}"
 ONLY_PACKAGE="${ONLY_PACKAGE:-}"
 
+# The second of two independent guards on "the schedule never deletes". The
+# workflow gates DRY_RUN on the event; this refuses to act on the result if the
+# event is not a manual dispatch. One expression is too thin a thread for a
+# deletion that cannot be undone, and its failure mode is silent.
+forced_dry=""
+if [ "$DRY_RUN" != "true" ] && [ -n "${GITHUB_EVENT_NAME:-}" ] \
+   && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+  echo "Refusing to delete: DRY_RUN=$DRY_RUN but the event is '$GITHUB_EVENT_NAME'," >&2
+  echo "not workflow_dispatch. Reporting instead." >&2
+  forced_dry="$GITHUB_EVENT_NAME"
+  DRY_RUN=true
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
-CUTOFF="$(date -u -d "$KEEP_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)"
+# GNU date on the runner, BSD date locally -- the same fallback
+# audit-repo-settings.sh carries, and what lets this be exercised on a Mac.
+CUTOFF="$(date -u -d "$KEEP_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+          || date -u -v-"${KEEP_DAYS}"d +%Y-%m-%dT%H:%M:%SZ)"
 
 # The registry takes the same token, base64-encoded, as a bearer credential.
 REG_TOKEN="$(printf '%s' "$GH_TOKEN" | base64 | tr -d '\n')"
@@ -174,6 +190,17 @@ done < "$WORK/packages"
     awk -F'|' '{printf "| `%s` | %s |\n", $1, $2}' "$WORK/skips"
     echo
   fi
+  if [ -n "$forced_dry" ]; then
+    echo "> **Deletion was refused.** DRY_RUN was not \`true\`, but this run was triggered"
+    echo "> by \`$forced_dry\` rather than a manual dispatch, so the script reported instead."
+    echo
+  fi
+  echo "**Before a real deletion, grep the deploy repositories for \`@sha256:\` digest pins.**"
+  echo "Every keep rule here is registry-side: a manifest that pins an image by digest is"
+  echo "invisible to them, so a version it depends on that is untagged, older than the"
+  echo "cutoff and not an index child classifies as deletable. Nothing inside this script"
+  echo "can see that reference."
+  echo
   echo "A version is kept when it carries a real tag, carries a \`sha256-*\` sidecar,"
   echo "is the subject of one, is a child of a tagged manifest index, or is newer"
   echo "than the cutoff. Deletion is irreversible, so the schedule only ever reports."
