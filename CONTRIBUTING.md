@@ -1,6 +1,7 @@
 <!--
 Organisation-wide default. A repository can override it with its own
-CONTRIBUTING.md, but none currently does — every repository inherits this file.
+CONTRIBUTING.md, and three do — bit.cr, bitcr.org, and the crowdin-sdk fork, whose
+copy is upstream's. The remaining 25 active repositories inherit this file.
 Everything below describes what is actually configured and enforced. If you
 change a ruleset or a repository setting, change this file with it.
 -->
@@ -152,6 +153,18 @@ that something is wrong.
 Your branch is **deleted automatically** on merge, in every repository. Nothing
 auto-merges anywhere, so a pull request sits until a person merges it.
 
+## How your change ships
+
+Merging is not shipping. Five repositories — `Wildcat`, `Clowder`,
+`Wildcat-Auxiliary`, `Wildcat-deployment` and `wildcat-dashboard-ui` — ship
+together as one coordinated **train**; every other repository releases on its own
+schedule. Which version number means what, how a train is cut, and what a release
+has to carry are in [RELEASING.md][releasing].
+
+One thing worth knowing before you file a bug about it: **the version in a
+manifest and the version in a tag are two different numbers here**, and they are
+not expected to agree.
+
 ## Dependencies
 
 Dependabot is configured in 24 of the 29 active repositories, with grouped
@@ -171,3 +184,4 @@ does not duplicate them.
 [security]: https://github.com/BitcreditProtocol/.github/blob/master/SECURITY.md
 [coc]: https://github.com/BitcreditProtocol/.github/blob/master/CODE_OF_CONDUCT.md
 [labels]: https://github.com/BitcreditProtocol/.github/blob/master/labels.yml
+[releasing]: https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md
