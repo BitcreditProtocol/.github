@@ -1,16 +1,15 @@
 # Organisation automation
 
-Three scheduled workflows keep settings from drifting apart across the
-organisation. All three discover repositories from the API and skip archived
+Two scheduled workflows keep settings from drifting apart across the
+organisation. Both discover repositories from the API and skip archived
 ones, so creating or archiving a repository needs no change here.
 
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
-| `prune-package-versions.yml` | `prune-package-versions.sh` | nothing on a schedule | container versions nothing references |
 | `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | 32 findings, 3 metrics and a list of what it could not read — see below |
 
-All three accept a `dry_run` input on manual runs, which prints the intended
+Both accept a `dry_run` input on manual runs, which prints the intended
 changes without writing anything. On `audit-repo-settings` a dry run stops after
 the job summary: it does **not** touch the drift issue, so a dry run is not a way
 to refresh that issue.
@@ -115,7 +114,7 @@ actually use their wiki as empty.
 
 ## Setup
 
-All three need an organisation-scoped token. `GITHUB_TOKEN` cannot be used
+Both need an organisation-scoped token. `GITHUB_TOKEN` cannot be used
 — it is scoped to this repository alone and cannot touch the others.
 
 - organisation **variable** `AUTOMATION_APP_ID` — the App's numeric ID
@@ -137,33 +136,31 @@ rather than the App when confirming a grant.
 | Dependabot alerts | read | the open-alert summary |
 
 It also holds `contents: write`, `pull_requests: write` and repository
-`packages: write`, granted for work outside these three scripts. None of the
-three writes a file or opens a pull request.
+`packages: write`, granted for work outside these two scripts. Neither of the
+two writes a file or opens a pull request.
 
-### What it is missing
+### What it was missing, and what happened to the list
 
-Seven permissions, each one named by a run rather than guessed at. Six are the
-audit's, and the seventh stops the prune before it starts.
+Eight of the nine permissions this file used to list were granted on 2026-09-02,
+so the audit now runs every check it used to skip. Read the installation rather
+than this paragraph — `orgs/{org}/installations` is the source of truth, and
+`Variables` appears there under its API name `actions_variables`.
 
-| Permission | Level | Unlocks |
-| --- | --- | --- |
-| Custom properties: read | organisation | the `stack` check |
-| Members: read | organisation | the non-member-reviewer check |
-| Secrets: read | organisation | the shadowing and not-granted checks |
-| Secrets: read | repository | the shadowing check, the orphaned-credential check, the secret-surface figures |
-| Variables: read | repository | variables in the orphaned-credential check |
-| Environments: read | repository | the unprotected-environment check, the non-member-reviewer check, the environment half of the secret surface |
-| Packages: read | **organisation** | listing container packages at all — `prune-package-versions.sh` stops here |
+**The ninth does not exist, and asking for it was an error.** This file claimed
+`GET /orgs/{org}/packages` needed an *organisation* Packages permission the App
+lacked. There is no such App permission: that endpoint, and the version-list and
+version-delete endpoints beside it, accept **only OAuth tokens and classic
+personal access tokens** with `read:packages`. A GitHub App installation token is
+not supported for any of them, at any grant.
 
-**The Packages one is the trap.** The App holds repository `packages: write`, and
-that is a different permission: `GET /orgs/{org}/packages` needs the
-**organisation** Packages permission, which the App does not have. The prune's
-first run stopped at the package listing and said so, which is how the difference
-was established rather than assumed.
+The prune could therefore never have worked, and it has been removed rather than
+left looking like package hygiene that happens. The claim above survived because
+the evidence for it was the prune's own error message — which this repository
+wrote. A message you authored is not a measurement.
 
 The installation is `repository_selection: all`, so every permission added lands
 on every repository in the organisation. That is worth weighing per permission
-rather than granting the list in one go.
+rather than granting a list in one go.
 
 The existing `private-repo-access-for-ci` App is not a substitute: it holds only
 `contents:read`, `dependabot_secrets:read` and `metadata:read`, and is installed
@@ -224,65 +221,3 @@ Every label a `dependabot.yml` can ask for is in `required` rather than
 `managed`, deliberately. Dependabot applies only labels that already exist and
 **fails the update** when one is missing, so a label that exists everywhere costs
 nothing next to an update that does not run.
-
-## Pruning package versions
-
-`prune-package-versions.sh` reports container package versions that nothing
-references. The organisation reached **2,974 versions across 21 packages** with no
-cleanup anywhere; `clowder` alone held 752.
-
-**91% of them are untagged, and that is not the same as unused.** A version is
-kept when any of these holds:
-
-1. it carries a real tag — anything not matching `sha256-*`
-2. it carries a `sha256-*` sidecar tag, which is an attestation or signature
-3. its digest is the subject of one: `sha256-<hex>` names `sha256:<hex>`
-4. its digest is a child of a tagged manifest index
-5. it is newer than `keep_days`, default 30
-
-Rule 4 is the one that cannot be skipped. A multi-architecture image carries its
-tag on the index and every per-architecture manifest underneath is untagged, so
-"delete the untagged ones" removes the platforms out of a live tag. The packages
-API cannot see inside a manifest list, so the script resolves each tagged index
-against `ghcr.io/v2/...` directly. Measured here before the script existed: 30 of
-`bcr-wdc-dashboard-ui`'s 443 untagged versions are index children, and 149 of
-`clowder`'s are attestation subjects — a naive policy is wrong by 27% on the
-attested package, irreversibly.
-
-### What it will not do
-
-**The schedule never deletes.** Deleting a version cannot be undone, and unlike a
-label it cannot be recreated by hand — so removal needs a manual run with
-`dry_run` unticked, and `only_package` exists so the first one can be a single
-package. Two independent guards enforce it: the workflow computes `DRY_RUN=false`
-only for a `workflow_dispatch`, and the script itself refuses to delete when
-`GITHUB_EVENT_NAME` is set to anything else.
-
-It never deletes a *package*, only versions. A package whose versions carry no
-real tag at all is **skipped and reported** rather than emptied, because deleting
-every version removes the package itself.
-
-If a tag cannot be resolved against the registry the whole package is skipped, not
-partly processed. An unresolved tag means unknown children, and a partly resolved
-keep-set is how a live image loses an architecture.
-
-**It cannot see a reference from outside the registry.** Every keep rule is
-registry-side, so a deployment manifest that pins an image by digest —
-`image@sha256:…` — is invisible to all five. A version that manifest depends on
-classifies as deletable the moment it is untagged, older than the cutoff and not
-an index child. This is inherent to the approach rather than a gap to close: the
-script has no way to know which repositories deploy what. **Before the first real
-deletion, grep the deploy repositories for `@sha256:` and check the digests
-against the list.** The run summary repeats this, so the warning reaches whoever
-is about to press the button rather than only whoever read this file.
-
-### Setup
-
-Needs the automation App to hold the **organisation** Packages permission —
-`read` for the report, `write` to delete. It does not have it, so the script
-currently stops at the package listing and says which permission is missing,
-rather than reporting an empty estate. See *What it is missing* above for why the
-repository `packages: write` it does hold is not the same thing.
-
-The same token is reused as a registry credential, base64-encoded, as a
-`Bearer` against `ghcr.io/v2/<owner>/<package>/manifests/<tag>`.
