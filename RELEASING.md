@@ -141,6 +141,39 @@ head commit's checks are not green.** The intended end state is a release workfl
 that refuses to proceed and says why. That is not built yet; until it is, this is a
 rule people keep by hand.
 
+## When a release goes wrong
+
+Nothing here is a runbook for somebody else's deployment. It is what is and is not
+reversible, so the decision is not being worked out while something is broken.
+
+**A container image goes back by redeploying an older tag.** `Wildcat-deployment`'s
+`deploy.yml` takes `image_tag`, and a per-service override — `wildcat_image_tag`,
+`clowder_image_tag`, `auxiliary_image_tag`, `dashboard_ui_image_tag` — so one
+service can go back without the others. Every image ever built is still in the
+registry: the package prune keeps 30 days and has never run.
+
+**That is only clean when no migration landed in between.** `Clowder` carries nine
+migration files and `Wildcat` one, they are numbered forward, and **there are no
+down-migrations anywhere**. An older image against a newer schema is untested. Each
+release body now says which case it is — the train compares the migration files at
+the previous train tag against this one and writes the answer in.
+
+**A published npm version cannot be taken back.** `@bitcredit/bcr-ebill-wasm` is at
+54 published versions and `@bitcredit/ui-library` at 37; npm restricts unpublishing
+after 72 hours, and consumers may already have resolved it. The fix is a higher
+version, not a removal. `bcr-common` is not on crates.io yet; when it is, crates.io
+never unpublishes at all — a bad version is yanked, which hides it from new
+resolution and leaves existing lockfiles working.
+
+**A tag cannot be deleted.** The `All tags` ruleset enforces `deletion` across every
+repository, with bypass for organisation admins only. The tag of a bad release stays
+where it is. Say so in the GitHub release instead: edit the body, or mark it as a
+pre-release so it stops being *Latest*.
+
+**So the honest order is: redeploy the previous image, then fix forward.** Reversing
+a train is not one action, and pretending otherwise is how a bad hour becomes a bad
+day.
+
 ## Package releases
 
 Four workflows in the whole organisation create a release or publish a package:
