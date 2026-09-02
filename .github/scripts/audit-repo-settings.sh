@@ -449,12 +449,12 @@ while IFS= read -r repo; do
   : > "$WORK/noperm"
   while IFS= read -r wf; do
     [ -z "$wf" ] && continue
-    # Guard on the exit status, not the text: gh writes its error body to stdout,
-    # so a 404 arrives as 127 bytes of JSON and [ -z ] never fires -- the blob is
-    # then analysed as a workflow, and reported as one with no permissions block.
-    # The tree is read once and these fetches follow minutes later, so a workflow
-    # renamed inside that window lands here. [ -z ] stays for what it does cover:
-    # an empty file, which comes back empty with status 0.
+    # Guard on the exit status, not the text. This script runs under set -eu, so a
+    # failed assignment here ended the whole run: one workflow that 404s -- the
+    # tree is read once and these fetches follow minutes later, so a rename inside
+    # that window does it -- and the weekly audit died with no report. And gh
+    # writes its error body to stdout, so [ -z ] could never have been the guard.
+    # [ -z ] stays for what it does cover: an empty file, empty with status 0.
     body=$(gh api "repos/$ORG/$repo/contents/$wf?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null) || continue
     [ -z "$body" ] && continue
     # kept for the credential check below: these bodies are already paid for here
