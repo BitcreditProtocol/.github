@@ -3,8 +3,14 @@ name: Cut a release train
 # One tag and one release across every member of the train, or none.
 #
 # RELEASING.md in this repository is the contract; this implements it. Membership
-# is the five named there, the tag is train/v<product>-<YYYY-MM-DD>, and the tags
-# are annotated so the tagger and the moment are on the record.
+# is the five named there, the tag is v<product>-<YYYY-MM-DD>, and the tags are
+# annotated so the tagger and the moment are on the record.
+#
+# The tag keeps the v prefix and the three-part version because that is what the
+# image builds trigger on -- push: tags: [v*.*.*] in Wildcat, Clowder,
+# Wildcat-Auxiliary and wildcat-dashboard-ui. The script refuses any name that
+# would miss that glob or fail to parse as semver, because either one produces a
+# train that tags everything and builds nothing.
 #
 # Dispatch only. A train is a decision, never a schedule.
 #
