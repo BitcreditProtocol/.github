@@ -29,6 +29,13 @@ permissions: {}
 
 jobs:
   prune:
+    # A bound, not a measurement: the job has never got past its first API call,
+    # so there is nothing to derive one from. It will walk 3,409 container
+    # versions once organisation `Packages: read` is granted, and gets measured
+    # on that run. A job with no timeout at all runs to GitHub's six-hour
+    # default -- and the audit next door was cancelled today by a value set too
+    # tight, so this errs the other way.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
