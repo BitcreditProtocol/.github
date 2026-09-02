@@ -738,26 +738,36 @@ while IFS= read -r repo; do
     echo "$repo|own .github/ISSUE_TEMPLATE/ on $branch and no config.yml — the organisation contact links are suppressed here" >> "$WORK/findings"
   fi
 
-  # The newest tag with no GitHub release. The estate uses tags for two purposes
-  # -- a train marker and a shipped release -- and nothing tells them apart.
-  # Only the newest is checked: the backlog of 55 older orphans is a historical
-  # fact rather than drift, and reporting it weekly would bury everything else.
+  # The highest-versioned tag with no GitHub release. The estate uses tags for
+  # two purposes -- a train marker and a shipped release -- and nothing tells
+  # them apart. Only one tag is checked: the backlog of 55 older orphans is a
+  # historical fact rather than drift, and reporting it weekly would bury
+  # everything else.
+  #
+  # "Highest-versioned", not "newest". The tags endpoint orders by version, not
+  # by date -- Wildcat returns v0.6.0, v0.5.0, v0.4.0, v0.4.0-aug25, v0.3.0,
+  # which is semver descending and places a prerelease below its own release.
+  # So .[0] is the highest version, and calling it the newest would be a claim
+  # the data does not support. The true newest costs a commit lookup per tag,
+  # 302 of them across the estate, to answer a question this check does not
+  # need to ask: a repository whose highest version shipped with no release is
+  # worth a line whether or not something older was tagged after it.
   #
   # A repository that has never cut a release is skipped. It is not behind on
   # releasing; it does not release. That rule rather than a list of names is what
   # keeps AI-Credit (its own tobo-ai-credit-testnet-N scheme) and the crowdin-sdk
   # fork (21 upstream tags) out, and it lets either in on the day it cuts a first
   # release, with no edit here. Owner decision 2026-09-02.
-  newest_tag=$(gh api "repos/$ORG/$repo/tags?per_page=1" --jq '.[0].name // empty' 2>/dev/null || true)
-  if [ -n "$newest_tag" ] && ! gh api "repos/$ORG/$repo/releases/tags/$newest_tag" >/dev/null 2>&1; then
+  top_tag=$(gh api "repos/$ORG/$repo/tags?per_page=1" --jq '.[0].name // empty' 2>/dev/null || true)
+  if [ -n "$top_tag" ] && ! gh api "repos/$ORG/$repo/releases/tags/$top_tag" >/dev/null 2>&1; then
     # Only now is it worth asking whether this repository releases at all. The
-    # question costs a request and its answer only matters once the newest tag
-    # has turned out to have no release, which is true in four repositories out
+    # question costs a request and its answer only matters once that tag has
+    # turned out to have no release, which is true in four repositories out
     # of twenty-nine -- so asking first spent a request on all twenty-nine.
     n_rel=$(gh api "repos/$ORG/$repo/releases?per_page=1" --jq 'length' 2>/dev/null || echo 0)
     case "$n_rel" in ''|*[!0-9]*) n_rel=0 ;; esac
     [ "$n_rel" = "0" ] ||
-      echo "$repo|newest tag \`$newest_tag\` has no GitHub release" >> "$WORK/findings"
+      echo "$repo|highest-versioned tag \`$top_tag\` has no GitHub release" >> "$WORK/findings"
   fi
 
   # A repository publishing a public Pages site. Not a defect by itself -- one
@@ -941,11 +951,17 @@ done
 # on one day, and the defect is the silent partial: Wildcat-deployment missed
 # june17, july31 and aug4 and nothing noticed for three months.
 #
-# Only the train/ namespace is checked. The nine historical trains predate the
-# convention and are not migrated by contract, so matching them here would be
-# nine permanent findings for a decision already taken. Zero train/* tags exist
-# as of 2026-09-02, which means this is silent until the first train is cut --
-# by design, not by accident.
+# A train tag is `v<product>-<YYYY-MM-DD>`, and the date suffix is the only
+# thing that marks one -- a package release tag has none. A separate `train/`
+# namespace was the first choice and was withdrawn before anything merged: the
+# image builds trigger on `push: tags: ["v*.*.*"]`, which a `train/` ref does
+# not match, so a train cut under that name would have built nothing at all.
+#
+# The nine historical trains are named v0.4.0-aug25 and the like, so the date
+# pattern excludes them for free. They predate the convention, are not migrated
+# by contract, and would otherwise be nine permanent findings for a decision
+# already taken. No dated tag exists as of 2026-09-02, so this is silent until
+# the first train is cut -- by design, not by accident.
 #
 # The finding is attributed to each repository that is missing the tag, not to
 # the train, because that is the repository somebody has to act on.
@@ -979,11 +995,13 @@ fi
 
 : > "$WORK/trainrefs"
 for m in $TRAIN_MEMBERS; do
-  gh api "repos/$ORG/$m/git/matching-refs/tags/train/" \
+  gh api "repos/$ORG/$m/git/matching-refs/tags/v" \
     --jq '.[].ref | sub("^refs/tags/"; "")' 2>/dev/null > "$WORK/trainone" || : > "$WORK/trainone"
   while IFS= read -r t; do
     [ -z "$t" ] && continue
-    echo "$t|$m" >> "$WORK/trainrefs"
+    case "$t" in
+      *-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) echo "$t|$m" >> "$WORK/trainrefs" ;;
+    esac
   done < "$WORK/trainone"
 done
 cut -d'|' -f1 "$WORK/trainrefs" | sort -u > "$WORK/trainnames"
