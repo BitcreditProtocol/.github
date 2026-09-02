@@ -78,6 +78,8 @@ def active_repos():
     out, page = [], 1
     while True:
         d = api(f"orgs/{ORG}/repos?per_page=100&page={page}")
+        if d is None:
+            sys.exit(f"could not list repositories (page {page}); refusing to run on a partial graph")
         if not d:
             break
         out += [(r["name"], r["default_branch"], r["fork"]) for r in d if not r["archived"]]
@@ -183,8 +185,16 @@ def latest_release(repo, cache={}):
 
 def open_issues(repo, cache={}):
     if repo not in cache:
-        d = api(f"repos/{ORG}/{repo}/issues?state=open&per_page=100")
-        cache[repo] = [i for i in (d or []) if "pull_request" not in i]
+        out, page = [], 1
+        while True:
+            d = api(f"repos/{ORG}/{repo}/issues?state=open&per_page=100&page={page}")
+            if d is None:
+                sys.exit(f"could not list open issues in {repo}; a partial list would open duplicates")
+            out += [i for i in d if "pull_request" not in i]
+            if len(d) < 100:
+                break
+            page += 1
+        cache[repo] = out
     return cache[repo]
 
 
@@ -212,8 +222,11 @@ def notify(consumer, dep, pin, producer, newest, gaps):
     if DRY_RUN:
         return "would " + ("update" if existing else "open")
     if existing:
-        api(f"repos/{ORG}/{consumer}/issues/{existing['number']}",
-            "PATCH", {"title": title, "body": body})
+        r = api(f"repos/{ORG}/{consumer}/issues/{existing['number']}",
+                "PATCH", {"title": title, "body": body})
+        if not r or "number" not in r:
+            gaps.append(f"could not update #{existing['number']} in `{consumer}`")
+            return "FAILED"
         return f"updated #{existing['number']}"
     created = api(f"repos/{ORG}/{consumer}/issues", "POST",
                   {"title": title, "body": body})
