@@ -94,8 +94,10 @@ done
 Then a release per tag, in each of the five:
 
 ```bash
-gh release create "$TRAIN" --repo "BitcreditProtocol/$repo" \
-  --title "$TRAIN" --generate-notes
+for repo in Wildcat Clowder Wildcat-Auxiliary Wildcat-deployment wildcat-dashboard-ui; do
+  gh release create "$TRAIN" --repo "BitcreditProtocol/$repo" \
+    --title "$TRAIN" --generate-notes
+done
 ```
 
 Tag the commit you actually intend to ship, and make sure it is the commit that was
