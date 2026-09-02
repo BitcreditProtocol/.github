@@ -607,9 +607,9 @@ while IFS= read -r repo; do
       # this script must never produce. At this run's request volume the
       # installation token hitting a secondary rate limit mid-sweep is realistic,
       # and a 403 is indistinguishable from an empty answer. So a failure sets
-      # cred_unknown and the credential is reported as unknown instead, which is
-      # the conservatism prune-package-versions.sh already applies to a tag it
-      # cannot resolve. Process substitution hides the producer's exit status,
+      # cred_unknown and the credential is reported as unknown instead: an
+      # unreadable answer is not an empty one, and only the second is safe to act
+      # on. Process substitution hides the producer's exit status,
       # so each listing goes to a file whose status can be tested.
       : > "$WORK/seen"
       : > "$WORK/matched"
