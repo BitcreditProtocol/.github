@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 ORG = os.environ.get("ORG", "BitcreditProtocol")
 PRODUCT = os.environ.get("PRODUCT", "").strip()
@@ -45,6 +46,11 @@ ACTOR = os.environ.get("GITHUB_ACTOR", "unknown")
 # finding. Adding a member is a change here AND a change to the contract.
 MEMBERS = ["Wildcat", "Clowder", "Wildcat-Auxiliary", "Wildcat-deployment",
            "wildcat-dashboard-ui"]
+
+# The members that turn a tag into a container image, on `push: tags: v*.*.*`.
+# Wildcat-deployment is deliberately absent: it carries deployment configuration
+# and builds nothing, so polling it would report a missing build every train.
+IMAGE_BUILDERS = ["Wildcat", "Clowder", "Wildcat-Auxiliary", "wildcat-dashboard-ui"]
 
 GATE_EXCLUDE = {"Dependabot"}
 BLOCKING = {"failure", "timed_out", "cancelled", "action_required", "stale"}
@@ -205,6 +211,45 @@ def notify_stale_snapshot(snap, code, tag, gaps):
     return f"opened #{made['number']}"
 
 
+def builds_started(tag, gaps):
+    """Did tagging actually start the image builds?
+
+    The train tags with an App installation token, and nothing in this
+    organisation has ever done that before -- every historical tag-push build
+    was started by a person, and the only bot in the run history is Dependabot,
+    which the platform handles specially. If an App push does not fire
+    `push: tags`, the train tags five repositories, publishes five releases and
+    produces no images, with no error anywhere.
+
+    So the consequence is checked rather than assumed. A missing build becomes a
+    gap, which makes the run exit non-zero -- the loudest signal available
+    without a second write to every release.
+
+    Bounded and late: the tags already exist, so nothing here can undo a correct
+    train. A build that is merely slow is reported as not started, which is the
+    safe direction to be wrong in.
+    """
+    missing = []
+    for repo in IMAGE_BUILDERS:
+        # Filtered server-side. A tag push reports the tag as head_branch, so
+        # `branch=` matches it exactly and total_count answers in one row.
+        # Scanning the most recent 30 runs instead looked equivalent and was
+        # not: Clowder is busy enough that a real tag-push run had already
+        # fallen off the first page, and the check reported it as missing.
+        q = f"repos/{ORG}/{repo}/actions/runs?event=push&branch={tag}&per_page=1"
+        for attempt in range(6):
+            if (api(q) or {}).get("total_count", 0) > 0:
+                break
+            if attempt < 5:
+                time.sleep(15)
+        else:
+            missing.append(repo)
+    for repo in missing:
+        gaps.append(f"`{repo}` started no workflow run for `{tag}` within 90s — "
+                    f"the tag exists but no image is being built")
+    return missing
+
+
 # ------------------------------------------------------------------ act
 
 def cut(repo, tag, expected_sha, others, wire_note, snap_note, gaps):
@@ -328,6 +373,10 @@ def main():
             actions[repo] = cut(repo, tag, heads[repo], others, wire_note, snap_note, gaps)
         if stale:
             actions["_snapshot"] = notify_stale_snapshot(snap, code, tag, gaps)
+        missing = builds_started(tag, gaps)
+        actions["_builds"] = ("every image builder started a run"
+                              if not missing
+                              else "NO BUILD STARTED in: " + ", ".join(missing))
     elif not blocked and stale:
         actions["_snapshot"] = notify_stale_snapshot(snap, code, tag, gaps)
 
