@@ -165,9 +165,24 @@ else
   gap "environments — needs \`Environments: read\`; the unprotected-environment check, the non-member-reviewer check and the environment half of the secret surface are skipped"
 fi
 
-# Counters for the two metrics that are deliberately not findings.
-n_untimed=0; n_agentfiles=0; n_agentrepos=0
+# Pages needs its own probe shape, because here a failure is ambiguous in a way
+# the others are not: 403 is "no permission" and 404 is "this repository has no
+# site", and a repository with no site is the normal case. Testing only the exit
+# code would declare the permission missing on any organisation whose .github
+# repository does not publish, so the error text decides. Succeeded, or failed
+# for any reason other than the App wall, means the endpoint is readable.
+have_pages=""
+if gh api "repos/$ORG/.github/pages" >/dev/null 2>"$WORK/pageprobe" \
+   || ! grep -q 'Resource not accessible by integration' "$WORK/pageprobe"; then
+  have_pages=1
+else
+  gap "Pages sites — needs \`Pages: read\`; the check for a repository publishing a public site is skipped"
+fi
+
+# Counters for the metrics that are deliberately not findings.
+n_untimed=0; n_agentfiles=0; n_agentrepos=0; n_wiki=0
 : > "$WORK/untimedrepos"
+: > "$WORK/wikirepos"
 jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WORK/repos"
 total=$(wc -l < "$WORK/repos" | tr -d ' ')
 echo "Auditing $total non-archived repositories (dry_run=$DRY_RUN)"
@@ -709,6 +724,64 @@ while IFS= read -r repo; do
     fi
   done
 
+  # A repository's own .github/ISSUE_TEMPLATE/ suppresses the organisation
+  # config.yml entirely, so the shared contact links vanish from the chooser
+  # unless the repository carries its own copy. Read from the default branch,
+  # which is the whole point: GitHub reads issue templates from there and nowhere
+  # else, so a config.yml merged to dev is invisible until dev reaches master and
+  # nothing anywhere says so. Measured 2026-09-02 -- two repositories with the
+  # file on dev showed zero contact links, against three in a control.
+  if grep -q '^\.github/ISSUE_TEMPLATE/' "$WORK/tree.all" &&
+     ! grep -qxF '.github/ISSUE_TEMPLATE/config.yml' "$WORK/tree.all" &&
+     [ "$(echo "$meta" | jq -r '.has_issues')" = "true" ] &&
+     [ "$(echo "$meta" | jq -r '.fork')" = "false" ]; then
+    echo "$repo|own .github/ISSUE_TEMPLATE/ on $branch and no config.yml — the organisation contact links are suppressed here" >> "$WORK/findings"
+  fi
+
+  # The newest tag with no GitHub release. The estate uses tags for two purposes
+  # -- a train marker and a shipped release -- and nothing tells them apart.
+  # Only the newest is checked: the backlog of 55 older orphans is a historical
+  # fact rather than drift, and reporting it weekly would bury everything else.
+  #
+  # A repository that has never cut a release is skipped. It is not behind on
+  # releasing; it does not release. That rule rather than a list of names is what
+  # keeps AI-Credit (its own tobo-ai-credit-testnet-N scheme) and the crowdin-sdk
+  # fork (21 upstream tags) out, and it lets either in on the day it cuts a first
+  # release, with no edit here. Owner decision 2026-09-02.
+  newest_tag=$(gh api "repos/$ORG/$repo/tags?per_page=1" --jq '.[0].name // empty' 2>/dev/null || true)
+  if [ -n "$newest_tag" ]; then
+    n_rel=$(gh api "repos/$ORG/$repo/releases?per_page=1" --jq 'length' 2>/dev/null || echo 0)
+    case "$n_rel" in ''|*[!0-9]*) n_rel=0 ;; esac
+    if [ "$n_rel" != "0" ]; then
+      gh api "repos/$ORG/$repo/releases/tags/$newest_tag" >/dev/null 2>&1 ||
+        echo "$repo|newest tag \`$newest_tag\` has no GitHub release" >> "$WORK/findings"
+    fi
+  fi
+
+  # A repository publishing a public Pages site. Not a defect by itself -- one
+  # repository is a documentation site and is meant to -- but an internal
+  # repository serving a public site is an exposure nobody chose on purpose, so
+  # the visibility of the repository is reported beside the URL.
+  if [ -n "$have_pages" ]; then
+    pg=$(gh api "repos/$ORG/$repo/pages" 2>/dev/null || true)
+    pg_url=$(echo "$pg" | jq -r '.html_url // empty' 2>/dev/null || true)
+    pg_public=$(echo "$pg" | jq -r '.public // false' 2>/dev/null || echo false)
+    if [ -n "$pg_url" ] && [ "$pg_public" = "true" ]; then
+      pg_src=$(echo "$pg" | jq -r '.source.branch // "?"' 2>/dev/null || echo "?")
+      vis=$(echo "$meta" | jq -r '.visibility')
+      echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
+    fi
+  fi
+
+  # The has_wiki flag is readable at every visibility; wiki *content* is not.
+  # Counted here as a flag, which is a fact, and left as a metric rather than a
+  # finding by owner decision 2026-09-02 -- three wiki questions are still open,
+  # and three findings a week ahead of the answer is noise.
+  if [ "$(echo "$meta" | jq -r '.has_wiki')" = "true" ]; then
+    n_wiki=$((n_wiki + 1))
+    echo "$repo ($(echo "$meta" | jq -r '.visibility'))" >> "$WORK/wikirepos"
+  fi
+
   # Only public repositories: an App installation token cannot read a wiki, so
   # for an internal or private one "no content" and "no access" look identical.
   # Checking those reported the two repositories that actually use their wiki as
@@ -862,6 +935,87 @@ jq -r '.assignees | keys[]' "$WORK/assignees.json" | while IFS= read -r listed; 
   fi
 done
 
+# An incomplete release train. Five repositories are tagged with one shared name
+# on one day, and the defect is the silent partial: Wildcat-deployment missed
+# june17, july31 and aug4 and nothing noticed for three months.
+#
+# Only the train/ namespace is checked. The nine historical trains predate the
+# convention and are not migrated by contract, so matching them here would be
+# nine permanent findings for a decision already taken. Zero train/* tags exist
+# as of 2026-09-02, which means this is silent until the first train is cut --
+# by design, not by accident.
+#
+# The finding is attributed to each repository that is missing the tag, not to
+# the train, because that is the repository somebody has to act on.
+#
+# This list exists twice: here, and as MEMBERS in scripts/release-train.py, which
+# is what actually cuts the tags. They must agree -- a member the train tags and
+# the audit does not know about can never be reported as missing, and one the
+# audit knows about and the train does not would be reported missing every week
+# forever. Change both, or neither. The contract is .github/RELEASING.md.
+TRAIN_MEMBERS="Wildcat Clowder Wildcat-Auxiliary Wildcat-deployment wildcat-dashboard-ui"
+n_train_members=$(echo "$TRAIN_MEMBERS" | wc -w | tr -d ' ')
+
+# ...and the agreement is checked rather than trusted. A member the train tags
+# and this list omits can never be reported missing; one this list carries and
+# the train does not would be reported missing every week forever. Both failures
+# are silent, which is why the comparison is a finding. Skipped while
+# release-train.py does not exist -- it arrives with .github#39.
+rt_script="$(dirname "$0")/release-train.py"
+if [ -f "$rt_script" ]; then
+  # awk rather than a sed range, because a sed range cannot close on the line it
+  # opened on: the moment somebody reformats MEMBERS onto one line -- and the list
+  # is short enough that they will -- the range runs on to the next ] in the file
+  # and sweeps in GATE_EXCLUDE and BLOCKING. Caught by a control that reformatted
+  # it, which is the only reason it is not a weekly false finding.
+  rt_members=$(awk '/^MEMBERS *= *\[/ { inside = 1 } inside { print; if (/\]/) exit }' "$rt_script" \
+               | grep -o '"[^"]*"' | tr -d '"' | sort | tr '\n' ' ')
+  au_members=$(echo "$TRAIN_MEMBERS" | tr ' ' '\n' | sort | tr '\n' ' ')
+  [ "$rt_members" = "$au_members" ] ||
+    echo ".github|release-train.py and this script disagree about train membership — train: [$rt_members] audit: [$au_members]" >> "$WORK/findings"
+fi
+
+: > "$WORK/trainrefs"
+for m in $TRAIN_MEMBERS; do
+  gh api "repos/$ORG/$m/git/matching-refs/tags/train/" \
+    --jq '.[].ref | sub("^refs/tags/"; "")' 2>/dev/null > "$WORK/trainone" || : > "$WORK/trainone"
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    echo "$t|$m" >> "$WORK/trainrefs"
+  done < "$WORK/trainone"
+done
+cut -d'|' -f1 "$WORK/trainrefs" | sort -u > "$WORK/trainnames"
+while IFS= read -r t; do
+  [ -z "$t" ] && continue
+  awk -F'|' -v t="$t" '$1 == t {print $2}' "$WORK/trainrefs" | sort -u > "$WORK/trainhave"
+  n_have=$(wc -l < "$WORK/trainhave" | tr -d ' ')
+  if [ "$n_have" != "$n_train_members" ]; then
+    for m in $TRAIN_MEMBERS; do
+      grep -qxF "$m" "$WORK/trainhave" ||
+        echo "$m|release train \`$t\` was cut in $n_have of $n_train_members repositories but not here" >> "$WORK/findings"
+    done
+  fi
+done < "$WORK/trainnames"
+
+# Archived repositories are outside the audit loop by design: nothing about them
+# can drift, because nothing about them can change. Their credentials can.
+# Archiving revokes nothing -- a token in an archived repository is still valid,
+# and it belongs to no CI that anyone watches. Guarded by the same probe as the
+# other secret checks, so it declares itself skipped rather than reporting zero.
+if [ -n "$have_reposecrets" ]; then
+  jq -r 'add | .[] | select(.archived == true) | .name' "$WORK/repos.json" > "$WORK/archived"
+  while IFS= read -r arch; do
+    [ -z "$arch" ] && continue
+    ns=$(gh api "repos/$ORG/$arch/actions/secrets" --jq '.total_count' 2>/dev/null || echo 0)
+    case "$ns" in ''|*[!0-9]*) ns=0 ;; esac
+    if [ "$ns" != "0" ]; then
+      echo "$arch|archived, but still holds $ns repository secret(s) — archiving does not revoke a credential" >> "$WORK/findings"
+    fi
+  done < "$WORK/archived"
+else
+  gap "archived repositories' secrets — needs \`Secrets: read\`; a credential left in an archived repository is unchecked"
+fi
+
 # Dependabot backlog. Not drift, so it is reported rather than counted as a
 # finding — alerts come and go with upstream advisories and would keep the issue
 # open forever. Needs the App's "Dependabot alerts: read"; if that is ever
@@ -959,6 +1113,9 @@ done < "$WORK/repos"
   n_untimed_repos=$(sort -u "$WORK/untimedrepos" | awk 'END{print NR}')
   echo "- jobs with no \`timeout-minutes\`: **$n_untimed** across **$n_untimed_repos** repositories — a job with none runs to GitHub's six-hour default. Not a finding: fifty lines would bury everything else, and the remainder after the open pull requests merge is deferred for stated reasons — a dormant repository, dispatch-only workflows, one job behind \`if: false\`. Caller jobs are excluded because they cannot take the key at all."
   echo "- open pull requests behind their base: **$n_behind** — of which **$n_behind_bot** are Dependabot's, which self-heal when the branch is recreated from a pinned default, leaving **$n_behind_live** that are not drafts and were touched in the last 30 days. Not a finding: the remedy is \`update-branch\` on another team's branch, and tip-commit authorship is not ownership. \`bit.cr#1\` and \`bitcr.org#1\` are excluded by the owner's decision of 2026-08-25."
+  if [ "$n_wiki" -gt 0 ]; then
+    echo "- repositories with the wiki enabled: **$n_wiki** — $(sort "$WORK/wikirepos" | tr '\n' ',' | sed 's/,$//; s/,/, /g'). A wiki is a separate git repository, invisible to code search, to the contents API and to every ruleset, which targets \`branch\` and \`tag\` only. Not a finding: whether these should exist is an open question, and an App token cannot read an internal or private wiki, so emptiness is only establishable for the public one."
+  fi
   echo "- agent-instruction files outside the enterprise ruleset's globs: **$n_agentfiles** across **$n_agentrepos** repositories — the ruleset restricts \`.github/agents/*.md\` and \`agents/*.md\`, and neither directory exists anywhere. Owner decision 2026-08-18: record, do not widen."
   echo
 
