@@ -1,0 +1,61 @@
+name: Watch the dependency graph
+
+# Tells a repository when its pin on another repository in this organisation has
+# fallen behind that repository's newest release.
+#
+# The graph is derived from manifests on every run -- package.json, Cargo.toml and
+# pubspec.yaml on each default branch, plus dev where it exists -- so a new
+# consumer or a new dependency is covered without any change here.
+#
+# Unlike prune-package-versions, the schedule here DOES act. An issue is cheap and
+# closeable, where a deleted package version cannot be undone. dry_run stays the
+# default for a manual run so a change to this workflow can be inspected before it
+# speaks to anybody.
+#
+# Only an exact pin can be behind in a way that needs a person: a range resolves on
+# the next install, a revision pin is precise already, and a pin overridden by a
+# cargo [patch] section is dead text. The script says which is which and opens an
+# issue only for the first.
+
+on:
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be opened without opening anything
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: watch-dependency-graph
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Watch the dependency graph
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint an org-scoped token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Report pins that have fallen behind
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          # A manual run reports unless dry_run is unticked; the schedule acts.
+          # Gated on the event as well as the input: on a schedule `inputs` is
+          # empty, and GitHub coerces both sides of == to a number, so
+          # `inputs.dry_run == false` would be TRUE there.
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == true) && 'true' || 'false' }}
+        run: python3 .github/scripts/watch-dependency-graph.py
