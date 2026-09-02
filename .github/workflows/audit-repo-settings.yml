@@ -17,7 +17,13 @@ permissions: {}
 
 jobs:
   audit:
-    timeout-minutes: 45
+    # Measured, not guessed: the first run with every check able to read its
+    # input took 19m17s (11:30:05 -> 11:49:22 on 2026-09-02). The previous value
+    # of 15 was set while six checks were being skipped for want of permission,
+    # and the first full-sight run was cancelled at exactly 15m00s with no
+    # report written at all. 30 leaves half again as much headroom on a job
+    # that runs once a week.
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
