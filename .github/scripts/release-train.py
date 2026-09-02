@@ -113,7 +113,8 @@ def gate(repo, sha):
                   if r.get("conclusion") in BLOCKING and r["name"] not in GATE_EXCLUDE})
     skipped = sorted({r["name"] for r in runs
                       if r.get("conclusion") in BLOCKING and r["name"] in GATE_EXCLUDE})
-    running = sorted({r["name"] for r in runs if r.get("status") != "completed"})
+    running = sorted({r["name"] for r in runs
+                      if r.get("status") != "completed" and r["name"] not in GATE_EXCLUDE})
     if bad:
         return False, "failing: " + ", ".join(f"`{b}`" for b in bad)
     if running:
@@ -409,9 +410,15 @@ def main():
     if len(set(v[0] for v in pins.values() if v[0])) <= 1:
         wire_note = f"All members that use `{WIRE_CRATE}` build against the same revision."
     else:
-        worst = max((n for _, _, n in spread), default=0)
+        if spread:
+            apart = f"up to **{max(n for _, _, n in spread)} commits** apart. "
+        else:
+            # distance() returned None for every differing pair, so the compare call
+            # failed; "0 commits apart" would read as agreement.
+            apart = "how far apart could not be measured (the compare call failed). "
+            gaps.append(f"could not measure how far apart the `{WIRE_CRATE}` revisions are")
         wire_note = (f"**`{WIRE_CRATE}` is not the same revision across this train** — "
-                     f"up to **{worst} commits** apart. "
+                     + apart
                      + "; ".join(f"`{r}` at `{str(v[0])[:8]}` ({v[1]})" for r, v in sorted(pins.items()))
                      + f". Nothing tests that the encodings agree — `{WIRE_CRATE}#209`.")
 
