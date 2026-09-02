@@ -141,12 +141,12 @@ head commit's checks are not green.** The intended end state is a release workfl
 that refuses to proceed and says why. That is not built yet; until it is, this is a
 rule people keep by hand.
 
-## When a release goes wrong
+## Rollback: when a release goes wrong
 
 Nothing here is a runbook for somebody else's deployment. It is what is and is not
 reversible, so the decision is not being worked out while something is broken.
 
-**A container image goes back by redeploying an older tag.** `Wildcat-deployment`'s
+**A container image rolls back by redeploying an older tag.** `Wildcat-deployment`'s
 `deploy.yml` takes `image_tag`, and a per-service override — `wildcat_image_tag`,
 `clowder_image_tag`, `auxiliary_image_tag`, `dashboard_ui_image_tag` — so one
 service can go back without the others. Every image ever built is still in the
@@ -170,7 +170,7 @@ repository, with bypass for organisation admins only. The tag of a bad release s
 where it is. Say so in the GitHub release instead: edit the body, or mark it as a
 pre-release so it stops being *Latest*.
 
-**So the honest order is: redeploy the previous image, then fix forward.** Reversing
+**So the honest order is: roll the image back, then fix forward.** Reversing
 a train is not one action, and pretending otherwise is how a bad hour becomes a bad
 day.
 
