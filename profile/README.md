@@ -25,7 +25,6 @@ The Bitcoin Credit Money Layer for the Real Economy.
 **Wallet**
 
 - [`Wallet-Core`](https://github.com/BitcreditProtocol/Wallet-Core) — wallet core, Rust and WASM
-- [`wallet-version`](https://github.com/BitcreditProtocol/wallet-version) — minimum supported version for the force-update check
 
 **Credit mint**
 
@@ -46,7 +45,7 @@ The Bitcoin Credit Money Layer for the Real Economy.
 - [`static-assets`](https://github.com/BitcreditProtocol/static-assets) — hosted static assets
 - [`bcr-load-tests`](https://github.com/BitcreditProtocol/bcr-load-tests) — load testing harness
 
-Some work happens in repositories that are not public. What you see here is the part that is.
+Some work happens in repositories that are not public, so this is not everything — and a public repository that is a fork of somebody else's project is left out rather than listed as ours. What is above is what we build and maintain in the open.
 
 ## Contributing
 

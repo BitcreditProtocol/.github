@@ -102,7 +102,13 @@ fi
 # dead weight that makes a gate look stronger than it is: bcr-relay/prod
 # appeared to have four approvers and had three.
 have_members=""
-if gh api "orgs/$ORG/members?per_page=100" --paginate --jq '.[].login' > "$WORK/members.raw" 2>/dev/null; then
+# -s as well as exit 0. Without `Members: read` this endpoint answers 200 with an
+# empty list rather than 403, so testing only the status set have_members=1 on an
+# empty file and every reviewer in the organisation was reported as a non-member.
+# An empty membership is not a possible true answer here: the audit is running as
+# an App installed by an organisation that has at least one member.
+if gh api "orgs/$ORG/members?per_page=100" --paginate --jq '.[].login' > "$WORK/members.raw" 2>/dev/null \
+   && [ -s "$WORK/members.raw" ]; then
   sort "$WORK/members.raw" > "$WORK/members"; have_members=1
 else
   : > "$WORK/members"
@@ -142,7 +148,7 @@ fi
 # once against this repository, because the answer describes the token and not
 # the target, and probing per repository would cost 29 requests to learn one
 # fact.
-have_reposecrets=""; have_repovars=""; have_envs=""
+have_reposecrets=""; have_repovars=""; have_envs=""; envsec_gap=""
 if gh api "repos/$ORG/.github/actions/secrets?per_page=1" >/dev/null 2>&1; then
   have_reposecrets=1
 else
@@ -226,10 +232,14 @@ while IFS= read -r repo; do
   # narrowed. It found crowdin-sdk, which arrived as a fork on 2026-08-28 and was
   # the only active repository without one; the archived twelve are deliberately
   # unset and never reach here, because the loop filters them.
-  [ "$(jq -r --arg r "$repo" 'add | map(select(.repository_name == $r))
+  # Gated on have_props. The gap was declared and the check was not skipped, so a
+  # 403 on the property values reported all 29 repositories as unclassified --
+  # a gap message and a wall of findings saying the opposite of each other.
+  if [ -n "$have_props" ] && [ "$(jq -r --arg r "$repo" 'add | map(select(.repository_name == $r))
         | .[0].properties // [] | map(select(.property_name == "stack"))
-        | .[0].value // ""' "$WORK/props.json")" = "" ] &&
+        | .[0].value // ""' "$WORK/props.json")" = "" ]; then
     echo "$repo|no stack custom property" >> "$WORK/findings"
+  fi
 
   # LICENSE: present at all, and naming the holder we expect
   if ! gh api "repos/$ORG/$repo/license" --jq '.content' 2>/dev/null | base64 -d > "$WORK/lic" 2>/dev/null \
@@ -453,8 +463,19 @@ while IFS= read -r repo; do
     # id-token: write lets a workflow mint an OIDC identity. Granted and never
     # used it is a capability nobody asked for, and the consumers are a closed
     # list: a cloud login, an npm or PyPI publish with provenance, buildx
+    # A file whose jobs call a reusable workflow has delegated the work, and with
+    # it the reason for the permission: a called workflow's token is the
+    # INTERSECTION of the caller's and its own, so a caller that omits the grant
+    # silently strips it. Clowder's build.yml and nightly.yml are three lines each
+    # and exist only to call build-image.yml, where the GCP auth and both attest
+    # steps live -- and the called workflow is scanned in its own right, so a real
+    # gap still surfaces there rather than being lost here.
+    delegates=""
+    printf '%s\n' "$body" | grep -qE '^[[:space:]]+uses:[[:space:]]*[^[:space:]]*\.github/workflows/' \
+      && delegates=1
+
     # provenance, an attestation, cosign. Nine files grant it without one.
-    case "$body" in
+    [ -n "$delegates" ] || case "$body" in
       *"id-token: write"*)
         printf '%s\n' "$body" | grep -qE 'npm publish|--provenance|provenance:[[:space:]]*true|google-github-actions/auth|aws-actions/configure-aws-credentials|azure/login|attest-build-provenance|cosign|sigstore|pypa/gh-action-pypi|dart-lang/setup-dart' \
           || printf '%s\n' "$wf" >> "$WORK/idtoken"
@@ -501,8 +522,9 @@ while IFS= read -r repo; do
     printf '%s\n' "$body" \
       | grep -oE '^[[:space:]]*(- )?uses:[[:space:]]*[^[:space:]]+' \
       | sed 's|.*uses:[[:space:]]*||' \
-      | grep -v '^\./' | grep -vE '@[0-9a-f]{40}$' >> "$WORK/floating" || true
+      | grep -v '^\./' | grep -vE '@[0-9a-f]{40}$' | grep -vE '@sha256:[0-9a-f]{64}$' >> "$WORK/floating" || true
 
+    [ -n "$delegates" ] && continue
     case "$body" in *"attestations: write"*) ;; *) continue ;; esac
     case "$body" in *attest-build-provenance*) continue ;; esac
     echo "$repo|$wf grants attestations: write with no attest step" >> "$WORK/findings"
@@ -751,7 +773,16 @@ while IFS= read -r repo; do
         Wildcat-deployment/wildcat-dev) continue ;;
         wallet/dev)                     continue ;;
       esac
-      ns=$(gh api "repos/$ORG/$repo/environments/$env/secrets" --jq '.total_count' 2>/dev/null || echo 0)
+      # Not `|| echo 0`: gh writes the error body to stdout and then exits, so the
+      # fallback appends to it rather than replacing it and ns became the whole
+      # 403 JSON -- which is not "0", so every environment was reported as holding
+      # secrets. Unreadable is skipped and named once, never counted as a number.
+      if ! ns=$(gh api "repos/$ORG/$repo/environments/$env/secrets" --jq '.total_count' 2>/dev/null); then
+        [ -n "$envsec_gap" ] || gap "environment secret counts — needs \`Secrets: read\`; the unprotected-environment check is skipped"
+        envsec_gap=1
+        continue
+      fi
+      case "$ns" in ''|*[!0-9]*) ns=0 ;; esac
       # if, not [ ] && -- this while is the right-hand side of a pipeline, so its
       # body's last command is the pipeline's exit status, and a false AND-list
       # there aborts the whole script under set -e. Demonstrated, not assumed:
