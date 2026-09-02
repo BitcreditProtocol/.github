@@ -749,13 +749,15 @@ while IFS= read -r repo; do
   # fork (21 upstream tags) out, and it lets either in on the day it cuts a first
   # release, with no edit here. Owner decision 2026-09-02.
   newest_tag=$(gh api "repos/$ORG/$repo/tags?per_page=1" --jq '.[0].name // empty' 2>/dev/null || true)
-  if [ -n "$newest_tag" ]; then
+  if [ -n "$newest_tag" ] && ! gh api "repos/$ORG/$repo/releases/tags/$newest_tag" >/dev/null 2>&1; then
+    # Only now is it worth asking whether this repository releases at all. The
+    # question costs a request and its answer only matters once the newest tag
+    # has turned out to have no release, which is true in four repositories out
+    # of twenty-nine -- so asking first spent a request on all twenty-nine.
     n_rel=$(gh api "repos/$ORG/$repo/releases?per_page=1" --jq 'length' 2>/dev/null || echo 0)
     case "$n_rel" in ''|*[!0-9]*) n_rel=0 ;; esac
-    if [ "$n_rel" != "0" ]; then
-      gh api "repos/$ORG/$repo/releases/tags/$newest_tag" >/dev/null 2>&1 ||
-        echo "$repo|newest tag \`$newest_tag\` has no GitHub release" >> "$WORK/findings"
-    fi
+    [ "$n_rel" = "0" ] ||
+      echo "$repo|newest tag \`$newest_tag\` has no GitHub release" >> "$WORK/findings"
   fi
 
   # A repository publishing a public Pages site. Not a defect by itself -- one
