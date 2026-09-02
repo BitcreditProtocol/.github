@@ -40,25 +40,41 @@ A package that nobody consumes may legitimately have no version at all — `ui` 
 
 ## Cutting a train
 
-**Tag name:** `train/v<product>-<YYYY-MM-DD>` — for example
-`train/v0.4.0-2026-08-25`.
+**Tag name:** `v<product>-<YYYY-MM-DD>` — for example `v0.4.0-2026-08-25`.
+The date suffix is what makes a tag a train tag; nothing else does.
 
 - **Annotated**, never lightweight. The tagger and the date are the only record of
   who cut the train and when.
 - **The same name in all five repositories**, cut from `master` in each.
-- Message: `Release train/v<product>-<YYYY-MM-DD>`.
+- Message: `Release v<product>-<YYYY-MM-DD>`.
 - **One GitHub release per tag**, with a note. See *What a release must carry*.
 
 ### Why this shape
 
-The `train/` namespace exists so the product number stops colliding with each
-repository's own tags: today `v0.5.0` means 2025-09-16 in `Wildcat`, 2026-08-25 in
-`Clowder`, and 2025-10-22 in `bcr-common` — three different things under one name.
+The date suffix stops the product number colliding with each repository's own
+tags: today `v0.5.0` means 2025-09-16 in `Wildcat`, 2026-08-25 in `Clowder`, and
+2025-10-22 in `bcr-common` — three different things under one name. `2026-08-25`
+in place of `aug25` makes the date sortable and unambiguous.
 
-The date is separated from the version because the previous form, `v0.4.0-aug25`,
-**is a semver prerelease of 0.4.0**: a hyphen introduces a prerelease, so every
-train tag sorted *below* the plain release of the same number for any tool that
-reads semver.
+**A separate `train/` namespace was the first choice and was withdrawn before
+anything merged, because it silently breaks the build.** All four repositories that
+produce images build them on `push: tags: ["v*.*.*"]` —
+`Wildcat/build.yml`, `Clowder/build.yml`, `Wildcat-Auxiliary/build.yml`,
+`wildcat-dashboard-ui/release.yml` — and three of them derive the image tag with
+`type=semver,pattern={{version}}`, which is how `v0.4.0-aug25` became the image
+`0.4.0-aug25`. A ref beginning `train/` matches neither: no workflow fires, no
+image is built, and `Wildcat-deployment` — whose `deploy-wildcat.yml` takes
+`image_tag` as an input — has nothing to deploy. The train would tag five
+repositories, publish five releases, and produce nothing runnable, **with no error
+anywhere**. Keeping the `v` prefix costs one thing, deliberately accepted: a
+hyphen makes `v0.5.0-2026-09-08` a semver *prerelease* of `0.5.0`, so a train tag
+sorts below a plain release of the same number.
+
+**The hyphens inside the date are load-bearing.** `0.5.0-2026-09-08` is a valid
+prerelease because `2026-09-08` is a single alphanumeric identifier. Writing it
+with dots — `0.5.0-2026.09.08` — is **not valid semver**: dots split the prerelease
+into identifiers, `09` is then a numeric identifier with a leading zero, and the
+whole tag fails to parse. `type=semver` would produce nothing.
 
 ### The sequence
 
@@ -66,7 +82,7 @@ Until this is automated, a train is cut by hand. All five, from `master`, in one
 pass — that is what keeps a train a train:
 
 ```bash
-TRAIN=train/v0.4.0-2026-08-25
+TRAIN=v0.4.0-2026-08-25
 
 for repo in Wildcat Clowder Wildcat-Auxiliary Wildcat-deployment wildcat-dashboard-ui; do
   git -C "$repo" fetch origin
@@ -91,8 +107,9 @@ All five are full members. `Wildcat-deployment` included: it carries the deploym
 configuration and the self-hosted runners, so a train without it does not describe
 what is actually deployed. It missed the `june17`, `july31` and `aug4` trains.
 
-A `train/*` tag present in some repositories and absent from others is an
-**incomplete train**, and the weekly audit reports it.
+A dated tag present in some repositories and absent from others is an
+**incomplete train**, and the weekly audit reports it against every member that is
+missing it.
 
 ### Tags cut before 2026-09-01 keep their names
 
@@ -139,8 +156,9 @@ Everything else is published by a person. `ui` is worth knowing about: its packa
 publish is automated and its GitHub release is not, which is why so many of its
 releases are empty.
 
-Package release tags keep the plain `vX.Y.Z` form. They are the repository's own
-numbering and do not go in the `train/` namespace.
+Package release tags keep the plain `vX.Y.Z` form, with no date. They are the
+repository's own numbering, and the absence of a date suffix is what tells them
+apart from a train tag.
 
 ## `bcr-common`
 
@@ -155,7 +173,7 @@ Its existing tags do **not** describe what consumers use: the newest, `v0.7.0`, 
 
 The organisation ruleset **`All tags`** applies to every tag in every repository —
 `deletion` and `non_fast_forward`, enforcement active, bypass for organisation
-admins only. A `train/*` tag is protected the moment it is pushed; nothing needs
+admins only. A train tag is protected the moment it is pushed; nothing needs
 configuring.
 
 ---
