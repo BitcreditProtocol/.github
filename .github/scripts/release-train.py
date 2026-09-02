@@ -250,9 +250,68 @@ def builds_started(tag, gaps):
     return missing
 
 
+def previous_train(tag):
+    """The dated tag before this one, taken across the whole train.
+
+    Sorted by the date suffix, not by the name: `v0.10.0-2026-01-05` sorts below
+    `v0.9.0-2026-02-01` as a string, and the later date is what "previous" means.
+    """
+    names = set()
+    for m in MEMBERS:
+        for r in api(f"repos/{ORG}/{m}/git/matching-refs/tags/v") or []:
+            n = r.get("ref", "").replace("refs/tags/", "")
+            if n != tag and re.fullmatch(r"v.+-\d{4}-\d{2}-\d{2}", n):
+                names.add(n)
+    return max(names, key=lambda n: n[-10:], default=None)
+
+
+def migrations_at(repo, ref):
+    """Migration files present at a ref, or None if the ref is not there."""
+    d = api(f"repos/{ORG}/{repo}/git/trees/{ref}?recursive=1")
+    if not isinstance(d, dict) or "tree" not in d:
+        return None
+    return {t["path"] for t in d["tree"]
+            if t.get("type") == "blob"
+            and re.search(r"migrations/.*\.sql$", t["path"], re.I)}
+
+
+def rollback_note(repo, tag, prev):
+    """One line per release saying whether rolling back is a plain redeploy.
+
+    Rolling an image back is only simple when no migration landed in between.
+    Clowder carries nine migration files and Wildcat one, and there are no
+    down-migrations anywhere in the train -- so an older image can meet a newer
+    schema, and nothing tests that pairing. Working that out at the moment
+    something is broken is exactly the wrong time, so it is computed here and
+    written into every release body, including the members with no schema at
+    all: a missing line reads as a bug, not as an all-clear.
+    """
+    if not prev:
+        return ("**Rollback:** first train under this convention — no previous "
+                "train to roll back to.")
+    was = migrations_at(repo, prev)
+    if was is None:
+        return (f"**Rollback:** `{repo}` did not carry `{prev}`, so there is "
+                f"nothing to compare against.")
+    now = migrations_at(repo, tag)
+    if now is None:
+        return f"**Rollback:** could not read `{repo}` at `{tag}`."
+    new = sorted(now - was)
+    if not new and not now:
+        return (f"**Rollback to `{prev}`:** no schema in this repository, so it "
+                f"is a plain redeploy of the older image.")
+    if not new:
+        return (f"**Rollback to `{prev}`:** no migration landed since, so it is "
+                f"a plain redeploy of the older image.")
+    return (f"**Rollback to `{prev}` is not clean** — {len(new)} migration(s) "
+            f"landed since: " + ", ".join(f"`{q.rsplit('/', 1)[-1]}`" for q in new)
+            + ". There are no down-migrations, so an older image would run "
+              "against a newer schema.")
+
+
 # ------------------------------------------------------------------ act
 
-def cut(repo, tag, expected_sha, others, wire_note, snap_note, gaps):
+def cut(repo, tag, expected_sha, others, wire_note, snap_note, roll_note, gaps):
     now = head_of(repo)
     if now != expected_sha:
         gaps.append(f"`{repo}` moved from `{expected_sha[:8]}` to `{str(now)[:8]}` "
@@ -273,7 +332,7 @@ def cut(repo, tag, expected_sha, others, wire_note, snap_note, gaps):
         + ", ".join(f"`{o}`" for o in MEMBERS) + f" by @{ACTOR}.\n\n"
         f"| member | commit |\n|---|---|\n"
         + "".join(f"| `{r}` | `{s[:8]}` |\n" for r, s in others.items())
-        + f"\n{wire_note}\n\n{snap_note}\n"
+        + f"\n{wire_note}\n\n{snap_note}\n\n{roll_note}\n"
     )
     rel = api(f"repos/{ORG}/{repo}/releases", "POST", {
         "tag_name": tag, "name": tag, "body": body, "generate_release_notes": True})
@@ -366,11 +425,14 @@ def main():
     else:
         snap_note = f"The dashboard's `openapi.json` snapshot is current (snapshot {snap[:10]}, API {code[:10]})."
 
+    prev = previous_train(tag)
+
     actions = {}
     if not blocked and not DRY_RUN:
         for repo in MEMBERS:
             others = {r: s for r, s in heads.items() if r != repo}
-            actions[repo] = cut(repo, tag, heads[repo], others, wire_note, snap_note, gaps)
+            actions[repo] = cut(repo, tag, heads[repo], others, wire_note, snap_note,
+                                rollback_note(repo, tag, prev), gaps)
         if stale:
             actions["_snapshot"] = notify_stale_snapshot(snap, code, tag, gaps)
         missing = builds_started(tag, gaps)
@@ -396,6 +458,7 @@ def main():
             w(f"| `{repo}` | `{str(sha)[:8]}` | {'pass' if ok else '**blocked**'} | "
               f"{detail} | \n")
         w(f"\n{wire_note}\n\n{snap_note}\n")
+        w(f"\nPrevious train: {('`' + prev + '`') if prev else 'none — this is the first'}\n")
         if actions:
             w("\n### What was done\n\n")
             for k, v in actions.items():
