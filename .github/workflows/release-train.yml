@@ -1,6 +1,8 @@
 name: Cut a release train
 
-# One tag and one release across every member of the train, or none.
+# The gate is all five or none: nothing is tagged unless every member passes it.
+# Once cutting starts, a member that fails is reported, not rolled back -- tags
+# cannot be deleted in this organisation, so a partial train is a visible one.
 #
 # RELEASING.md in this repository is the contract; this implements it. Membership
 # is the five named there, the tag is v<product>-<YYYY-MM-DD>, and the tags are
