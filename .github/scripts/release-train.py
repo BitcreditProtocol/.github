@@ -247,7 +247,36 @@ def main():
               file=sys.stderr)
         return 1
     product = PRODUCT if PRODUCT.startswith("v") else "v" + PRODUCT
-    tag = f"train/{product}-{datetime.date.today().isoformat()}"
+    tag = f"{product}-{datetime.date.today().isoformat()}"
+
+    # The tag has to match the image builds' trigger or the train produces
+    # nothing at all. Wildcat, Clowder, Wildcat-Auxiliary and
+    # wildcat-dashboard-ui build on `push: tags: ["v*.*.*"]`, and three derive
+    # the image tag with type=semver,pattern={{version}} -- which is how
+    # v0.4.0-aug25 became the image 0.4.0-aug25. A name outside that glob tags
+    # five repositories, publishes five releases and builds nothing, with no
+    # error anywhere; Wildcat-deployment is then left with no image_tag to
+    # deploy. That is exactly what the train/ namespace would have done, and it
+    # is why the namespace was withdrawn before this ever ran. Asserted here so
+    # an odd product string cannot bring the same failure back quietly.
+    # Two conditions, and both are needed. The glob decides whether the build
+    # runs at all; GitHub's * never matches /, so it is [^/]* three times over.
+    # Semver decides whether type=semver can name the image once it does run --
+    # a product string like 0.5.0.1 clears the glob and produces no image tag,
+    # which is the same failure one step later. Found by testing the pair, not
+    # by reading them.
+    if not re.fullmatch(r"v[^/]*\.[^/]*\.[^/]*", tag):
+        print(f"tag {tag!r} does not match the build trigger v*.*.* used by the "
+              f"image-producing members — refusing to cut a train that would "
+              f"build no images", file=sys.stderr)
+        return 1
+    if not re.fullmatch(
+            r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+            r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+            r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?", tag[1:]):
+        print(f"tag {tag!r} is not valid semver, so type=semver would give the "
+              f"image no tag — refusing", file=sys.stderr)
+        return 1
 
     heads, results, blocked = {}, {}, []
     for repo in MEMBERS:
