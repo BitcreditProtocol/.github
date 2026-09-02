@@ -137,9 +137,19 @@ This organisation has **no required status checks**, deliberately, and the
 being cut from a red commit.
 
 The gate therefore belongs in the release process: **do not cut a release when the
-head commit's checks are not green.** The intended end state is a release workflow
-that refuses to proceed and says why. That is not built yet; until it is, this is a
-rule people keep by hand.
+head commit's checks are not green.**
+
+**For a train, the workflow enforces it.** `release-train.py` gates all five members
+before it touches any, and refuses on a check whose conclusion is `failure`,
+`timed_out`, `cancelled`, `action_required` or `stale`. `Dependabot` is excluded by
+name and the exclusion is printed in every summary. It also refuses when the tag name
+already exists in any member, when a head commit moved between being gated and being
+tagged, and — fail-closed — when it cannot read the check runs at all, because a gate
+that waves things through when it cannot verify is worse than no gate.
+
+**For a package release, it is still a rule people keep by hand.** The train covers
+the five Wildcat repositories; nothing gates a single repository publishing its own
+artifact.
 
 ## Rollback: when a release goes wrong
 
