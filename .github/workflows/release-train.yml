@@ -1,0 +1,71 @@
+name: Cut a release train
+
+# The gate is all five or none: nothing is tagged unless every member passes it.
+# Once cutting starts, a member that fails is reported, not rolled back -- tags
+# cannot be deleted in this organisation, so a partial train is a visible one.
+#
+# RELEASING.md in this repository is the contract; this implements it. Membership
+# is the five named there, the tag is v<product>-<YYYY-MM-DD>, and the tags are
+# annotated so the tagger and the moment are on the record.
+#
+# The tag keeps the v prefix and the three-part version because that is what the
+# image builds trigger on -- push: tags: [v*.*.*] in Wildcat, Clowder,
+# Wildcat-Auxiliary and wildcat-dashboard-ui. The script refuses any name that
+# would miss that glob or fail to parse as semver, because either one produces a
+# train that tags everything and builds nothing.
+#
+# Dispatch only. A train is a decision, never a schedule.
+#
+# The gate blocks on a red check and on a tag name already in use, and refuses if
+# it cannot read the checks at all -- a gate that waves things through when it
+# cannot verify is worse than none. It does NOT block on the shared wire-crate
+# spread or a stale openapi snapshot: those are reported in the summary and in
+# every release body, so whoever cuts the train sees them without going to look.
+# Owner decision 2026-09-02.
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: Product version for this train, e.g. 0.5.0
+        type: string
+        required: true
+      dry_run:
+        description: Report what would be tagged without tagging anything
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: release-train
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: Cut a release train
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint an org-scoped token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Gate the train, then cut it
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          PRODUCT: ${{ inputs.product }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          # Gated on the event as well as the input. There is no schedule here, so
+          # the empty-inputs coercion that would flip this cannot arise -- but the
+          # guard costs nothing and a schedule could be added later by someone who
+          # does not know that.
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) && 'false' || 'true' }}
+        run: python3 .github/scripts/release-train.py
