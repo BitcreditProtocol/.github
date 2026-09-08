@@ -12,8 +12,7 @@
 #
 # App permissions. The App was set up with Metadata, Issues, Administration,
 # Contents and Dependabot alerts, which is what everything above the credential
-# checks needs. The checks added since need more, and none of them is granted at
-# the time of writing:
+# checks needs. Additional reads are probed at runtime; a grant can change:
 #
 #   Members: read                organisation      environment reviewers
 #   Secrets: read                organisation      shadowing, not-granted
@@ -23,6 +22,7 @@
 #   Variables: read              repository        orphaned credentials
 #   Environments: read           repository        unprotected environments,
 #                                                  non-member reviewers
+#   Pages: read                  repository        public Pages sites
 #
 # Each is probed once at startup rather than assumed, and whatever is missing is
 # named in a "Not measured on this run" section. A check whose input could not be
@@ -88,6 +88,33 @@ gh api "orgs/$ORG/repos?per_page=100" --paginate --slurp > "$WORK/repos.json"
 : > "$WORK/gaps"
 gap() { echo "$1" >> "$WORK/gaps"; }
 
+# Keep transport errors out of data. Return 44 only for an explicit HTTP 404;
+# each caller decides whether absence is expected for that endpoint.
+read_api() {
+  local endpoint=$1 output=$2
+  shift 2
+  if gh api "$endpoint" "$@" > "$output" 2>"$WORK/read-error"; then
+    return 0
+  fi
+  : > "$output"
+  if grep -q '(HTTP 404)' "$WORK/read-error"; then return 44; fi
+  gap "$endpoint — $(tr '\n' ' ' < "$WORK/read-error")"
+  return 1
+}
+
+read_count() {
+  local endpoint=$1
+  if read_api "$endpoint" "$WORK/count.json"; then
+    if jq -er '.total_count | select(type == "number" and . >= 0 and . == floor)' "$WORK/count.json"; then
+      return 0
+    fi
+    gap "$endpoint — invalid count response"
+  else
+    [ "$?" != 44 ] || gap "$endpoint — HTTP 404, count unknown"
+  fi
+  return 1
+}
+
 have_props=""
 if gh api "orgs/$ORG/properties/values?per_page=100" --paginate --slurp > "$WORK/props.json" 2>/dev/null \
    && jq -e 'type == "array"' "$WORK/props.json" >/dev/null 2>&1; then
@@ -148,7 +175,7 @@ fi
 # once against this repository, because the answer describes the token and not
 # the target, and probing per repository would cost 29 requests to learn one
 # fact.
-have_reposecrets=""; have_repovars=""; have_envs=""; envsec_gap=""
+have_reposecrets=""; have_repovars=""; have_envs=""
 if gh api "repos/$ORG/.github/actions/secrets?per_page=1" >/dev/null 2>&1; then
   have_reposecrets=1
 else
@@ -165,9 +192,25 @@ else
   gap "environments — needs \`Environments: read\`; the unprotected-environment check, the non-member-reviewer check and the environment half of the secret surface are skipped"
 fi
 
-# Counters for the two metrics that are deliberately not findings.
-n_untimed=0; n_agentfiles=0; n_agentrepos=0
+# Pages needs its own probe shape, because here a failure is ambiguous in a way
+# the others are not: 403 is "no permission" and 404 is "this repository has no
+# site", and a repository with no site is the normal case. Other failures are
+# unknown, never evidence that the endpoint is readable.
+have_pages=""
+if read_api "repos/$ORG/.github/pages" "$WORK/pageprobe"; then
+  if jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pageprobe" >/dev/null 2>&1; then
+    have_pages=1
+  else
+    gap "Pages permission probe — invalid response"
+  fi
+else
+  [ "$?" != 44 ] || have_pages=1
+fi
+
+# Counters for the metrics that are deliberately not findings.
+n_untimed=0; n_agentfiles=0; n_agentrepos=0; n_wiki=0
 : > "$WORK/untimedrepos"
+: > "$WORK/wikirepos"
 jq -r 'add | .[] | select(.archived == false) | .name' "$WORK/repos.json" > "$WORK/repos"
 total=$(wc -l < "$WORK/repos" | tr -d ' ')
 echo "Auditing $total non-archived repositories (dry_run=$DRY_RUN)"
@@ -263,8 +306,18 @@ while IFS= read -r repo; do
   # of repository names, so a repository that later gains a manifest starts being
   # reported without anyone editing this script.
   branch=$(echo "$meta" | jq -r '.default_branch')
-  gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
-    --jq '[.tree[]? | select(.type == "blob") | .path] | join("\n")' 2>/dev/null > "$WORK/tree.all" || : > "$WORK/tree.all"
+  tree_complete=""
+  if read_api "repos/$ORG/$repo/git/trees/$branch?recursive=1" "$WORK/tree.json"; then
+    if jq -e '.truncated == false and (.tree | type == "array")' "$WORK/tree.json" >/dev/null 2>&1; then
+      jq -r '[.tree[] | select(.type == "blob") | .path] | join("\n")' "$WORK/tree.json" > "$WORK/tree.all"
+      tree_complete=1
+    else
+      gap "$repo workflow tree — truncated or invalid response"
+    fi
+  else
+    [ "$?" != 44 ] || gap "$repo workflow tree — HTTP 404"
+  fi
+  [ -n "$tree_complete" ] || : > "$WORK/tree.all"
 
   # Vendored and generated paths carry manifests that are not ours to update.
   # Dependabot pointed at a vendored copy would diverge it from upstream, so a
@@ -428,13 +481,26 @@ while IFS= read -r repo; do
   # attestations: write and produced no attestation, while ten container images
   # shipped with no provenance at all.
   : > "$WORK/wfbody"
+  workflows_complete="$tree_complete"
   : > "$WORK/prt"
   : > "$WORK/floating"
   : > "$WORK/idtoken"
   : > "$WORK/noperm"
   while IFS= read -r wf; do
     [ -z "$wf" ] && continue
-    body=$(gh api "repos/$ORG/$repo/contents/$wf?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null)
+    # Guard on the exit status, not the text. This script runs under set -eu, so a
+    # failed assignment here ended the whole run: one workflow that 404s -- the
+    # tree is read once and these fetches follow minutes later, so a rename inside
+    # that window does it -- and the weekly audit died with no report. And gh
+    # writes its error body to stdout, so [ -z ] could never have been the guard.
+    # [ -z ] stays for what it does cover: an empty file, empty with status 0.
+    if read_api "repos/$ORG/$repo/contents/$wf?ref=$branch" "$WORK/workflow.raw" -H "Accept: application/vnd.github.raw"; then
+      body=$(cat "$WORK/workflow.raw")
+    else
+      [ "$?" != 44 ] || gap "$repo workflow $wf — disappeared after the tree was read"
+      workflows_complete=""
+      continue
+    fi
     [ -z "$body" ] && continue
     # kept for the credential check below: these bodies are already paid for here
     printf '%s\n' "$body" >> "$WORK/wfbody"
@@ -559,7 +625,7 @@ while IFS= read -r repo; do
   # since January, and granting the secret to satisfy it would have widened the
   # blast radius for nothing. Live branches block a deletion; dead ones must not
   # block it. Ninety days is where that line sits.
-  if [ -s "$WORK/wfbody" ] && [ -n "$have_reposecrets" ]; then
+  if [ -n "$workflows_complete" ] && [ -s "$WORK/wfbody" ] && [ -n "$have_reposecrets" ]; then
     { gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate \
         --jq '.secrets[]?.name' 2>/dev/null
       if [ -n "$have_repovars" ]; then
@@ -592,9 +658,9 @@ while IFS= read -r repo; do
       # this script must never produce. At this run's request volume the
       # installation token hitting a secondary rate limit mid-sweep is realistic,
       # and a 403 is indistinguishable from an empty answer. So a failure sets
-      # cred_unknown and the credential is reported as unknown instead, which is
-      # the conservatism prune-package-versions.sh already applies to a tag it
-      # cannot resolve. Process substitution hides the producer's exit status,
+      # cred_unknown and the credential is reported as unknown instead: an
+      # unreadable answer is not an empty one, and only the second is safe to act
+      # on. Process substitution hides the producer's exit status,
       # so each listing goes to a file whose status can be tested.
       : > "$WORK/seen"
       : > "$WORK/matched"
@@ -709,11 +775,99 @@ while IFS= read -r repo; do
     fi
   done
 
+  # A repository's own .github/ISSUE_TEMPLATE/ suppresses the organisation
+  # config.yml entirely, so the shared contact links vanish from the chooser
+  # unless the repository carries its own copy. Read from the default branch,
+  # which is the whole point: GitHub reads issue templates from there and nowhere
+  # else, so a config.yml merged to dev is invisible until dev reaches master and
+  # nothing anywhere says so. Measured 2026-09-02 -- two repositories with the
+  # file on dev showed zero contact links, against three in a control.
+  if grep -q '^\.github/ISSUE_TEMPLATE/' "$WORK/tree.all" &&
+     ! grep -qxF '.github/ISSUE_TEMPLATE/config.yml' "$WORK/tree.all" &&
+     [ "$(echo "$meta" | jq -r '.has_issues')" = "true" ] &&
+     [ "$(echo "$meta" | jq -r '.fork')" = "false" ]; then
+    echo "$repo|own .github/ISSUE_TEMPLATE/ on $branch and no config.yml — the organisation contact links are suppressed here" >> "$WORK/findings"
+  fi
+
+  # The highest-versioned tag with no GitHub release. The estate uses tags for
+  # two purposes -- a train marker and a shipped release -- and nothing tells
+  # them apart. Only one tag is checked: the backlog of 55 older orphans is a
+  # historical fact rather than drift, and reporting it weekly would bury
+  # everything else.
+  #
+  # "Highest-versioned", not "newest". The tags endpoint orders by version, not
+  # by date -- Wildcat returns v0.6.0, v0.5.0, v0.4.0, v0.4.0-aug25, v0.3.0,
+  # which is semver descending and places a prerelease below its own release.
+  # So .[0] is the highest version, and calling it the newest would be a claim
+  # the data does not support. The true newest costs a commit lookup per tag,
+  # 302 of them across the estate, to answer a question this check does not
+  # need to ask: a repository whose highest version shipped with no release is
+  # worth a line whether or not something older was tagged after it.
+  #
+  # A repository that has never cut a release is skipped. It is not behind on
+  # releasing; it does not release. That rule rather than a list of names is what
+  # keeps AI-Credit (its own tobo-ai-credit-testnet-N scheme) and the crowdin-sdk
+  # fork (21 upstream tags) out, and it lets either in on the day it cuts a first
+  # release, with no edit here. Owner decision 2026-09-02.
+  if read_api "repos/$ORG/$repo/tags?per_page=1" "$WORK/tags.json"; then
+    if ! top_tag=$(jq -er 'if type == "array" then (if length == 0 then "" else .[0].name | strings end) else error("invalid tags") end' "$WORK/tags.json"); then
+      gap "$repo highest-versioned tag — invalid response"
+    elif [ -n "$top_tag" ]; then
+      if ! git check-ref-format "refs/tags/$top_tag" >/dev/null 2>&1; then
+        gap "$repo highest-versioned tag — invalid tag name"
+      else
+        encoded_tag=$(jq -nr --arg tag "$top_tag" '$tag | @uri')
+        if read_api "repos/$ORG/$repo/releases/tags/$encoded_tag" "$WORK/release.json"; then
+          jq -e '.id | type == "number"' "$WORK/release.json" >/dev/null 2>&1 || gap "$repo release for $top_tag — invalid response"
+        elif [ "$?" = 44 ]; then
+          if read_api "repos/$ORG/$repo/releases?per_page=1" "$WORK/releases.json"; then
+            if ! n_rel=$(jq -er 'if type == "array" then length else error("invalid releases") end' "$WORK/releases.json"); then
+              gap "$repo release history — invalid response"
+            elif [ "$n_rel" != 0 ]; then
+              echo "$repo|highest-versioned tag \`$top_tag\` has no GitHub release" >> "$WORK/findings"
+            fi
+          else
+            [ "$?" != 44 ] || gap "$repo release history — HTTP 404"
+          fi
+        fi
+      fi
+    fi
+  else
+    [ "$?" != 44 ] || gap "$repo tag listing — HTTP 404"
+  fi
+
+  # A repository publishing a public Pages site. Not a defect by itself -- one
+  # repository is a documentation site and is meant to -- but an internal
+  # repository serving a public site is an exposure nobody chose on purpose, so
+  # the visibility of the repository is reported beside the URL.
+  if [ -n "$have_pages" ]; then
+    if read_api "repos/$ORG/$repo/pages" "$WORK/pages.json"; then
+      if ! jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pages.json" >/dev/null 2>&1; then
+        gap "$repo Pages site — invalid response"
+      elif [ "$(jq -r .public "$WORK/pages.json")" = true ]; then
+        pg_url=$(jq -r .html_url "$WORK/pages.json")
+        pg_src=$(jq -r '.source.branch // "?"' "$WORK/pages.json")
+        vis=$(echo "$meta" | jq -r '.visibility')
+        echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
+      fi
+    fi
+  fi
+
+  # The has_wiki flag is readable at every visibility; wiki *content* is not.
+  # Counted here as a flag, which is a fact, and left as a metric rather than a
+  # finding by owner decision 2026-09-02 -- three wiki questions are still open,
+  # and three findings a week ahead of the answer is noise.
+  has_wiki=$(echo "$meta" | jq -r '.has_wiki')
+  if [ "$has_wiki" = "true" ]; then
+    n_wiki=$((n_wiki + 1))
+    echo "$repo ($(echo "$meta" | jq -r '.visibility'))" >> "$WORK/wikirepos"
+  fi
+
   # Only public repositories: an App installation token cannot read a wiki, so
   # for an internal or private one "no content" and "no access" look identical.
   # Checking those reported the two repositories that actually use their wiki as
   # empty, which is worse than not checking at all.
-  if [ "$(echo "$meta" | jq -r '.has_wiki')" = "true" ] &&
+  if [ "$has_wiki" = "true" ] &&
      [ "$(echo "$meta" | jq -r '.visibility')" = "public" ]; then
     git ls-remote "https://github.com/$ORG/$repo.wiki.git" >/dev/null 2>&1 ||
       echo "$repo|wiki enabled but empty" >> "$WORK/findings"
@@ -748,7 +902,7 @@ while IFS= read -r repo; do
   # file makes granted secrets look ungranted, which fault injection caught
   # after the sibling check had already been gated and this one had not.
   notgranted=""
-  while [ -n "$have_orgsecrets" ] && IFS= read -r s; do
+  while [ -n "$have_orgsecrets" ] && [ -n "$workflows_complete" ] && IFS= read -r s; do
     [ -z "$s" ] && continue
     grep -qE "secrets\.$s([^A-Za-z0-9_]|\$)" "$WORK/wfbody" || continue
     grep -qxF "$s" "$WORK/reposecrets" && continue
@@ -777,12 +931,7 @@ while IFS= read -r repo; do
       # fallback appends to it rather than replacing it and ns became the whole
       # 403 JSON -- which is not "0", so every environment was reported as holding
       # secrets. Unreadable is skipped and named once, never counted as a number.
-      if ! ns=$(gh api "repos/$ORG/$repo/environments/$env/secrets" --jq '.total_count' 2>/dev/null); then
-        [ -n "$envsec_gap" ] || gap "environment secret counts — needs \`Secrets: read\`; the unprotected-environment check is skipped"
-        envsec_gap=1
-        continue
-      fi
-      case "$ns" in ''|*[!0-9]*) ns=0 ;; esac
+      ns=$(read_count "repos/$ORG/$repo/environments/$env/secrets") || continue
       # if, not [ ] && -- this while is the right-hand side of a pipeline, so its
       # body's last command is the pipeline's exit status, and a false AND-list
       # there aborts the whole script under set -e. Demonstrated, not assumed:
@@ -862,6 +1011,104 @@ jq -r '.assignees | keys[]' "$WORK/assignees.json" | while IFS= read -r listed; 
   fi
 done
 
+# An incomplete release train. Five repositories are tagged with one shared name
+# on one day, and the defect is the silent partial: Wildcat-deployment missed
+# june17, july31 and aug4 and nothing noticed for three months.
+#
+# A train tag is `v<product>-<YYYY-MM-DD>`, and the date suffix is the only
+# thing that marks one -- a package release tag has none. A separate `train/`
+# namespace was the first choice and was withdrawn before anything merged: the
+# image builds trigger on `push: tags: ["v*.*.*"]`, which a `train/` ref does
+# not match, so a train cut under that name would have built nothing at all.
+#
+# The nine historical trains are named v0.4.0-aug25 and the like, so the date
+# pattern excludes them for free. They predate the convention, are not migrated
+# by contract, and would otherwise be nine permanent findings for a decision
+# already taken. No dated tag exists as of 2026-09-02, so this is silent until
+# the first train is cut -- by design, not by accident.
+#
+# The finding is attributed to each repository that is missing the tag, not to
+# the train, because that is the repository somebody has to act on.
+#
+# This list exists twice: here, and as MEMBERS in scripts/release-train.py, which
+# is what actually cuts the tags. They must agree -- a member the train tags and
+# the audit does not know about can never be reported as missing, and one the
+# audit knows about and the train does not would be reported missing every week
+# forever. Change both, or neither. The contract is .github/RELEASING.md.
+TRAIN_MEMBERS="Wildcat Clowder Wildcat-Auxiliary Wildcat-deployment wildcat-dashboard-ui"
+n_train_members=$(echo "$TRAIN_MEMBERS" | wc -w | tr -d ' ')
+
+# ...and the agreement is checked rather than trusted. A member the train tags
+# and this list omits can never be reported missing; one this list carries and
+# the train does not would be reported missing every week forever. Both failures
+# are silent, which is why the comparison is a finding. Skipped while
+# release-train.py does not exist -- it arrives with .github#39.
+rt_script="$(dirname "$0")/release-train.py"
+if [ -f "$rt_script" ]; then
+  # awk rather than a sed range, because a sed range cannot close on the line it
+  # opened on: the moment somebody reformats MEMBERS onto one line -- and the list
+  # is short enough that they will -- the range runs on to the next ] in the file
+  # and sweeps in GATE_EXCLUDE and BLOCKING. Caught by a control that reformatted
+  # it, which is the only reason it is not a weekly false finding.
+  rt_members=$(awk '/^MEMBERS *= *\[/ { inside = 1 } inside { print; if (/\]/) exit }' "$rt_script" \
+               | grep -o '"[^"]*"' | tr -d '"' | sort | tr '\n' ' ')
+  au_members=$(echo "$TRAIN_MEMBERS" | tr ' ' '\n' | sort | tr '\n' ' ')
+  [ "$rt_members" = "$au_members" ] ||
+    echo ".github|release-train.py and this script disagree about train membership — train: [$rt_members] audit: [$au_members]" >> "$WORK/findings"
+fi
+
+: > "$WORK/trainrefs"
+train_complete=1
+for m in $TRAIN_MEMBERS; do
+  if read_api "repos/$ORG/$m/git/matching-refs/tags/v" "$WORK/train.json"; then
+    if ! jq -er 'if type == "array" and all(.[]; .ref | type == "string") then [.[] .ref | sub("^refs/tags/"; "")] | join("\n") else error("invalid refs") end' "$WORK/train.json" > "$WORK/trainone"; then
+      gap "$m train tags — invalid response; completeness not measured"
+      train_complete=""
+      continue
+    fi
+  else
+    [ "$?" != 44 ] || gap "$m train tags — HTTP 404; completeness not measured"
+    train_complete=""
+    continue
+  fi
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    case "$t" in
+      *-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) echo "$t|$m" >> "$WORK/trainrefs" ;;
+    esac
+  done < "$WORK/trainone"
+done
+cut -d'|' -f1 "$WORK/trainrefs" | sort -u > "$WORK/trainnames"
+while [ -n "$train_complete" ] && IFS= read -r t; do
+  [ -z "$t" ] && continue
+  awk -F'|' -v t="$t" '$1 == t {print $2}' "$WORK/trainrefs" | sort -u > "$WORK/trainhave"
+  n_have=$(wc -l < "$WORK/trainhave" | tr -d ' ')
+  if [ "$n_have" != "$n_train_members" ]; then
+    for m in $TRAIN_MEMBERS; do
+      grep -qxF "$m" "$WORK/trainhave" ||
+        echo "$m|release train \`$t\` was cut in $n_have of $n_train_members repositories but not here" >> "$WORK/findings"
+    done
+  fi
+done < "$WORK/trainnames"
+
+# Archived repositories are outside the audit loop by design: nothing about them
+# can drift, because nothing about them can change. Their credentials can.
+# Archiving revokes nothing -- a token in an archived repository is still valid,
+# and it belongs to no CI that anyone watches. Guarded by the same probe as the
+# other secret checks, so it declares itself skipped rather than reporting zero.
+if [ -n "$have_reposecrets" ]; then
+  jq -r 'add | .[] | select(.archived == true) | .name' "$WORK/repos.json" > "$WORK/archived"
+  while IFS= read -r arch; do
+    [ -z "$arch" ] && continue
+    ns=$(read_count "repos/$ORG/$arch/actions/secrets") || continue
+    if [ "$ns" != "0" ]; then
+      echo "$arch|archived, but still holds $ns repository secret(s) — archiving does not revoke a credential" >> "$WORK/findings"
+    fi
+  done < "$WORK/archived"
+else
+  gap "archived repositories' secrets — needs \`Secrets: read\`; a credential left in an archived repository is unchecked"
+fi
+
 # Dependabot backlog. Not drift, so it is reported rather than counted as a
 # finding — alerts come and go with upstream advisories and would keep the issue
 # open forever. Needs the App's "Dependabot alerts: read"; if that is ever
@@ -903,10 +1150,16 @@ have_surface=""
 : > "$WORK/secsurface"
 if [ -n "$have_reposecrets" ] && [ -n "$have_envs" ]; then have_surface=1; fi
 while [ -n "$have_surface" ] && read -r repo; do
-  n=$(gh api "repos/$ORG/$repo/actions/secrets" --jq '.total_count' 2>/dev/null || echo 0)
-  n=${n:-0}
+  if ! n=$(read_count "repos/$ORG/$repo/actions/secrets"); then have_surface=""; break; fi
   repo_level=$((repo_level + n))
-  envs=$(gh api "repos/$ORG/$repo/environments?per_page=100" 2>/dev/null || echo '{}')
+  if ! read_api "repos/$ORG/$repo/environments?per_page=100" "$WORK/surface-envs.json"; then
+    gap "$repo secret surface — environments unavailable"
+    have_surface=""; break
+  fi
+  if ! jq -e '.environments | type == "array"' "$WORK/surface-envs.json" >/dev/null 2>&1; then
+    gap "$repo secret surface — invalid environments response"
+    have_surface=""; break
+  fi
   g=0
   u=0
   # protection_rules is empty for an unprotected environment, so its length is the
@@ -914,11 +1167,10 @@ while [ -n "$have_surface" ] && read -r repo; do
   # nothing either way.
   while IFS=$'\t' read -r ename prot; do
     [ -z "$ename" ] && continue
-    es=$(gh api "repos/$ORG/$repo/environments/$ename/secrets" --jq '.total_count' 2>/dev/null || echo 0)
-    es=${es:-0}
+    if ! es=$(read_count "repos/$ORG/$repo/environments/$ename/secrets"); then have_surface=""; break; fi
     [ "$es" -eq 0 ] && continue
     if [ "$prot" = "0" ]; then u=$((u + es)); else g=$((g + es)); fi
-  done < <(printf '%s' "$envs" | jq -r '.environments[]? | [.name, ((.protection_rules//[])|length)] | @tsv')
+  done < <(jq -r '.environments[] | [.name, ((.protection_rules//[])|length)] | @tsv' "$WORK/surface-envs.json")
   gated=$((gated + g))
   ungated_env=$((ungated_env + u))
   if [ $((n + g + u)) -gt 0 ]; then
@@ -946,6 +1198,8 @@ done < "$WORK/repos"
     echo "| repository | finding |"
     echo "| --- | --- |"
     sort "$WORK/findings" | awk -F'|' '{printf "| `%s` | %s |\n", $1, $2}'
+  elif [ -s "$WORK/gaps" ]; then
+    echo "No drift found in the completed checks; coverage is incomplete."
   else
     echo "No drift found."
   fi
@@ -959,6 +1213,9 @@ done < "$WORK/repos"
   n_untimed_repos=$(sort -u "$WORK/untimedrepos" | awk 'END{print NR}')
   echo "- jobs with no \`timeout-minutes\`: **$n_untimed** across **$n_untimed_repos** repositories — a job with none runs to GitHub's six-hour default. Not a finding: fifty lines would bury everything else, and the remainder after the open pull requests merge is deferred for stated reasons — a dormant repository, dispatch-only workflows, one job behind \`if: false\`. Caller jobs are excluded because they cannot take the key at all."
   echo "- open pull requests behind their base: **$n_behind** — of which **$n_behind_bot** are Dependabot's, which self-heal when the branch is recreated from a pinned default, leaving **$n_behind_live** that are not drafts and were touched in the last 30 days. Not a finding: the remedy is \`update-branch\` on another team's branch, and tip-commit authorship is not ownership. \`bit.cr#1\` and \`bitcr.org#1\` are excluded by the owner's decision of 2026-08-25."
+  if [ "$n_wiki" -gt 0 ]; then
+    echo "- repositories with the wiki enabled: **$n_wiki** — $(sort "$WORK/wikirepos" | tr '\n' ',' | sed 's/,$//; s/,/, /g'). A wiki is a separate git repository, invisible to code search, to the contents API and to every ruleset, which targets \`branch\` and \`tag\` only. Not a finding: whether these should exist is an open question, and an App token cannot read an internal or private wiki, so emptiness is only establishable for the public one."
+  fi
   echo "- agent-instruction files outside the enterprise ruleset's globs: **$n_agentfiles** across **$n_agentrepos** repositories — the ruleset restricts \`.github/agents/*.md\` and \`agents/*.md\`, and neither directory exists anywhere. Owner decision 2026-08-18: record, do not widen."
   echo
 
@@ -1012,7 +1269,7 @@ if [ -s "$WORK/findings" ]; then
       | gh api -X POST "repos/$REPORT_REPO/issues" --input - --jq '.number')
     echo "Opened issue #$n ($count findings)"
   fi
-elif [ -n "$existing" ]; then
+elif [ -n "$existing" ] && [ ! -s "$WORK/gaps" ]; then
   gh api -X POST "repos/$REPORT_REPO/issues/$existing/comments" \
     -f "body=No drift found across $total repositories. Closing; it will reopen if anything drifts again." >/dev/null
   gh api -X PATCH "repos/$REPORT_REPO/issues/$existing" -f state=closed >/dev/null
