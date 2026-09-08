@@ -7,7 +7,7 @@ ones, so creating or archiving a repository needs no change here.
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
-| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | 32 findings, 3 metrics and a list of what it could not read — see below |
+| `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | configuration findings, coverage metrics and a list of what it could not read — see below |
 
 Both accept a `dry_run` input on manual runs, which prints the intended
 changes without writing anything. On `audit-repo-settings` a dry run stops after
@@ -22,7 +22,7 @@ workflow log is a report nobody reads.
 
 ## What the audit reports
 
-Thirty-two findings, grouped by what they are about. Every one names the
+Findings are grouped by what they are about. Every one names the
 repository and is a single line, so the issue stays readable when several fire
 at once.
 
@@ -59,10 +59,11 @@ matters most: a failed read must never render as *safe to delete*.
 **Its environments** — one holding secrets with no protection rule · one listing
 a reviewer who is not an organisation member.
 
-**Its community files** — a file byte-identical to the organisation version in
-this repository, which could simply be inherited.
+**Its community files** — a file byte-identical to the organisation version, or a repository issue-template directory missing its own `config.yml`.
 
-### Three things are counted rather than reported
+**Its releases and sites** — the highest-versioned tag without a release in a repository that has released before; incomplete dated trains; disagreement about train membership; public Pages sites with the source repository visibility; credentials still held by archived repositories.
+
+### Coverage metrics
 
 Each of these is real and none is a finding, because a check that prints fifty
 lines on its first run trains its audience to skip the whole report.
@@ -80,11 +81,15 @@ lines on its first run trains its audience to skip the whole report.
   restricts `.github/agents/*.md` and `agents/*.md`, and neither directory exists
   anywhere in the organisation. Owner decision 2026-08-18: record, do not widen.
 
+- **repositories with a wiki enabled**, across all visibilities. This counts the flag; it does not claim to read private wiki content.
+
 ### What it could not read
 
 Every check that depends on a read the token cannot make is **skipped and
 named**, in a *Not measured on this run* section, with the permission it needs.
-None of them reports zero.
+Failed reads never become zero. A failed tag-list request skips train completeness. An incomplete workflow corpus suppresses dependent credential verdicts. An incomplete audit does not close the drift issue.
+
+Run the committed fault checks with `python3 .github/scripts/test_audit.py`. Pull requests run these checks without an App token; only scheduled and manual runs can execute the audit. Its timeout is 30 minutes, based on the measured 19m17s full run on 2026-09-02.
 
 That distinction is the reason the section exists. An unreadable answer and an
 empty one are indistinguishable in the response, and reporting the second when it
@@ -134,6 +139,12 @@ rather than the App when confirming a grant.
 | Administration | **write** | setting topics |
 | Contents | read | `LICENSE`, `dependabot.yml`, workflow bodies, branch trees |
 | Dependabot alerts | read | the open-alert summary |
+| Pages | read | public Pages sites |
+| Members | read, organisation | environment reviewers |
+| Secrets | read, organisation and repository | credential checks and secret counts |
+| Custom properties | read, organisation | stack classification |
+| Variables | read, repository | orphaned variables |
+| Environments | read | protection rules and environment secrets |
 
 It also holds `contents: write`, `pull_requests: write` and repository
 `packages: write`, granted for work outside these two scripts. Neither of the
