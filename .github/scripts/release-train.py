@@ -1,32 +1,11 @@
 #!/usr/bin/env python3
-"""Cut a release train: one tag and one release across every member, or none.
+"""Prepare an immutable five-member release candidate, then reconcile its tags and releases.
 
-A train is the coordinated cut this organisation has been doing by hand since
-February 2026 -- nine of them, twice as a loop in one engineer's shell. RELEASING.md
-in this repository is the contract; this implements it.
-
-What blocks a train, and what is only reported
-----------------------------------------------
-Blocks: a red check on any member's head, and a tag name already in use.
-
-Reports: the shared wire-crate spread and the age of the dashboard's openapi
-snapshot. Owner decision 2026-09-02. Three members build against three different
-revisions of bcr-common today and nine trains have shipped anyway; refusing them all
-on a risk nothing has confirmed would break a working practice, and only the teams
-could clear it by editing manifests. So the number is put in front of whoever cuts
-the train instead of being left for them to find.
-
-Fail closed
------------
-If the check runs cannot be read the train is refused and the missing permission is
-named. A gate that waves things through when it cannot verify is worse than no gate,
-because it looks like protection.
-
-`Dependabot` is excluded from the gate by name. It is the dependency updater
-reporting on itself, not CI reporting on the code, and it fails for its own reasons
--- it is the single red check across all five members today.
+Only dispatches cut releases. Dry runs cannot write. Resuming uses the original
+Actions artifact, never current master heads. Deployment is a separate action.
 """
 
+import argparse
 import base64
 import datetime
 import json
@@ -35,6 +14,9 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
+import tempfile
+from urllib.parse import quote, urlencode
 
 ORG = os.environ.get("ORG", "BitcreditProtocol")
 PRODUCT = os.environ.get("PRODUCT", "").strip()
@@ -50,7 +32,8 @@ MEMBERS = ["Wildcat", "Clowder", "Wildcat-Auxiliary", "Wildcat-deployment",
 # The members that turn a tag into a container image, on `push: tags: v*.*.*`.
 # Wildcat-deployment is deliberately absent: it carries deployment configuration
 # and builds nothing, so polling it would report a missing build every train.
-IMAGE_BUILDERS = ["Wildcat", "Clowder", "Wildcat-Auxiliary", "wildcat-dashboard-ui"]
+IMAGE_BUILDERS = {"Wildcat": "build.yml", "Clowder": "build.yml",
+                  "Wildcat-Auxiliary": "build.yml", "wildcat-dashboard-ui": "release.yml"}
 
 GATE_EXCLUDE = {"Dependabot"}
 BLOCKING = {"failure", "timed_out", "cancelled", "action_required", "stale"}
@@ -61,34 +44,70 @@ API_REPO, API_PATH = "Wildcat", "crates/bcr-wdc-admin-aggregator"
 
 WIRE_CRATE = "bcr-common"
 MARKER = "bitcredit-openapi-snapshot"
+ARTIFACT = "release-train-plan"
+SHA = re.compile(r"[0-9a-f]{40}")
+SEMVER = re.compile(
+    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?")
 
 
-def api(path, method="GET", body=None):
+class APIError(RuntimeError):
+    pass
+
+
+def api(path, method="GET", body=None, *, missing=False, token=None):
+    env = os.environ.copy()
+    if method != "GET":
+        if DRY_RUN:
+            raise APIError("dry-run refused a write")
+        token = os.environ.get("GH_WRITE_TOKEN")
+        if not token:
+            raise APIError("write token is unavailable")
+    if token:
+        env["GH_TOKEN"] = token
     cmd = ["gh", "api", "-X", method, path]
     if body is not None:
         cmd += ["--input", "-"]
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       input=json.dumps(body) if body is not None else None)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                       input=json.dumps(body) if body is not None else None, timeout=60)
     if r.returncode != 0:
-        return None
+        if missing and re.search(r"\(HTTP 404\)", r.stderr):
+            return None
+        raise APIError(f"{method} {path}: {r.stderr.strip()[:500] or 'request failed'}")
     try:
         return json.loads(r.stdout)
     except json.JSONDecodeError:
-        return None
+        raise APIError(f"{method} {path}: invalid JSON response") from None
+
+
+def pages(path, key=None, *, token=None):
+    out, page = [], 1
+    while True:
+        data = api(f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}", token=token)
+        rows = data.get(key) if isinstance(data, dict) and key else data
+        if not isinstance(rows, list):
+            raise APIError(f"{path}: invalid list response")
+        out.extend(rows)
+        if len(rows) < 100:
+            return out
+        page += 1
 
 
 def content(repo, path, ref="master"):
-    d = api(f"repos/{ORG}/{repo}/contents/{path}?ref={ref}")
-    if not isinstance(d, dict) or "content" not in d:
+    d = api(f"repos/{ORG}/{repo}/contents/{path}?ref={quote(ref, safe='')}", missing=True)
+    if d is None:
         return None
+    if not isinstance(d, dict) or "content" not in d:
+        raise APIError(f"{repo}/{path}: invalid contents response")
     try:
         return base64.b64decode(d["content"]).decode("utf-8", "replace")
     except Exception:
-        return None
+        raise APIError(f"{repo}/{path}: invalid content encoding") from None
 
 
-def last_commit_date(repo, path):
-    d = api(f"repos/{ORG}/{repo}/commits?path={path}&per_page=1")
+def last_commit_date(repo, path, ref):
+    d = api(f"repos/{ORG}/{repo}/commits?" + urlencode(dict(path=path, sha=ref, per_page=1)))
     if not d:
         return None
     return d[0]["commit"]["committer"]["date"]
@@ -98,44 +117,69 @@ def last_commit_date(repo, path):
 
 def head_of(repo):
     d = api(f"repos/{ORG}/{repo}/commits/master")
-    return d["sha"] if d else None
+    sha = d.get("sha") if isinstance(d, dict) else None
+    if not isinstance(sha, str) or not SHA.fullmatch(sha):
+        raise APIError(f"{repo}: invalid master SHA")
+    return sha
 
 
 def gate(repo, sha):
     """(ok, detail). ok is False when the train must not proceed for this member."""
-    d = api(f"repos/{ORG}/{repo}/commits/{sha}/check-runs?per_page=100")
-    if not isinstance(d, dict) or "check_runs" not in d:
-        return False, "could not read check runs — the App is missing `Checks: read`"
-    runs = d["check_runs"]
+    suites = pages(f"repos/{ORG}/{repo}/commits/{sha}/check-suites", "check_suites")
+    latest = {}
+    for suite in suites:
+        if suite.get("head_branch") != "master" or suite.get("head_sha") != sha:
+            continue
+        for run in pages(f"repos/{ORG}/{repo}/check-suites/{suite['id']}/check-runs?filter=all", "check_runs"):
+            if run.get("head_sha") != sha or not isinstance(run.get("name"), str):
+                raise APIError(f"{repo}: invalid check run")
+            key = (run.get("app", {}).get("id"), run["name"])
+            # Creation order matters: a newer queued check has no started_at yet.
+            # Execution timestamps can also put an older, delayed run last.
+            order = run.get("id")
+            if not isinstance(order, int) or order <= 0:
+                raise APIError(f"{repo}: invalid check-run ID")
+            if key not in latest or order > latest[key][0]:
+                latest[key] = (order, run)
+    runs = [r for _, r in latest.values() if r["name"] not in GATE_EXCLUDE]
     if not runs:
         return False, "no check run at all on this commit — nothing verified it"
     bad = sorted({r["name"] for r in runs
                   if r.get("conclusion") in BLOCKING and r["name"] not in GATE_EXCLUDE})
-    skipped = sorted({r["name"] for r in runs
-                      if r.get("conclusion") in BLOCKING and r["name"] in GATE_EXCLUDE})
     running = sorted({r["name"] for r in runs
                       if r.get("status") != "completed" and r["name"] not in GATE_EXCLUDE})
     if bad:
         return False, "failing: " + ", ".join(f"`{b}`" for b in bad)
     if running:
         return False, "still running: " + ", ".join(f"`{r}`" for r in running)
-    note = f"{len(runs)} checks green"
-    if skipped:
-        note += " (excluded: " + ", ".join(f"`{s}`" for s in skipped) + ")"
-    return True, note
+    return True, f"{len(runs)} checks green (Dependabot excluded)"
 
 
-def tag_exists(repo, tag):
-    return api(f"repos/{ORG}/{repo}/git/ref/tags/{tag}") is not None
+def tag_commit(repo, tag):
+    ref = api(f"repos/{ORG}/{repo}/git/ref/tags/{quote(tag, safe='')}", missing=True)
+    if ref is None:
+        return None
+    obj = ref.get("object", {})
+    if obj.get("type") != "tag":
+        raise APIError(f"{repo}/{tag}: existing tag is not annotated")
+    for _ in range(10):
+        if not isinstance(obj.get("sha"), str) or not SHA.fullmatch(obj["sha"]):
+            break
+        if obj.get("type") == "commit":
+            return obj["sha"]
+        if obj.get("type") != "tag":
+            break
+        obj = api(f"repos/{ORG}/{repo}/git/tags/{obj['sha']}").get("object", {})
+    raise APIError(f"{repo}/{tag}: cannot resolve annotated tag to a commit")
 
 
 # ------------------------------------------------------------------ reports
 
-def wire_pins():
+def wire_pins(heads):
     """What revision of the wire crate each Rust member builds against."""
     out = {}
     for repo in MEMBERS:
-        txt = content(repo, "Cargo.toml")
+        txt = content(repo, "Cargo.toml", heads[repo])
         if not txt:
             continue
         m = re.search(r"^\s*%s\s*=\s*\{([^}]*)\}" % re.escape(WIRE_CRATE), txt, re.M)
@@ -144,7 +188,7 @@ def wire_pins():
         body = re.sub(r"\s+", " ", m.group(1)).strip()
         patched = bool(re.search(r"^\[patch\.[^\]]*%s" % re.escape(WIRE_CRATE), txt, re.M))
         if patched:
-            sub = api(f"repos/{ORG}/{repo}/contents/{WIRE_CRATE}?ref=master")
+            sub = api(f"repos/{ORG}/{repo}/contents/{WIRE_CRATE}?ref={heads[repo]}")
             sha = sub.get("sha") if isinstance(sub, dict) else None
             out[repo] = (sha, "submodule, the declared tag is overridden by [patch]")
         else:
@@ -171,310 +215,387 @@ def distance(a, b):
     return d["ahead_by"] + d.get("behind_by", 0)
 
 
-def snapshot_state():
-    snap = last_commit_date(SNAPSHOT_REPO, SNAPSHOT_PATH)
-    code = last_commit_date(API_REPO, API_PATH)
+def snapshot_state(heads):
+    snap = last_commit_date(SNAPSHOT_REPO, SNAPSHOT_PATH, heads[SNAPSHOT_REPO])
+    code = last_commit_date(API_REPO, API_PATH, heads[API_REPO])
     if not snap or not code:
         return None, snap, code
     return (code > snap), snap, code
 
 
-def notify_stale_snapshot(snap, code, tag, gaps):
-    mark = f"<!-- {MARKER} -->"
-    issues = api(f"repos/{ORG}/{SNAPSHOT_REPO}/issues?state=open&per_page=100") or []
-    existing = next((i for i in issues
-                     if "pull_request" not in i and mark in (i.get("body") or "")), None)
-    title = f"opt/wildcat/openapi.json is older than the API it describes"
-    body = (
-        f"{mark}\n"
-        f"`{SNAPSHOT_PATH}` was last changed **{snap[:10]}**, and "
-        f"`{API_REPO}/{API_PATH}` was last changed **{code[:10]}** — so the committed "
-        f"snapshot describes an older version of the admin API than the one being "
-        f"released.\n\n"
-        f"Noticed while cutting **`{tag}`**.\n\n"
-        f"This is a comparison of commit dates, not of the specs themselves: "
-        f"`{API_REPO}` generates `openapi.json` into a build artifact that expires, "
-        f"so there is nothing durable to diff against. The dates are the signal that "
-        f"is available without publishing the spec.\n\n"
-        f"Tracked in `infrastructure#82`. Opened by `release-train` in `{ORG}/.github`; "
-        f"one issue, refreshed rather than duplicated.\n"
-    )
-    if DRY_RUN:
-        return "would " + ("update" if existing else "open")
+def notify_stale_snapshot(snap, code, tag, existing):
+    body = (f"<!-- {MARKER} -->\nThe dashboard snapshot changed {snap}, while "
+            f"the API code changed {code}. Observed in train `{tag}`.\n\n"
+            "This is a commit-date signal, not a comparison of the generated specs. "
+            "Tracked in infrastructure#82.")
+    payload = {"title": "Refresh the dashboard OpenAPI snapshot", "body": body}
+    path = f"repos/{ORG}/{SNAPSHOT_REPO}/issues"
+    method = "POST"
     if existing:
-        api(f"repos/{ORG}/{SNAPSHOT_REPO}/issues/{existing['number']}", "PATCH",
-            {"title": title, "body": body})
-        return f"updated #{existing['number']}"
-    made = api(f"repos/{ORG}/{SNAPSHOT_REPO}/issues", "POST", {"title": title, "body": body})
-    if not made or "number" not in made:
-        gaps.append(f"could not open an issue in `{SNAPSHOT_REPO}`")
-        return "FAILED"
-    return f"opened #{made['number']}"
+        path += f"/{existing['number']}"
+        method = "PATCH"
+    result = api(path, method, payload)
+    if not isinstance(result, dict) or not isinstance(result.get("number"), int):
+        raise APIError("invalid snapshot issue response")
+    return f"snapshot issue #{result['number']}"
 
 
-def builds_started(tag, gaps):
-    """Did tagging actually start the image builds?
-
-    The train tags with an App installation token, and nothing in this
-    organisation has ever done that before -- every historical tag-push build
-    was started by a person, and the only bot in the run history is Dependabot,
-    which the platform handles specially. If an App push does not fire
-    `push: tags`, the train tags five repositories, publishes five releases and
-    produces no images, with no error anywhere.
-
-    So the consequence is checked rather than assumed. A missing build becomes a
-    gap, which makes the run exit non-zero -- the loudest signal available
-    without a second write to every release.
-
-    Bounded and late: the tags already exist, so nothing here can undo a correct
-    train. A build that is merely slow is reported as not started, which is the
-    safe direction to be wrong in.
-    """
-    missing = []
-    for repo in IMAGE_BUILDERS:
-        # Filtered server-side. A tag push reports the tag as head_branch, so
-        # `branch=` matches it exactly and total_count answers in one row.
-        # Scanning the most recent 30 runs instead looked equivalent and was
-        # not: Clowder is busy enough that a real tag-push run had already
-        # fallen off the first page, and the check reported it as missing.
-        q = f"repos/{ORG}/{repo}/actions/runs?event=push&branch={tag}&per_page=1"
-        for attempt in range(6):
-            if (api(q) or {}).get("total_count", 0) > 0:
+def builds_started(plan, gaps):
+    started = []
+    for repo, workflow in IMAGE_BUILDERS.items():
+        query = urlencode(dict(event="push", branch=plan["tag"],
+                               head_sha=plan["heads"][repo], per_page=1))
+        for attempt in range(7):
+            try:
+                result = api(f"repos/{ORG}/{repo}/actions/workflows/{workflow}/runs?{query}")
+                runs = result.get("workflow_runs") if isinstance(result, dict) else None
+                if not isinstance(runs, list):
+                    raise APIError(f"{repo}: invalid workflow-run response")
+                match = next((r for r in runs if r.get("head_sha") == plan["heads"][repo]
+                              and r.get("head_branch") == plan["tag"] and r.get("event") == "push"), None)
+                if match:
+                    started.append(repo)
+                    if match.get("conclusion") in BLOCKING:
+                        gaps.append(f"{repo}/{workflow}: build {match['conclusion']} — {match.get('html_url', '')}")
+                    break
+            except (APIError, subprocess.TimeoutExpired) as exc:
+                gaps.append(f"{repo}/{workflow}: could not verify build start: {exc}")
                 break
-            if attempt < 5:
+            if attempt < 6:
                 time.sleep(15)
         else:
-            missing.append(repo)
-    for repo in missing:
-        gaps.append(f"`{repo}` started no workflow run for `{tag}` within 90s — "
-                    f"the tag exists but no image is being built")
-    return missing
+            gaps.append(f"{repo}/{workflow}: no matching image build started within 90s")
+    return started
 
 
 def previous_train(tag):
-    """The dated tag before this one, taken across the whole train.
-
-    Sorted by the date suffix, not by the name: `v0.10.0-2026-01-05` sorts below
-    `v0.9.0-2026-02-01` as a string, and the later date is what "previous" means.
-    """
-    names = set()
-    for m in MEMBERS:
-        for r in api(f"repos/{ORG}/{m}/git/matching-refs/tags/v") or []:
-            n = r.get("ref", "").replace("refs/tags/", "")
-            if n != tag and re.fullmatch(r"v.+-\d{4}-\d{2}-\d{2}", n):
-                names.add(n)
-    return max(names, key=lambda n: n[-10:], default=None)
+    candidates = {}
+    for repo in MEMBERS:
+        refs = api(f"repos/{ORG}/{repo}/git/matching-refs/tags/v")
+        if not isinstance(refs, list):
+            raise APIError(f"{repo}: invalid train-ref response")
+        for ref in refs:
+            name = ref.get("ref", "").removeprefix("refs/tags/")
+            if name != tag and re.fullmatch(r"v.+-\d{4}-\d{2}-\d{2}", name):
+                candidates.setdefault(name, []).append((repo, ref.get("object", {})))
+    if not candidates:
+        return None
+    # All new train dates are UTC. Only the latest date needs tag-object reads.
+    day = max(n[-10:] for n in candidates)
+    dated = []
+    for name, refs in candidates.items():
+        if name[-10:] != day:
+            continue
+        for repo, obj in refs:
+            if obj.get("type") != "tag" or not SHA.fullmatch(str(obj.get("sha", ""))):
+                raise APIError(f"{repo}/{name}: previous train is not an annotated tag")
+            data = api(f"repos/{ORG}/{repo}/git/tags/{obj['sha']}")
+            timestamp = data.get("tagger", {}).get("date")
+            if not timestamp:
+                raise APIError(f"{repo}/{name}: missing tagger date")
+            dated.append((datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00")), name))
+    return max(dated)[1]
 
 
 def migrations_at(repo, ref):
-    """Migration files present at a ref, or None if the ref is not there."""
-    d = api(f"repos/{ORG}/{repo}/git/trees/{ref}?recursive=1")
-    if not isinstance(d, dict) or "tree" not in d:
-        return None
-    return {t["path"] for t in d["tree"]
-            if t.get("type") == "blob"
-            and re.search(r"migrations/.*\.sql$", t["path"], re.I)}
+    data = api(f"repos/{ORG}/{repo}/git/trees/{quote(ref, safe='')}?recursive=1")
+    if not isinstance(data, dict) or not isinstance(data.get("tree"), list) or data.get("truncated") is not False:
+        raise APIError(f"{repo}/{ref}: incomplete migration tree")
+    return {entry["path"]: entry["sha"] for entry in data["tree"]
+            if entry.get("type") == "blob" and re.search(r"migrations/.*\.sql$", entry["path"], re.I)}
 
 
-def rollback_note(repo, tag, prev):
-    """One line per release saying whether rolling back is a plain redeploy.
-
-    Rolling an image back is only simple when no migration landed in between.
-    Clowder carries nine migration files and Wildcat one, and there are no
-    down-migrations anywhere in the train -- so an older image can meet a newer
-    schema, and nothing tests that pairing. Working that out at the moment
-    something is broken is exactly the wrong time, so it is computed here and
-    written into every release body, including the members with no schema at
-    all: a missing line reads as a bug, not as an all-clear.
-    """
+def rollback_note(repo, sha, prev):
     if not prev:
-        return ("**Rollback:** first train under this convention — no previous "
-                "train to roll back to.")
+        return "**Rollback:** no previous dated train exists under this convention."
     was = migrations_at(repo, prev)
-    if was is None:
-        return (f"**Rollback:** `{repo}` did not carry `{prev}`, so there is "
-                f"nothing to compare against.")
-    now = migrations_at(repo, tag)
-    if now is None:
-        return f"**Rollback:** could not read `{repo}` at `{tag}`."
-    new = sorted(now - was)
-    if not new and not now:
-        return (f"**Rollback to `{prev}`:** no schema in this repository, so it "
-                f"is a plain redeploy of the older image.")
-    if not new:
-        return (f"**Rollback to `{prev}`:** no migration landed since, so it is "
-                f"a plain redeploy of the older image.")
-    return (f"**Rollback to `{prev}` is not clean** — {len(new)} migration(s) "
-            f"landed since: " + ", ".join(f"`{q.rsplit('/', 1)[-1]}`" for q in new)
-            + ". There are no down-migrations, so an older image would run "
-              "against a newer schema.")
+    now = migrations_at(repo, sha)
+    added = sorted(now.keys() - was.keys())
+    removed = sorted(was.keys() - now.keys())
+    changed = sorted(path for path in now.keys() & was.keys() if now[path] != was[path])
+    details = "; ".join(f"{name}: " + ", ".join(f"`{p}`" for p in paths)
+                        for name, paths in (("added", added), ("changed", changed), ("removed", removed)) if paths)
+    if details:
+        return f"**Rollback to `{prev}`: SQL migrations differ** — {details}. Review schema/data compatibility before deploying an older image."
+    return f"**Rollback to `{prev}`: no SQL migration-file changes detected.** This does not establish application or data compatibility."
 
 
-# ------------------------------------------------------------------ act
-
-def cut(repo, tag, expected_sha, others, wire_note, snap_note, roll_note, gaps):
-    now = head_of(repo)
-    if now != expected_sha:
-        gaps.append(f"`{repo}` moved from `{expected_sha[:8]}` to `{str(now)[:8]}` "
-                    f"after it was gated — refusing to tag an unverified commit")
-        return "REFUSED — head moved"
-    obj = api(f"repos/{ORG}/{repo}/git/tags", "POST", {
-        "tag": tag, "message": f"Release {tag}", "object": expected_sha, "type": "commit"})
-    if not obj or "sha" not in obj:
-        gaps.append(f"could not create the tag object in `{repo}`")
-        return "FAILED"
-    ref = api(f"repos/{ORG}/{repo}/git/refs", "POST",
-              {"ref": f"refs/tags/{tag}", "sha": obj["sha"]})
-    if not ref:
-        gaps.append(f"created a tag object in `{repo}` but could not push the ref")
-        return "FAILED"
-    body = (
-        f"Part of release train **`{tag}`**, cut across "
-        + ", ".join(f"`{o}`" for o in MEMBERS) + f" by @{ACTOR}.\n\n"
-        f"| member | commit |\n|---|---|\n"
-        + "".join(f"| `{r}` | `{s[:8]}` |\n" for r, s in others.items())
-        + f"\n{wire_note}\n\n{snap_note}\n\n{roll_note}\n"
-    )
-    rel = api(f"repos/{ORG}/{repo}/releases", "POST", {
-        "tag_name": tag, "name": tag, "body": body, "generate_release_notes": True})
-    if not rel or "number" not in rel:
-        gaps.append(f"tagged `{repo}` but could not create its release")
-        return "tagged, release FAILED"
-    return f"tagged and released"
+def validate_tag(tag):
+    if not isinstance(tag, str) or not tag.startswith("v") or not SEMVER.fullmatch(tag[1:]):
+        raise ValueError("train tag must be valid v-prefixed SemVer")
+    if not re.search(r"-\d{4}-\d{2}-\d{2}$", tag):
+        raise ValueError("train tag must end in an ISO date")
+    datetime.date.fromisoformat(tag[-10:])
 
 
-# ------------------------------------------------------------------ main
+def validate_plan(plan):
+    if not isinstance(plan, dict) or plan.get("schema_version") != 1:
+        raise ValueError("unsupported release plan")
+    if plan.get("repository") != f"{ORG}/.github":
+        raise ValueError("release plan belongs to another repository")
+    validate_tag(plan.get("tag"))
+    heads = plan.get("heads")
+    if not isinstance(heads, dict) or set(heads) != set(MEMBERS):
+        raise ValueError("release plan must contain exactly the five members")
+    if any(not isinstance(s, str) or not SHA.fullmatch(s) for s in heads.values()):
+        raise ValueError("release plan contains an invalid commit SHA")
+    if plan.get("previous_tag") is not None:
+        validate_tag(plan["previous_tag"])
+        if plan["previous_tag"] == plan["tag"]:
+            raise ValueError("release plan cannot be its own predecessor")
+    actor = plan.get("tagger")
+    if not isinstance(actor, dict) or not re.fullmatch(r"[A-Za-z0-9-]+", str(actor.get("name", ""))):
+        raise ValueError("release plan has an invalid initiator")
+    if not re.fullmatch(r"\d+\+" + re.escape(actor["name"]) + r"@users\.noreply\.github\.com", str(actor.get("email", ""))):
+        raise ValueError("release plan has an invalid tagger email")
+    when = datetime.datetime.fromisoformat(str(actor.get("date", "")).replace("Z", "+00:00"))
+    if when.utcoffset() != datetime.timedelta(0) or when.date().isoformat() != plan["tag"][-10:]:
+        raise ValueError("release plan tag/date must agree in UTC")
+    if not re.fullmatch(r"[1-9]\d*", str(plan.get("run_id", ""))):
+        raise ValueError("release plan must identify its original Actions run")
+    return plan
 
-def main():
-    gaps = []
-    if not re.fullmatch(r"v?\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.]+)?", PRODUCT):
-        print(f"product version {PRODUCT!r} is not of the form 0.5.0 or v0.5.0",
-              file=sys.stderr)
-        return 1
-    product = PRODUCT if PRODUCT.startswith("v") else "v" + PRODUCT
-    tag = f"{product}-{datetime.date.today().isoformat()}"
 
-    # The tag has to match the image builds' trigger or the train produces
-    # nothing at all. Wildcat, Clowder, Wildcat-Auxiliary and
-    # wildcat-dashboard-ui build on `push: tags: ["v*.*.*"]`, and three derive
-    # the image tag with type=semver,pattern={{version}} -- which is how
-    # v0.4.0-aug25 became the image 0.4.0-aug25. A name outside that glob tags
-    # five repositories, publishes five releases and builds nothing, with no
-    # error anywhere; Wildcat-deployment is then left with no image_tag to
-    # deploy. That is exactly what the train/ namespace would have done, and it
-    # is why the namespace was withdrawn before this ever ran. Asserted here so
-    # an odd product string cannot bring the same failure back quietly.
-    # Two conditions, and both are needed. The glob decides whether the build
-    # runs at all; GitHub's * never matches /, so it is [^/]* three times over.
-    # Semver decides whether type=semver can name the image once it does run --
-    # a product string like 0.5.0.1 clears the glob and produces no image tag,
-    # which is the same failure one step later. Found by testing the pair, not
-    # by reading them.
-    if not re.fullmatch(r"v[^/]*\.[^/]*\.[^/]*", tag):
-        print(f"tag {tag!r} does not match the build trigger v*.*.* used by the "
-              f"image-producing members — refusing to cut a train that would "
-              f"build no images", file=sys.stderr)
-        return 1
-    if not re.fullmatch(
-            r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
-            r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
-            r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?", tag[1:]):
-        print(f"tag {tag!r} is not valid semver, so type=semver would give the "
-              f"image no tag — refusing", file=sys.stderr)
-        return 1
+def load_plan(path):
+    if path.stat().st_size > 65536:
+        raise ValueError("release plan is too large")
+    return validate_plan(json.loads(path.read_text()))
 
-    heads, results, blocked = {}, {}, []
-    for repo in MEMBERS:
-        sha = head_of(repo)
-        if not sha:
-            blocked.append((repo, "could not read `master`"))
-            continue
-        heads[repo] = sha
-        if tag_exists(repo, tag):
-            blocked.append((repo, f"`{tag}` already exists"))
-            continue
+
+def artifact_token():
+    token = os.environ.get("GH_ARTIFACT_TOKEN")
+    if not token:
+        raise APIError("native Actions token is unavailable for release-plan storage")
+    return token
+
+
+def restore_plan(run_id, destination):
+    if not re.fullmatch(r"[1-9]\d*", run_id):
+        raise ValueError("resume_run_id must be a positive Actions run ID")
+    token = artifact_token()
+    run = api(f"repos/{ORG}/.github/actions/runs/{run_id}", token=token)
+    if (run.get("event") != "workflow_dispatch" or run.get("head_branch") != "master"
+            or run.get("path") != ".github/workflows/release-train.yml"):
+        raise ValueError("resume source must be the release workflow dispatched from master")
+    artifacts = pages(f"repos/{ORG}/.github/actions/runs/{run_id}/artifacts", "artifacts", token=token)
+    matches = [a for a in artifacts if a.get("name") == ARTIFACT and not a.get("expired")]
+    if len(matches) != 1:
+        raise ValueError("original release plan is missing, expired or ambiguous; refusing new heads")
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, GH_TOKEN=token)
+        subprocess.run(["gh", "run", "download", run_id, "--repo", f"{ORG}/.github",
+                        "--name", ARTIFACT, "--dir", tmp], env=env, check=True, timeout=60,
+                       stdout=subprocess.DEVNULL)
+        source = Path(tmp) / "release-train-plan.json"
+        plan = load_plan(source)
+        if str(plan["run_id"]) != run_id:
+            raise ValueError("release plan does not belong to the requested run")
+        destination.write_bytes(source.read_bytes())
+    return plan, str(matches[0]["id"])
+
+
+def release_for(repo, tag):
+    result = api(f"repos/{ORG}/{repo}/releases/tags/{quote(tag, safe='')}", missing=True)
+    if result is not None and (not isinstance(result, dict) or not isinstance(result.get("id"), int)
+                               or result.get("tag_name") != tag):
+        raise APIError(f"{repo}/{tag}: invalid release response")
+    return result
+
+
+def preflight(plan):
+    results = {}
+    for repo, sha in plan["heads"].items():
+        existing = tag_commit(repo, plan["tag"])
+        if existing is not None and existing != sha:
+            raise APIError(f"{repo}/{plan['tag']}: existing tag points at {existing}, expected {sha}")
         ok, detail = gate(repo, sha)
-        results[repo] = (sha, ok, detail)
+        results[repo] = detail
         if not ok:
-            blocked.append((repo, detail))
+            raise APIError(f"{repo}@{sha}: {detail}")
+        release_for(repo, plan["tag"])
+    return results
 
-    pins = wire_pins()
-    spread = []
-    keys = [k for k, v in pins.items() if v[0]]
-    for i, a in enumerate(keys):
-        for b in keys[i + 1:]:
-            if pins[a][0] != pins[b][0]:
-                n = distance(pins[a][0], pins[b][0])
-                if n:
-                    spread.append((a, b, n))
-    if len(set(v[0] for v in pins.values() if v[0])) <= 1:
-        wire_note = f"All members that use `{WIRE_CRATE}` build against the same revision."
-    else:
-        if spread:
-            apart = f"up to **{max(n for _, _, n in spread)} commits** apart. "
+
+def reports(plan, gaps):
+    heads = plan["heads"]
+    wire = "Shared wire-crate revisions could not be measured."
+    try:
+        pins = wire_pins(heads)
+        if any(not value[0] for value in pins.values()):
+            raise APIError("one shared-crate pin could not be resolved")
+        revisions = {p[0] for p in pins.values()}
+        if len(revisions) <= 1:
+            wire = "All measured shared wire-crate pins agree: " + str(next(iter(revisions), "none"))
         else:
-            # distance() returned None for every differing pair, so the compare call
-            # failed; "0 commits apart" would read as agreement.
-            apart = "how far apart could not be measured (the compare call failed). "
-            gaps.append(f"could not measure how far apart the `{WIRE_CRATE}` revisions are")
-        wire_note = (f"**`{WIRE_CRATE}` is not the same revision across this train** — "
-                     + apart
-                     + "; ".join(f"`{r}` at `{str(v[0])[:8]}` ({v[1]})" for r, v in sorted(pins.items()))
-                     + f". Nothing tests that the encodings agree — `{WIRE_CRATE}#209`.")
-
-    stale, snap, code = snapshot_state()
-    if stale is None:
-        snap_note = "Could not compare the dashboard's openapi snapshot against the API code."
-        gaps.append("could not read one of the two commit dates for the openapi snapshot")
-    elif stale:
-        snap_note = (f"**The dashboard's `openapi.json` snapshot is older than the API code** — "
-                     f"snapshot {snap[:10]}, API {code[:10]}. `infrastructure#82`.")
-    else:
-        snap_note = f"The dashboard's `openapi.json` snapshot is current (snapshot {snap[:10]}, API {code[:10]})."
-
-    prev = previous_train(tag)
-
-    actions = {}
-    if not blocked and not DRY_RUN:
-        for repo in MEMBERS:
-            others = {r: s for r, s in heads.items() if r != repo}
-            actions[repo] = cut(repo, tag, heads[repo], others, wire_note, snap_note,
-                                rollback_note(repo, tag, prev), gaps)
+            distances = [distance(a, b) for i, a in enumerate(sorted(revisions))
+                         for b in sorted(revisions)[i+1:]]
+            wire = "**Shared wire-crate pins differ**: " + "; ".join(
+                f"`{repo}` at `{pin[0]}` ({pin[1]})" for repo, pin in sorted(pins.items()))
+            wire += f". Maximum measured distance: {max(distances)} commits. No cross-version wire compatibility test is implied."
+    except (APIError, ValueError, TypeError, subprocess.TimeoutExpired) as exc:
+        gaps.append(f"shared wire-crate report: {exc}")
+    snapshot = "OpenAPI snapshot comparison could not be measured."
+    notice = None
+    try:
+        stale, snap, code = snapshot_state(heads)
+        if stale is None:
+            raise APIError("one OpenAPI source commit date is missing")
+        snapshot = f"Dashboard OpenAPI snapshot: {snap}; API source: {code}. " + (
+            "**Snapshot is older by commit date; review it.**" if stale else "Snapshot is not older by commit date.")
         if stale:
-            actions["_snapshot"] = notify_stale_snapshot(snap, code, tag, gaps)
-        missing = builds_started(tag, gaps)
-        actions["_builds"] = ("every image builder started a run"
-                              if not missing
-                              else "NO BUILD STARTED in: " + ", ".join(missing))
-    elif not blocked and stale:
-        actions["_snapshot"] = notify_stale_snapshot(snap, code, tag, gaps)
+            issues = pages(f"repos/{ORG}/{SNAPSHOT_REPO}/issues?state=open")
+            existing = next((i for i in issues if "pull_request" not in i
+                             and f"<!-- {MARKER} -->" in (i.get("body") or "")), None)
+            notice = (snap, code, existing)
+    except (APIError, subprocess.TimeoutExpired) as exc:
+        gaps.append(f"OpenAPI report: {exc}")
+    rollback = {}
+    for repo, sha in heads.items():
+        try:
+            rollback[repo] = rollback_note(repo, sha, plan["previous_tag"])
+        except (APIError, subprocess.TimeoutExpired) as exc:
+            rollback[repo] = f"**Rollback: not measured.** {exc}"
+            gaps.append(f"{repo} rollback: {exc}")
+    return wire, snapshot, rollback, notice
 
-    with open(SUMMARY, "a") as f:
-        w = f.write
-        w(f"## Release train `{tag}`\n\n")
-        if blocked:
-            w("### Refused\n\nA train is all five or none, so nothing was tagged.\n\n")
-            for repo, why in blocked:
-                w(f"- **`{repo}`** — {why}\n")
-            w("\n")
-        elif DRY_RUN:
-            w("**Dry run — nothing was tagged, released or opened.**\n\n")
-        w("| member | commit | gate | |\n|---|---|---|---|\n")
-        for repo in MEMBERS:
-            sha, ok, detail = results.get(repo, ("—", False, "not reached"))
-            w(f"| `{repo}` | `{str(sha)[:8]}` | {'pass' if ok else '**blocked**'} | "
-              f"{detail} | \n")
-        w(f"\n{wire_note}\n\n{snap_note}\n")
-        w(f"\nPrevious train: {('`' + prev + '`') if prev else 'none — this is the first'}\n")
-        if actions:
-            w("\n### What was done\n\n")
-            for k, v in actions.items():
-                w(f"- `{k}`: {v}\n")
-        if gaps:
-            w("\n### Not measured, or refused\n\n")
-            for g in sorted(set(gaps)):
-                w(f"- {g}\n")
-    return 1 if (blocked or gaps) else 0
+
+def cut(repo, plan, wire, snapshot, rollback):
+    tag, sha = plan["tag"], plan["heads"][repo]
+    existing = tag_commit(repo, tag)
+    if existing is not None and existing != sha:
+        raise APIError(f"{repo}/{tag}: tag conflict")
+    if existing is None:
+        try:
+            obj = api(f"repos/{ORG}/{repo}/git/tags", "POST", {
+                "tag": tag, "message": f"Release {tag}", "object": sha, "type": "commit",
+                "tagger": plan["tagger"]})
+            if not isinstance(obj, dict) or not SHA.fullmatch(str(obj.get("sha", ""))):
+                raise APIError(f"{repo}: invalid tag-object response")
+            api(f"repos/{ORG}/{repo}/git/refs", "POST", {"ref": f"refs/tags/{tag}", "sha": obj["sha"]})
+        except (APIError, subprocess.TimeoutExpired):
+            # A lost response is not proof that the write failed. Never blindly retry.
+            if tag_commit(repo, tag) != sha:
+                raise
+    if tag_commit(repo, tag) != sha:
+        raise APIError(f"{repo}/{tag}: tag readback does not match the candidate")
+    if release_for(repo, tag) is None:
+        body = (f"Release train **`{tag}`**, initiated by @{plan['tagger']['name']}.\n\n"
+                f"Candidate: https://github.com/{ORG}/.github/actions/runs/{plan['run_id']}\n\n"
+                "| member | commit |\n|---|---|\n"
+                + "".join(f"| `{r}` | [{s}](https://github.com/{ORG}/{r}/commit/{s}) |\n"
+                          for r, s in plan["heads"].items())
+                + f"\n{wire}\n\n{snapshot}\n\n{rollback}\n")
+        try:
+            release = api(f"repos/{ORG}/{repo}/releases", "POST", {
+                "tag_name": tag, "name": tag, "body": body, "generate_release_notes": True})
+            if not isinstance(release, dict) or not isinstance(release.get("id"), int):
+                raise APIError(f"{repo}: invalid release creation response")
+        except (APIError, subprocess.TimeoutExpired):
+            if release_for(repo, tag) is None:
+                raise
+    release = release_for(repo, tag)
+    if release is None:
+        raise APIError(f"{repo}/{tag}: release absent after creation")
+    return f"tag verified at {sha}; release id {release['id']}"
+
+
+def output(name, value):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a") as stream:
+            stream.write(f"{name}={value}\n")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--prepare", type=Path)
+    mode.add_argument("--apply", type=Path)
+    args = parser.parse_args(argv)
+    plan, checks, actions, gaps = None, {}, {}, []
+    wire = snapshot = ""
+    failed = False
+    try:
+        if args.prepare:
+            resume = os.environ.get("RESUME_RUN_ID", "").strip()
+            if not resume and int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")) > 1:
+                resume = os.environ.get("GITHUB_RUN_ID", "")
+            if resume:
+                plan, artifact_id = restore_plan(resume, args.prepare)
+                output("artifact_id", artifact_id)
+                output("new_plan", "false")
+            else:
+                when = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+                product = PRODUCT.removeprefix("v")
+                tag = f"v{product}-{when.date().isoformat()}"
+                validate_tag(tag)
+                plan = validate_plan({
+                    "schema_version": 1, "repository": f"{ORG}/.github",
+                    "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                    "tag": tag, "heads": {repo: head_of(repo) for repo in MEMBERS},
+                    "previous_tag": previous_train(tag),
+                    "tagger": {"name": ACTOR,
+                               "email": f"{os.environ.get('GITHUB_ACTOR_ID', '0')}+{ACTOR}@users.noreply.github.com",
+                               "date": when.isoformat().replace("+00:00", "Z")}})
+                # A new dispatch must never silently adopt somebody else's dated cut.
+                for repo in MEMBERS:
+                    if tag_commit(repo, tag) is not None:
+                        raise APIError(f"{repo}/{tag}: tag already exists; resume the original run or choose a new product suffix")
+                checks = preflight(plan)
+                args.prepare.write_text(json.dumps(plan, indent=2) + "\n")
+                output("new_plan", "true")
+            checks = preflight(plan) if not checks else checks
+            wire, snapshot, _, _ = reports(plan, gaps)
+        else:
+            plan = load_plan(args.apply)
+            artifact_id = os.environ.get("PLAN_ARTIFACT_ID", "")
+            if not re.fullmatch(r"[1-9]\d*", artifact_id):
+                raise ValueError("a successfully stored candidate artifact is required before any write")
+            artifact = api(f"repos/{ORG}/.github/actions/artifacts/{artifact_id}", token=artifact_token())
+            if (artifact.get("expired") or artifact.get("name") != ARTIFACT
+                    or str(artifact.get("workflow_run", {}).get("id")) != str(plan["run_id"])):
+                raise ValueError("candidate artifact does not match the original run")
+            with tempfile.TemporaryDirectory() as tmp:
+                canonical, stored_id = restore_plan(str(plan["run_id"]), Path(tmp) / "release-train-plan.json")
+            if canonical != plan or stored_id != artifact_id:
+                raise ValueError("local candidate differs from its immutable original artifact")
+            checks = preflight(plan)
+            wire, snapshot, rollback, notice = reports(plan, gaps)
+            if not DRY_RUN:
+                for repo in MEMBERS:
+                    try:
+                        actions[repo] = cut(repo, plan, wire, snapshot, rollback[repo])
+                    except (APIError, subprocess.TimeoutExpired) as exc:
+                        actions[repo] = f"STOPPED: {exc}"
+                        raise
+                if notice:
+                    try:
+                        actions["OpenAPI"] = notify_stale_snapshot(notice[0], notice[1], plan["tag"], notice[2])
+                    except (APIError, subprocess.TimeoutExpired) as exc:
+                        gaps.append(f"snapshot notification: {exc}")
+                actions["Image builds"] = ", ".join(builds_started(plan, gaps))
+    except (APIError, ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        gaps.append(str(exc))
+        failed = True
+    finally:
+        with open(SUMMARY, "a") as stream:
+            stream.write(f"## Release train {plan['tag'] if plan else 'preparation'}\n\n")
+            stream.write("Checks exclude Dependabot by name. A started build is not a successful deployment.\n\n")
+            if args.prepare or DRY_RUN:
+                stream.write("**Preview: no tags, releases or issues were written.**\n\n")
+            if plan:
+                stream.write(f"Original candidate run: {plan['run_id']}; previous train: {plan['previous_tag'] or 'none'}.\n\n")
+                for repo, sha in plan["heads"].items():
+                    stream.write(f"- `{repo}` at `{sha}`: {checks.get(repo, 'not verified on this attempt')}\n")
+            stream.write(f"\n{wire}\n\n{snapshot}\n")
+            for name, action in actions.items():
+                stream.write(f"- {name}: {action}\n")
+            if gaps:
+                stream.write("\n### Not measured or stopped\n\n")
+                for gap in sorted(set(gaps)):
+                    stream.write(f"- {gap}\n")
+    # Diagnostic gaps are visible but do not add wire/OpenAPI admission gates.
+    return 1 if failed or (args.apply and gaps) else 0
 
 
 if __name__ == "__main__":
