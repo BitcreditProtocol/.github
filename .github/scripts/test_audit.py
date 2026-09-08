@@ -20,7 +20,7 @@ meta = dict(name='demo', archived=False, default_branch='master', fork=False,
             description='Fixture', visibility='private', has_issues=True,
             has_wiki=False, allow_merge_commit=True, allow_squash_merge=True,
             allow_rebase_merge=True, delete_branch_on_merge=True)
-raw = '/contents/.github/workflows/' in route
+raw = any('application/vnd.github.raw' in arg for arg in args)
 status = 200
 if route in faults:
     status, data = faults[route]
@@ -89,22 +89,25 @@ else:
 
 
 class AuditTests(unittest.TestCase):
-    def run_audit(self, faults=None, disable_corpus_guards=False):
+    def run_audit(self, faults=None, disable_corpus_guards=False, files=None):
+        responses = {}
+        if files is not None:
+            responses['repos/Fixture/demo/git/trees/master'] = [200, {
+                'truncated': False, 'tree': [dict(type='blob', path=path, sha='a'*40) for path in files]}]
+            responses.update({'repos/Fixture/demo/contents/'+path: [200, body] for path, body in files.items()})
+        responses.update(faults or {})
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             gh = root / 'gh'
             gh.write_text(FAKE_GH)
             gh.chmod(0o755)
-            yq = root / 'yq'
-            yq.write_text('#!/bin/sh\nprintf \'%s\\n\' \'{"jobs":{}}\'\n')
-            yq.chmod(0o755)
             (root / 'license.json').write_text('{"holder":"Fixture"}')
             (root / 'assignees.json').write_text('{"assignees":{}}')
             env = dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'],
                        GH_TOKEN='offline-fixture', ORG='Fixture', DRY_RUN='true',
                        BASELINE_CONFIG='Bitcredit baseline', GITHUB_REPOSITORY='Fixture/.github',
                        LICENSE_JSON=str(root/'license.json'), ASSIGNEES_JSON=str(root/'assignees.json'),
-                       GITHUB_STEP_SUMMARY=str(root/'summary'), AUDIT_FAULTS=json.dumps(faults or {}))
+                       GITHUB_STEP_SUMMARY=str(root/'summary'), AUDIT_FAULTS=json.dumps(responses))
             script = Path(__file__).with_name('audit-repo-settings.sh')
             if disable_corpus_guards:
                 control = root/'audit-repo-settings.sh'
@@ -122,6 +125,101 @@ class AuditTests(unittest.TestCase):
         self.assertNotIn('has no GitHub release', summary)
         summary = self.run_audit({'repos/Fixture/demo/releases/tags/v1.2.3':[404,{}]})
         self.assertIn('highest-versioned tag `v1.2.3` has no GitHub release', summary)
+
+    def test_shell_only_workflows_do_not_require_dependabot(self):
+        workflow = '''name: Shell checks
+on: push
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: echo hello
+'''
+        summary = self.run_audit({'repos/Fixture/demo/contents/.github/workflows/one.yml': [200, workflow]})
+        self.assertNotIn('no .github/dependabot.yml', summary)
+        self.assertNotIn('Not measured on this run', summary)
+
+    def test_external_steps_and_reusable_workflows_require_dependabot(self):
+        jobs = [
+            {'runs-on': 'ubuntu-latest', 'steps': [{'uses': 'example/action@v2'}]},
+            {'runs-on': 'ubuntu-latest', 'steps': [{'uses': 'example/actions/setup@'+'a'*40}]},
+            {'uses': 'example/automation/.github/workflows/build.yml@v2'},
+            {'uses': 'example/automation/.github/workflows/build.yml@'+'b'*40},
+        ]
+        for job in jobs:
+            with self.subTest(job=job):
+                body = '# secrets.KEEP_ME\n' + json.dumps({'on': 'push', 'permissions': {}, 'jobs': {'check': job}})
+                summary = self.run_audit(files={'.github/workflows/check.yml': body})
+                self.assertIn('no .github/dependabot.yml, but has github-actions', summary)
+                self.assertNotIn('Not measured on this run', summary)
+
+    def test_local_refs_comments_run_strings_and_docker_are_not_external_actions(self):
+        body = '''# secrets.KEEP_ME
+# uses: example/comment-only@v1
+name: Local checks
+on: push
+permissions: {}
+jobs:
+  local_reusable:
+    uses: ./.github/workflows/local.yml
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/local
+      - uses: docker://alpine:3.22
+      - run: |
+          echo 'uses: example/string-only@v1'
+          uses: example/block-scalar@v1
+'''
+        files = {'.github/workflows/check.yml': body,
+                 '.github/workflows/local.yml': 'on: workflow_call\njobs: {}\n',
+                 '.github/actions/local/action.yml': 'runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo local\n'}
+        summary = self.run_audit(files=files)
+        self.assertNotIn('no .github/dependabot.yml', summary)
+        self.assertNotIn('Not measured on this run', summary)
+
+    def test_composite_action_yml_and_yaml_external_steps_require_dependabot(self):
+        cases = [('.github/actions/helper/'+filename, 'example/action/path@'+'c'*40)
+                 for filename in ('action.yml', 'action.yaml')]
+        cases += [('.github/actions/'+directory+'/action.yml', 'example/action@v2')
+                  for directory in ('helper', 'build')]
+        for path, reference in cases:
+            with self.subTest(path=path, reference=reference):
+                body = 'name: Composite\nruns:\n  using: composite\n  steps:\n    - uses: '+reference+'\n'
+                summary = self.run_audit(files={path: body})
+                self.assertIn('no .github/dependabot.yml, but has github-actions', summary)
+                self.assertNotIn('Not measured on this run', summary)
+
+    def test_malformed_action_dependency_yaml_is_unmeasured(self):
+        for path, body in (('.github/workflows/check.yml', 'jobs: [unterminated'),
+                           ('.github/actions/helper/action.yml', 'runs: [unterminated')):
+            with self.subTest(path=path):
+                summary = self.run_audit(files={path: body})
+                self.assertIn('Not measured on this run', summary)
+                self.assertIn(path, summary)
+                self.assertNotIn('no .github/dependabot.yml', summary)
+
+    def test_unreadable_action_sources_are_unmeasured(self):
+        for path in ('.github/workflows/check.yml', '.github/actions/helper/action.yaml'):
+            for code in (403, 404, 500):
+                with self.subTest(path=path, code=code):
+                    summary = self.run_audit(
+                        {'repos/Fixture/demo/contents/'+path: [code, {'message': 'unavailable'}]},
+                        files={path: 'name: Fixture\n'})
+                    self.assertIn('Not measured on this run', summary)
+                    self.assertIn(path, summary)
+                    self.assertNotIn('no .github/dependabot.yml', summary)
+
+    def test_incomplete_action_trees_are_unmeasured(self):
+        failures = [[200, {'truncated': True, 'tree': []}]] + [
+            [code, {'message': 'unavailable'}] for code in (403, 404, 503)]
+        for response in failures:
+            with self.subTest(response=response):
+                summary = self.run_audit({'repos/Fixture/demo/git/trees/master': response})
+                self.assertIn('Not measured on this run', summary)
+                self.assertNotIn('no .github/dependabot.yml', summary)
 
     def test_transport_failures_are_gaps_not_tag_names(self):
         for code in (403, 429, 500):

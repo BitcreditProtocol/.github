@@ -340,9 +340,45 @@ while IFS= read -r repo; do
   grep -qiE '(^|/)Dockerfile(\.[A-Za-z0-9_-]+)?$|(^|/)docker-compose.*\.ya?ml$' \
     "$WORK/tree" && eco="$eco docker"
   grep -qiE '\.tf$'                                  "$WORK/tree" && eco="$eco terraform"
-  # workflows need no manifest: the github-actions ecosystem updates the
-  # action versions pinned inside them
-  grep -qE '^\.github/workflows/.*\.ya?ml$'          "$WORK/tree" && eco="$eco github-actions"
+  # Dependabot updates external GitHub repository references, not shell-only
+  # workflows, local uses or docker:// images. Read each manifest once and reuse
+  # its body and parsed YAML in the workflow checks below.
+  # .github/actions/build is source, even though build/ and target/ remain
+  # excluded from general package discovery.
+  workflows_complete="$tree_complete"
+  action_dependencies=""
+  while IFS= read -r manifest; do
+    [ -n "$manifest" ] || continue
+    cached="$WORK/$(printf '%s/%s' "$repo" "$manifest" | git hash-object --stdin)"
+    if ! read_api "repos/$ORG/$repo/contents/$manifest?ref=$branch" "$cached" -H "Accept: application/vnd.github.raw"; then
+      # read_api already reports transport failures; a listed file's absence is
+      # also incomplete evidence, unlike an absent optional configuration.
+      [ -s "$WORK/read-error" ] && grep -q '(HTTP 404)' "$WORK/read-error" &&
+        gap "$repo action manifest $manifest — disappeared after the tree was read"
+      case "$manifest" in .github/workflows/*) workflows_complete="" ;; esac
+      continue
+    fi
+    if yq -o=json '.' "$cached" > "$WORK/manifest.json" 2>/dev/null &&
+       external=$(jq -sr '
+         if length != 1 then error("expected one YAML document") else .[0] end
+         | if type != "object" or ((.jobs // {}) | type != "object")
+              or ((.runs // {}) | type != "object") then error("invalid action manifest")
+           else [(.jobs // {} | .[] | .uses, (.steps // [] | .[] | .uses)),
+                 (.runs.steps // [] | .[] | .uses)] | map(select(. != null)) end
+         | if all(.[]; type == "string") then
+             any(.[]; test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+(/[^[:space:]@]+)*@[^[:space:]@]+$"))
+           else error("uses must be a string") end' "$WORK/manifest.json" 2>/dev/null); then
+      cp "$WORK/manifest.json" "$cached.json"
+      [ "$external" != true ] || action_dependencies=1
+    else
+      gap "$repo action manifest $manifest — invalid YAML or dependency structure"
+      case "$manifest" in .github/workflows/*) workflows_complete="" ;; esac
+    fi
+  done < <({
+    grep -E '^\.github/workflows/.*\.ya?ml$|(^|/)action\.ya?ml$' "$WORK/tree" || true
+    grep -E '^\.github/actions/(.*/)?action\.ya?ml$' "$WORK/tree.all" || true
+  } | sort -u)
+  [ -z "$action_dependencies" ] || eco="$eco github-actions"
 
   if ! gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" >/dev/null 2>&1; then
     if [ -n "$eco" ]; then
@@ -481,26 +517,14 @@ while IFS= read -r repo; do
   # attestations: write and produced no attestation, while ten container images
   # shipped with no provenance at all.
   : > "$WORK/wfbody"
-  workflows_complete="$tree_complete"
   : > "$WORK/prt"
   : > "$WORK/floating"
   : > "$WORK/idtoken"
   : > "$WORK/noperm"
   while IFS= read -r wf; do
     [ -z "$wf" ] && continue
-    # Guard on the exit status, not the text. This script runs under set -eu, so a
-    # failed assignment here ended the whole run: one workflow that 404s -- the
-    # tree is read once and these fetches follow minutes later, so a rename inside
-    # that window does it -- and the weekly audit died with no report. And gh
-    # writes its error body to stdout, so [ -z ] could never have been the guard.
-    # [ -z ] stays for what it does cover: an empty file, empty with status 0.
-    if read_api "repos/$ORG/$repo/contents/$wf?ref=$branch" "$WORK/workflow.raw" -H "Accept: application/vnd.github.raw"; then
-      body=$(cat "$WORK/workflow.raw")
-    else
-      [ "$?" != 44 ] || gap "$repo workflow $wf — disappeared after the tree was read"
-      workflows_complete=""
-      continue
-    fi
+    cached="$WORK/$(printf '%s/%s' "$repo" "$wf" | git hash-object --stdin)"
+    body=$(cat "$cached")
     [ -z "$body" ] && continue
     # kept for the credential check below: these bodies are already paid for here
     printf '%s\n' "$body" >> "$WORK/wfbody"
@@ -567,11 +591,10 @@ while IFS= read -r repo; do
     # requests fix most of it. A job that calls a reusable workflow cannot take
     # timeout-minutes at all, so those are excluded -- the timeout for that work
     # belongs inside the called workflow.
-    printf '%s\n' "$body" > "$WORK/wf1.yml"
-    if yq -o=json '.' "$WORK/wf1.yml" > "$WORK/wfjson" 2>/dev/null; then
+    if [ -s "$cached.json" ]; then
       c=$(jq '[.jobs // {} | to_entries[] | select((.value|type)=="object")
                | select((.value|has("uses")) == false)
-               | select((.value|has("timeout-minutes")) == false)] | length' "$WORK/wfjson" 2>/dev/null || echo 0)
+               | select((.value|has("timeout-minutes")) == false)] | length' "$cached.json" 2>/dev/null || echo 0)
       n_untimed=$((n_untimed + c))
       [ "$c" -gt 0 ] && printf '%s\n' "$repo" >> "$WORK/untimedrepos"
     fi
