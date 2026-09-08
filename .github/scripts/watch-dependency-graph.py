@@ -1,200 +1,275 @@
 #!/usr/bin/env python3
-"""Watch the intra-organisation dependency graph and tell a consumer when its pin
-is behind the producer's newest release.
+"""Read the dependency graph before acting; notify once per dependency/version.
 
-The graph is DERIVED from manifests on every run, never listed here, so a new
-consumer or a new dependency is covered without touching this file.
-
-Three kinds of pin, deliberately treated differently:
-
-  exact     `=0.5.15`, `tag = "v0.5.15"`, `ref: v0.9.12`
-            Behind means somebody has to act. This is the only kind that opens
-            an issue.
-  range     `^0.5`, `^0.1.14-bugfix`
-            Resolves on the next install, so nobody has to do anything.
-            Reported as a metric.
-  patched   declared with a tag, then overridden by a `[patch]` section
-            The declared version is dead text: cargo builds something else. Moving
-            the pin would change nothing, so saying "you are behind" would send
-            somebody to do useless work. Reported, with the warning that the
-            manifest is misleading. Wildcat/bcr-common is exactly this today.
-  revision  `rev = "e24040d"`, a submodule sha
-            Behind by a commit count, but the producer's tags may not describe
-            what consumers use at all -- which is the case for bcr-common today,
-            tracked in bcr-common#219. Reported as a metric, so this does not
-            open issues nothing can close.
-
-Unlike prune-package-versions, the SCHEDULE here does act: an issue is cheap and
-closeable, where a deleted package version cannot be undone. dry_run stays the
-default for a manual run so a change can be inspected before it speaks.
-
-Idempotent: one issue per (consumer, dependency). The marker below is searched in
-the bodies of that repository's open issues, so a hundred runs produce one issue
-and the body is refreshed rather than duplicated.
+Only exact SemVer pins produce issues. Manual closure suppresses that target
+version; an automatically resolved issue may be reopened after a regression.
 """
-
+import base64
+from collections import defaultdict
+from dataclasses import dataclass
 import json
 import os
+from pathlib import PurePosixPath
 import re
 import subprocess
 import sys
+import tomllib
+from urllib.parse import quote
 
 ORG = os.environ.get("ORG", "BitcreditProtocol")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
-EVENT = os.environ.get("GITHUB_EVENT_NAME", "")
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
 MARKER = "bitcredit-dependency-watch"
+STATE = "bitcredit-dependency-watch-state"
+WATCHER_BOT = os.environ.get("WATCHER_BOT", "bitcredit-automation[bot]")
+MANIFESTS = {"Cargo.toml", "package.json", "pubspec.yaml"}
+EXCLUDED = {"node_modules", "vendor", "target", "build", ".dart_tool", "cargokit", "crowdin_sdk"}
+NPM_OWNER = {"@bitcredit/bcr-ebill-wasm": "Bitcredit-Core",
+             "@bitcredit/ui-library": "ui", "@bitcreditprotocol/ui-library": "ui"}
+VERSION = re.compile(
+    r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
 
-MANIFESTS = ("package.json", "Cargo.toml", "pubspec.yaml")
+
+class APIError(RuntimeError):
+    pass
 
 
-def api(path, method="GET", body=None):
-    """Return parsed JSON, or None when the call fails. Never raises on a 404."""
-    cmd = ["gh", "api", "-X", method, path]
+@dataclass(frozen=True)
+class Edge:
+    consumer: str
+    branch: str
+    path: str
+    dependency: str
+    producer: str
+    pin: str
+    kind: str
+
+
+def api(path, method="GET", body=None, *, missing=False):
+    if method != "GET" and DRY_RUN:
+        raise APIError("dry-run refused a write")
+    command = ["gh", "api", "-X", method, path]
     if body is not None:
-        cmd += ["--input", "-"]
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       input=json.dumps(body) if body is not None else None)
-    if r.returncode != 0:
-        return None
+        command += ["--input", "-"]
+    result = subprocess.run(command, input=json.dumps(body) if body is not None else None,
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        if missing and re.search(r"\(HTTP 404\)", result.stderr):
+            return None
+        raise APIError(f"{method} {path}: {result.stderr.strip()[:500] or 'request failed'}")
     try:
-        return json.loads(r.stdout)
+        return json.loads(result.stdout)
     except json.JSONDecodeError:
-        return None
+        raise APIError(f"{path}: invalid JSON response") from None
 
 
-def content(repo, path, ref):
-    d = api(f"repos/{ORG}/{repo}/contents/{path}?ref={ref}")
-    if not isinstance(d, dict) or "content" not in d:
-        return None
-    import base64
-    try:
-        return base64.b64decode(d["content"]).decode("utf-8", "replace")
-    except Exception:
-        return None
-
-
-def active_repos():
-    out, page = [], 1
+def pages(path):
+    result, page = [], 1
     while True:
-        d = api(f"orgs/{ORG}/repos?per_page=100&page={page}")
-        if d is None:
-            sys.exit(f"could not list repositories (page {page}); refusing to run on a partial graph")
-        if not d:
-            break
-        out += [(r["name"], r["default_branch"], r["fork"]) for r in d if not r["archived"]]
-        if len(d) < 100:
-            break
+        rows = api(f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")
+        if not isinstance(rows, list):
+            raise APIError(f"{path}: invalid listing")
+        result.extend(rows)
+        if len(rows) < 100:
+            return result
         page += 1
-    return sorted(out)
 
 
-# ---------------------------------------------------------------- graph
-
-def edges_from(repo, branch, kind, txt):
-    """Every dependency in `txt` that points at something this organisation owns."""
-    out = []
-    if kind == "package.json":
-        try:
-            d = json.loads(txt)
-        except Exception:
-            return out
-        for sect in ("dependencies", "devDependencies", "peerDependencies"):
-            for name, spec in (d.get(sect) or {}).items():
-                if not isinstance(spec, str):
-                    continue
-                if re.search(r"bitcredit", name, re.I) or ORG in spec:
-                    out.append((repo, branch, name, spec, npm_kind(spec)))
-    elif kind == "Cargo.toml":
-        patched = patched_names(txt)
-        for m in re.finditer(r"^\s*([A-Za-z0-9_-]+)\s*=\s*\{([^}]*%s[^}]*)\}" % ORG, txt, re.M):
-            name = m.group(1)
-            body = re.sub(r"\s+", " ", m.group(2)).strip()
-            k = "patched" if name in patched else cargo_kind(body)
-            out.append((repo, branch, name, body, k))
-    elif kind == "pubspec.yaml":
-        for m in re.finditer(r"^  ([A-Za-z0-9_]+):\s*\n\s+git:\s*\n((?:\s+\S+:.*\n)+)", txt, re.M):
-            if ORG not in m.group(2):
-                continue
-            body = re.sub(r"\s+", " ", m.group(2)).strip()
-            out.append((repo, branch, m.group(1), body, "exact" if "ref:" in body else "range"))
-    return out
-
-
-def npm_kind(spec):
-    return "exact" if re.match(r"^=?\d+\.\d+\.\d+", spec.strip()) and not spec.strip().startswith(("^", "~", ">", "<")) else "range"
-
-
-def patched_names(txt):
-    """Dependencies this manifest overrides with a [patch] section.
-
-    A declared tag under a [patch] override is not what cargo builds, so the
-    declared version says nothing about the code. Reporting it as behind would
-    send somebody to change a line that has no effect.
-    """
-    names = set()
-    for m in re.finditer(r"^\[patch\.[^\]]+\]\s*\n((?:(?!^\[).*\n)*)", txt, re.M):
-        for line in m.group(1).splitlines():
-            e = re.match(r"\s*([A-Za-z0-9_-]+)\s*=", line)
-            if e:
-                names.add(e.group(1))
-    return names
+def semver(value):
+    match = VERSION.fullmatch(value)
+    if not match:
+        return None
+    major, minor, patch, pre = match.groups()
+    identifiers = tuple((0, int(p)) if p.isdigit() else (1, p) for p in pre.split(".")) if pre else ()
+    return int(major), int(minor), int(patch), int(pre is None), identifiers
 
 
 def cargo_kind(body):
-    if "rev" in body:
+    if re.search(r"\brev\s*=", body):
         return "revision"
-    if "tag" in body:
-        return "exact"
-    return "range"
+    return "exact" if re.search(r"\btag\s*=", body) else "range"
 
 
-def pinned_version(spec, kind):
-    if kind != "exact":
-        return None
-    m = re.search(r'(?:tag|ref)\s*[:=]\s*"?v?([0-9][^"\s,}]*)', spec)
-    if m:
-        return m.group(1)
-    m = re.match(r"^=?v?([0-9][0-9A-Za-z.+-]*)$", spec.strip())
-    return m.group(1) if m else None
+def producer_of(spec):
+    match = re.search(r"(?:github\.com[:/]|github:)" + re.escape(ORG) + r"/([A-Za-z0-9_.-]+)", spec, re.I)
+    return match[1].removesuffix(".git") if match else None
 
 
-def producer_of(dep_name, spec):
-    """Which repository publishes this dependency."""
-    m = re.search(r"%s/([A-Za-z0-9._-]+?)(?:\.git)?[\"/ ,]" % ORG, spec + " ")
-    if m:
-        return m.group(1)
-    return NPM_OWNER.get(dep_name)
+def owner_of(dep, spec, owners):
+    producer = producer_of(spec)
+    if producer:
+        return producer
+    if dep in owners and owners[dep] is None:
+        raise ValueError(f"ambiguous producer for {dep}")
+    return owners.get(dep)
 
 
-NPM_OWNER = {
-    "@bitcredit/bcr-ebill-wasm": "Bitcredit-Core",
-    "@bitcredit/ui-library": "ui",
-    "@bitcreditprotocol/ui-library": "ui",
-}
+def content(repo, path, sha):
+    data = api(f"repos/{ORG}/{repo}/contents/{quote(path, safe='/')}?ref={sha}")
+    if not isinstance(data, dict) or data.get("encoding") != "base64":
+        raise APIError(f"{repo}/{path}: contents unavailable")
+    try:
+        return base64.b64decode("".join(data["content"].split()), validate=True).decode("utf-8")
+    except (KeyError, ValueError, UnicodeError):
+        raise APIError(f"{repo}/{path}: invalid content encoding") from None
 
 
-# ---------------------------------------------------------------- issues
+def parse_manifest(path, text):
+    name = PurePosixPath(path).name
+    if name == "Cargo.toml":
+        return tomllib.loads(text)
+    if name == "package.json":
+        return json.loads(text)
+    result = subprocess.run(["yq", "-o=json", ".", "-"], input=text,
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError(f"{path}: invalid YAML")
+    data = json.loads(result.stdout)
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: manifest must be a mapping")
+    return data
 
-def latest_release(repo, cache={}):
-    if repo not in cache:
-        d = api(f"repos/{ORG}/{repo}/releases?per_page=1")
-        cache[repo] = d[0]["tag_name"] if d else None
-    return cache[repo]
+
+def declarations(doc):
+    for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+        yield from (doc.get(section) or {}).items()
+    yield from (doc.get("workspace", {}).get("dependencies") or {}).items()
+    for target in (doc.get("target") or {}).values():
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            yield from (target.get(section) or {}).items()
 
 
-def open_issues(repo, cache={}):
-    if repo not in cache:
-        out, page = [], 1
-        while True:
-            d = api(f"repos/{ORG}/{repo}/issues?state=open&per_page=100&page={page}")
-            if d is None:
-                sys.exit(f"could not list open issues in {repo}; a partial list would open duplicates")
-            out += [i for i in d if "pull_request" not in i]
-            if len(d) < 100:
+def cargo_patches(path, manifests):
+    doc = manifests[path]
+    if "workspace" not in doc:
+        for parent in PurePosixPath(path).parents:
+            candidate = str(parent / "Cargo.toml")
+            if candidate in manifests and "workspace" in manifests[candidate]:
+                doc = manifests[candidate]
                 break
-            page += 1
-        cache[repo] = out
+    return {name for source in (doc.get("patch") or {}).values() for name in source}
+
+
+def edges_from(repo, branch, path, manifests, owners):
+    doc = manifests[path]
+    edges = []
+    name = PurePosixPath(path).name
+
+    def add(dep, producer, pin, kind):
+        if producer and producer != repo:
+            edges.append(Edge(repo, branch, path, dep, producer, str(pin), kind))
+
+    if name == "Cargo.toml":
+        patched = cargo_patches(path, manifests)
+        for dep, value in declarations(doc):
+            attrs = value if isinstance(value, dict) else {"version": value}
+            if attrs.get("workspace") or "path" in attrs:
+                continue  # Workspace declarations are read separately; path sources are local.
+            producer = owner_of(attrs.get("package", dep), attrs.get("git", ""), owners)
+            if "rev" in attrs:
+                pin, kind = attrs["rev"], "revision"
+            elif "tag" in attrs:
+                pin, kind = attrs["tag"], "exact"
+            else:
+                pin = attrs.get("version", attrs.get("branch", "default branch"))
+                kind = "exact" if str(pin).startswith("=") else "range"
+                if kind == "exact":
+                    pin = str(pin)[1:]
+            add(dep, producer, pin, "patched" if attrs.get("package", dep) in patched else kind)
+    elif name == "package.json":
+        for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+            for dep, value in (doc.get(section) or {}).items():
+                if not isinstance(value, str):
+                    continue
+                producer = owner_of(dep, value, owners)
+                pin = value.removeprefix("=")
+                kind = "exact" if semver(pin) is not None else "range"
+                if "#" in value and producer_of(value):
+                    pin = value.rsplit("#", 1)[1]
+                    kind = "exact" if semver(pin) is not None else (
+                        "revision" if re.fullmatch(r"[0-9a-f]{7,40}", pin) else "range")
+                add(dep, producer, pin, kind)
+    else:
+        for section in ("dependencies", "dev_dependencies"):
+            for dep, attrs in (doc.get(section) or {}).items():
+                if not isinstance(attrs, dict) or "git" not in attrs:
+                    continue
+                git = attrs["git"]
+                git = {"url": git} if isinstance(git, str) else git
+                if not isinstance(git, dict):
+                    raise ValueError(f"{path}: invalid git dependency {dep}")
+                pin = git.get("ref", "default branch")
+                kind = "exact" if semver(pin) is not None else (
+                    "revision" if re.fullmatch(r"[0-9a-f]{7,40}", pin) else "range")
+                add(dep, producer_of(git.get("url", "")), pin, kind)
+    return edges
+
+
+def collect_graph(gaps, incomplete):
+    repos = [r for r in pages(f"orgs/{ORG}/repos")
+             if not r["archived"] and not r["fork"]]
+    graphs, package_owners = {}, defaultdict(set)
+    for repo in repos:
+        name, default = repo["name"], repo["default_branch"]
+        for branch in dict.fromkeys((default, "dev")):
+            try:
+                data = api(f"repos/{ORG}/{name}/branches/{quote(branch, safe='')}",
+                           missing=branch != default)
+                if data is None:
+                    continue
+                sha = data.get("commit", {}).get("sha")
+                if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                    raise APIError(f"{name}/{branch}: invalid branch SHA")
+                tree = api(f"repos/{ORG}/{name}/git/trees/{sha}?recursive=1")
+                if not isinstance(tree.get("tree"), list) or tree.get("truncated") is not False:
+                    raise APIError(f"{name}/{branch}: incomplete tree")
+                manifests = {}
+                for entry in tree["tree"]:
+                    path = PurePosixPath(entry["path"])
+                    if entry.get("type") != "blob" or path.name not in MANIFESTS or EXCLUDED.intersection(path.parts):
+                        continue
+                    try:
+                        doc = parse_manifest(str(path), content(name, str(path), sha))
+                        if not isinstance(doc, dict):
+                            raise ValueError("manifest must be a mapping")
+                        manifests[str(path)] = doc
+                        package_name = doc.get("package", {}).get("name") if path.name == "Cargo.toml" else doc.get("name")
+                        if isinstance(package_name, str):
+                            package_owners[package_name].add(name)
+                    except (APIError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                        gaps.append(f"{name}/{branch}/{path}: {exc}")
+                        incomplete.add(name)
+                graphs[name, branch] = manifests
+            except (APIError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+                gaps.append(f"{name}/{branch}: {exc}")
+                incomplete.add(name)
+    owners = {name: next(iter(values)) if len(values) == 1 else None
+              for name, values in package_owners.items()}
+    owners.update(NPM_OWNER)
+    edges = []
+    for (repo, branch), manifests in graphs.items():
+        for path in manifests:
+            try:
+                edges.extend(edges_from(repo, branch, path, manifests, owners))
+            except (ValueError, TypeError, AttributeError) as exc:
+                gaps.append(f"{repo}/{branch}/{path}: {exc}")
+                incomplete.add(repo)
+    return repos, sorted(set(edges), key=lambda e: (e.consumer, e.dependency, e.branch, e.path))
+
+
+def latest_release(repo, cache):
+    if repo not in cache:
+        release = api(f"repos/{ORG}/{repo}/releases/latest", missing=True)
+        if release is not None:
+            if (not isinstance(release, dict) or release.get("draft") is not False
+                    or release.get("prerelease") is not False or not isinstance(release.get("tag_name"), str)
+                    or semver(release["tag_name"]) is None):
+                raise APIError(f"{repo}: latest full release has no valid SemVer tag")
+            release = release["tag_name"]
+        cache[repo] = release
     return cache[repo]
 
 
@@ -202,131 +277,218 @@ def marker_for(dep):
     return f"<!-- {MARKER}:{dep} -->"
 
 
-def notify(consumer, dep, pin, producer, newest, gaps):
-    mark = marker_for(dep)
-    existing = next((i for i in open_issues(consumer)
-                     if mark in (i.get("body") or "")), None)
-    title = f"{dep} is pinned to {pin}, and {producer} has released {newest}"
-    body = (
-        f"{mark}\n"
-        f"`{consumer}` pins **`{dep}`** at **`{pin}`**, and "
-        f"[`{producer}`](https://github.com/{ORG}/{producer}/releases/tag/{newest}) "
-        f"has released **`{newest}`**.\n\n"
-        f"The pin is exact, so nothing moves it on its own — this needs a deliberate "
-        f"change, and often a code change beside it, which is why this is an issue "
-        f"rather than a pull request.\n\n"
-        f"Opened by `watch-dependency-graph` in `{ORG}/.github`. The graph is read "
-        f"from manifests on every run, so this issue appears once per pin and its "
-        f"body is refreshed rather than duplicated. Close it when the pin moves.\n"
-    )
-    if DRY_RUN:
-        return "would " + ("update" if existing else "open")
+def own_issue(issue):
+    return ("pull_request" not in issue and issue.get("user", {}).get("type") == "Bot"
+            and issue.get("user", {}).get("login") == WATCHER_BOT
+            and f"<!-- {MARKER}:" in (issue.get("body") or ""))
+
+
+def issue_state(issue):
+    match = re.search(r"<!-- " + STATE + r" (.*?) -->", issue.get("body") or "")
+    if not match:
+        return None
+    data = json.loads(match[1])
+    if (not isinstance(data, dict) or not isinstance(data.get("producer"), str)
+            or not isinstance(data.get("target"), str) or semver(data["target"]) is None
+            or type(data.get("resolved")) is not bool):
+        raise ValueError(f"issue #{issue['number']}: invalid watcher state")
+    if issue.get("state") == "closed" and data["resolved"]:
+        if issue.get("state_reason") == "not_planned":
+            data["resolved"] = False
+        else:
+            closer, author = issue.get("closed_by"), issue.get("user")
+            if not isinstance(closer, dict) or not isinstance(author, dict):
+                raise ValueError(f"issue #{issue['number']}: last closure could not be attributed")
+            data["resolved"] = (closer.get("type") == "Bot" and author.get("type") == "Bot"
+                                and closer.get("login") == author.get("login")
+                                and issue.get("state_reason") == "completed")
+    return data
+
+
+def issue_payload(dep, producer, target, edges, *, resolved=False):
+    state = dict(producer=producer, target=target, resolved=resolved)
+    body = marker_for(dep) + f"\n<!-- {STATE} {json.dumps(state, sort_keys=True)} -->\n"
+    if resolved:
+        body += f"All observed exact pins for **{dep}** have caught up, or no longer require an exact version.\n"
+    else:
+        body += f"**{producer}** has released **{target}**. These exact pins are behind:\n\n"
+    body += "| branch | manifest | pinned |\n|---|---|---|\n"
+    for edge in edges:
+        url = f"https://github.com/{ORG}/{edge.consumer}/blob/{quote(edge.branch, safe='')}/{quote(edge.path, safe='/')}"
+        body += f"| {edge.branch} | [{edge.path}]({url}) | {edge.pin} |\n"
+    body += ("\nOpened by watch-dependency-graph. Update the pin and any required product code deliberately. "
+             "Closing without an update skips this target version only; a newer release may notify again.\n")
+    return {"title": f"{dep}: update exact pins for {producer} {target}", "body": body}
+
+
+def plan_actions(edges, issues_by_repo, gaps, incomplete):
+    source_incomplete = frozenset(incomplete)
+    groups = defaultdict(list)
+    for edge in edges:
+        groups[edge.consumer, edge.dependency].append(edge)
+    for repo, issues in issues_by_repo.items():
+        for issue in issues:
+            mark = re.search(r"<!-- " + MARKER + r":([^\s<>]+) -->", issue.get("body") or "")
+            if mark and issue["state"] == "open":
+                groups.setdefault((repo, mark[1]), [])
+    actions, latest = [], {}
+    for (repo, dep), locations in sorted(groups.items()):
+        if repo in incomplete:
+            continue
+        if repo not in issues_by_repo:
+            if any(e.kind == "exact" for e in locations):
+                gaps.append(f"{repo}/{dep}: issues are disabled; notification not evaluated")
+            continue
+        try:
+            matching = [i for i in issues_by_repo.get(repo, [])
+                        if marker_for(dep) in (i.get("body") or "")]
+            opened = [i for i in matching if i["state"] == "open"]
+            if len(opened) > 1:
+                raise ValueError(f"{repo}/{dep}: multiple open watcher issues; reconcile them first")
+            existing = opened[0] if opened else None
+            if existing:
+                recorded = issue_state(existing)
+                if recorded and recorded["producer"] in source_incomplete:
+                    gaps.append(f"{repo}/{dep}: producer {recorded['producer']} was not fully read; issue unchanged")
+                    incomplete.add(repo)
+                    continue
+            producers = {e.producer for e in locations}
+            if len(producers) > 1:
+                raise ValueError(f"{repo}/{dep}: manifests refer to different producers")
+            producer = next(iter(producers), None)
+            exact = [e for e in locations if e.kind == "exact"]
+            behind, target = [], None
+            if exact:
+                target = latest_release(producer, latest)
+                if target is None:
+                    raise ValueError(f"{producer}: no published full release; exact pins not compared")
+                for edge in exact:
+                    pin = semver(edge.pin)
+                    if pin is None:
+                        raise ValueError(f"{repo}/{edge.path}: {dep} has an invalid exact SemVer pin")
+                    if pin < semver(target):
+                        behind.append(edge)
+            if behind:
+                states = [(i, issue_state(i)) for i in matching if i["state"] == "closed"]
+                if any(state is None for _, state in states):
+                    raise ValueError(f"{repo}/{dep}: closed watcher issue has no version state")
+                manual_skip = any(not state["resolved"] and state["producer"] == producer
+                                  and semver(state["target"]) == semver(target) for _, state in states)
+                if manual_skip:
+                    continue
+                if not existing:
+                    resolved = [i for i, state in states if state["resolved"] and state["producer"] == producer]
+                    existing = max(resolved, key=lambda i: i["number"], default=None)
+                payload = issue_payload(dep, producer, target, behind)
+                if existing:
+                    payload["state"] = "open"
+                    if all(existing.get(key) == value for key, value in payload.items()):
+                        continue
+                actions.append(dict(repo=repo, dep=dep, kind="update" if existing else "open",
+                                    existing=existing, payload=payload))
+            elif existing:
+                if not locations:
+                    # Missing ownership evidence is not proof the pin was removed.
+                    # Keep the issue for manual review instead of silently closing it.
+                    raise ValueError(f"{repo}/{dep}: previous dependency is no longer mapped; issue unchanged")
+                state = issue_state(existing)
+                if state is None:
+                    raise ValueError(f"{repo}/{dep}: open watcher issue has no version state")
+                payload = issue_payload(dep, state["producer"], state["target"], exact, resolved=True)
+                payload.update(state="closed", state_reason="completed")
+                actions.append(dict(repo=repo, dep=dep, kind="close", existing=existing, payload=payload))
+        except (APIError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
+            gaps.append(str(exc))
+            incomplete.add(repo)
+    # An error found later in this pass must also suppress earlier planned actions
+    # for that consumer. No writes happen until the whole pass has finished.
+    return [a for a in actions if a["repo"] not in incomplete]
+
+
+def apply_action(action):
+    repo, existing, payload = action["repo"], action["existing"], action["payload"]
+    path = f"repos/{ORG}/{repo}/issues"
     if existing:
-        r = api(f"repos/{ORG}/{consumer}/issues/{existing['number']}",
-                "PATCH", {"title": title, "body": body})
-        if not r or "number" not in r:
-            gaps.append(f"could not update #{existing['number']} in `{consumer}`")
-            return "FAILED"
-        return f"updated #{existing['number']}"
-    created = api(f"repos/{ORG}/{consumer}/issues", "POST",
-                  {"title": title, "body": body})
-    if not created or "number" not in created:
-        gaps.append(f"could not open an issue in `{consumer}` — the App may lack Issues: write there")
-        return "FAILED"
-    return f"opened #{created['number']}"
+        path += f"/{existing['number']}"
+    try:
+        result = api(path, "PATCH" if existing else "POST", payload)
+        number = result.get("number") if isinstance(result, dict) else None
+        if not isinstance(number, int):
+            raise APIError(f"{repo}: invalid issue write response")
+    except (APIError, subprocess.TimeoutExpired):
+        if existing:
+            number = existing["number"]
+        else:
+            # Read after an uncertain creation; never blindly issue a second POST.
+            matches = [i for i in pages(f"repos/{ORG}/{repo}/issues?state=all")
+                       if own_issue(i) and i.get("body") == payload["body"]]
+            if len(matches) != 1:
+                raise
+            number = matches[0]["number"]
+    result = api(f"repos/{ORG}/{repo}/issues/{number}")
+    if (not isinstance(result, dict) or not own_issue(result) or result.get("body") != payload["body"]
+            or result.get("state") != payload.get("state", "open")):
+        raise APIError(f"{repo} issue #{number}: write could not be verified")
+    return f"{action['kind']} verified: #{number}"
 
-
-# ---------------------------------------------------------------- main
 
 def main():
-    if EVENT and EVENT != "workflow_dispatch" and DRY_RUN is False:
-        pass  # the schedule is allowed to act here; see the module docstring
-
-    repos = active_repos()
-    if not repos:
-        print("could not list repositories — refusing to report a clean graph", file=sys.stderr)
-        return 1
-
-    edges, gaps = [], []
-    for name, default_branch, is_fork in repos:
-        if is_fork:
-            continue
-        branches = [default_branch] + (["dev"] if default_branch != "dev" else [])
-        for br in branches:
-            if br != default_branch and not api(f"repos/{ORG}/{name}/branches/{br}"):
+    gaps, incomplete, edges, actions, repos = [], set(), [], [], []
+    failed = False
+    try:
+        repos, edges = collect_graph(gaps, incomplete)
+        # Read every issue page before the first write. This also finds issues for
+        # dependencies that have been removed entirely since the previous run.
+        issues = {}
+        for repo in repos:
+            if repo.get("has_issues", True):
+                issues[repo["name"]] = [i for i in pages(f"repos/{ORG}/{repo['name']}/issues?state=all")
+                                        if own_issue(i)]
+                for index, issue in enumerate(issues[repo["name"]]):
+                    if issue["state"] == "closed" and f"<!-- {MARKER}:" in (issue.get("body") or ""):
+                        # List responses need not carry closed_by. Read native last-
+                        # closure metadata before deciding whether a human dismissed it.
+                        current = api(f"repos/{ORG}/{repo['name']}/issues/{issue['number']}")
+                        if not isinstance(current, dict) or current.get("number") != issue["number"]:
+                            raise APIError(f"{repo['name']}: invalid issue detail response")
+                        issues[repo["name"]][index] = current
+        actions = plan_actions(edges, issues, gaps, incomplete)
+        for action in actions:
+            if DRY_RUN:
+                action["result"] = "would " + action["kind"]
                 continue
-            for kind in MANIFESTS:
-                txt = content(name, kind, br)
-                if txt:
-                    edges += edges_from(name, br, kind, txt)
-
-    behind, ranges, revisions, current, patched = [], [], [], [], []
-    for consumer, branch, dep, spec, kind in edges:
-        producer = producer_of(dep, spec)
-        if not producer:
-            gaps.append(f"could not tell which repository publishes `{dep}` (in `{consumer}`)")
-            continue
-        newest = latest_release(producer)
-        if kind == "patched":
-            patched.append((consumer, branch, dep, spec, producer, newest))
-        elif kind == "range":
-            ranges.append((consumer, branch, dep, spec, producer, newest))
-        elif kind == "revision":
-            revisions.append((consumer, branch, dep, spec, producer, newest))
-        else:
-            pin = pinned_version(spec, kind)
-            if not pin or not newest:
-                gaps.append(f"could not read a version from `{dep}` in `{consumer}` (`{spec[:40]}`)")
-            elif pin != newest.lstrip("v"):
-                behind.append((consumer, branch, dep, pin, producer, newest))
-            else:
-                current.append((consumer, branch, dep, pin, producer))
-
-    seen, actions = set(), []
-    for consumer, branch, dep, pin, producer, newest in behind:
-        if (consumer, dep) in seen:
-            continue
-        seen.add((consumer, dep))
-        actions.append((consumer, dep, pin, producer, newest, notify(consumer, dep, pin, producer, newest, gaps)))
-
-    with open(SUMMARY, "a") as f:
-        w = f.write
-        w("## Dependency graph\n\n")
-        w(f"{len(edges)} intra-organisation edges across {len(repos)} repositories.\n\n")
-        if DRY_RUN:
-            w("**Dry run — no issue was opened or changed.**\n\n")
-        if actions:
-            w("### Exact pins behind a newer release\n\n")
-            w("| consumer | dependency | pinned | producer | released | |\n|---|---|---|---|---|---|\n")
-            for c, d, p, pr, n, what in actions:
-                w(f"| `{c}` | `{d}` | `{p}` | `{pr}` | `{n}` | {what} |\n")
-            w("\n")
-        else:
-            w("**Every exact pin is current.**\n\n")
-        w(f"- exact and current: **{len(current)}**\n")
-        w(f"- range pins, which resolve on the next install: **{len(ranges)}**\n")
-        w(f"- revision pins, reported rather than chased: **{len(revisions)}**\n")
-        w(f"- declared then overridden by `[patch]`: **{len(patched)}**\n")
-        if patched:
-            w("\n### Manifests whose declared version is dead text\n\n")
-            for c, br, d, s_, pr, n in patched:
-                w(f"- **`{c}`** declares `{d}` with a tag and then overrides it with a "
-                  f"`[patch]` section, so the declared version is not what is built. "
-                  f"`{pr}` newest release `{n}`. Moving the declared pin would change "
-                  f"nothing; the manifest itself is the thing to fix.\n")
-        if revisions:
-            w("\n<details><summary>revision pins</summary>\n\n")
-            for c, br, d, s, pr, n in revisions:
-                w(f"- `{c}` ({br}) pins `{d}` by revision; `{pr}` newest release `{n}`\n")
-            w("\nA revision pin is precise and reproducible. It is listed rather than "
-              "reported as behind because a producer's tags may not describe what "
-              "consumers actually use — which is the case for `bcr-common`, tracked "
-              "in `bcr-common#219`.\n</details>\n")
-        if gaps:
-            w("\n### Not measured on this run\n\n")
-            for g in sorted(set(gaps)):
-                w(f"- {g}\n")
-    return 0
+            try:
+                action["result"] = apply_action(action)
+            except (APIError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                action["result"] = f"FAILED: {exc}"
+                raise
+    except (APIError, ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+        gaps.append(str(exc))
+        failed = True
+    finally:
+        with open(SUMMARY, "a") as stream:
+            stream.write("## Dependency graph\n\n")
+            if DRY_RUN:
+                stream.write("**Dry run: no issues were opened, changed or closed.**\n\n")
+            stream.write(f"{len(edges)} declarations across {len(repos)} active, non-fork repositories.\n\n")
+            for kind in ("exact", "range", "revision", "patched"):
+                stream.write(f"- {kind}: {sum(e.kind == kind for e in edges)}\n")
+            stream.write("\n| consumer | branch | manifest | dependency | kind | pin | producer |\n")
+            stream.write("|---|---|---|---|---|---|---|\n")
+            for edge in edges:
+                cells = (edge.consumer, edge.branch, edge.path, edge.dependency, edge.kind, edge.pin, edge.producer)
+                stream.write("| " + " | ".join(str(c).replace("|", r"\|").replace("\n", " ") for c in cells) + " |\n")
+            stream.write("\n### Issue actions\n\n")
+            for action in actions:
+                stream.write(f"- {action['repo']}/{action['dep']}: {action.get('result', 'not attempted')}\n")
+            if not actions:
+                stream.write("No issue changes planned from the completed reads.\n")
+            if gaps:
+                stream.write("\n### Not measured or stopped\n\n")
+                for gap in sorted(set(gaps)):
+                    stream.write(f"- {gap}\n")
+                stream.write("\nThis run does not establish that all exact pins are current.\n")
+    return 1 if failed or gaps else 0
 
 
 if __name__ == "__main__":

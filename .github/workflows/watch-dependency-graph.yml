@@ -7,10 +7,8 @@ name: Watch the dependency graph
 # pubspec.yaml on each default branch, plus dev where it exists -- so a new
 # consumer or a new dependency is covered without any change here.
 #
-# Unlike prune-package-versions, the schedule here DOES act. An issue is cheap and
-# closeable, where a deleted package version cannot be undone. dry_run stays the
-# default for a manual run so a change to this workflow can be inspected before it
-# speaks to anybody.
+# The schedule is read-only until DEPENDENCY_WATCH_ENABLED=true is set after
+# reviewing a native dry-run. Manual runs also default to dry_run=true.
 #
 # Only an exact pin can be behind in a way that needs a person: a range resolves on
 # the next install, a revision pin is precise already, and a pin overridden by a
@@ -18,6 +16,11 @@ name: Watch the dependency graph
 # issue only for the first.
 
 on:
+  pull_request:
+    paths:
+      - '.github/scripts/watch-dependency-graph.py'
+      - '.github/scripts/test_dependency_watch.py'
+      - '.github/workflows/watch-dependency-graph.yml'
   schedule:
     - cron: '23 7 * * 1'
   workflow_dispatch:
@@ -29,15 +32,27 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: watch-dependency-graph
-  cancel-in-progress: false
-
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_dependency_watch.py
+
   watch:
+    if: github.event_name != 'pull_request'
+    needs: test
     name: Watch the dependency graph
     timeout-minutes: 15
     runs-on: ubuntu-latest
+    concurrency:
+      group: watch-dependency-graph
+      cancel-in-progress: false
+    env:
+      DRY_RUN: ${{ ((github.event_name == 'workflow_dispatch' && inputs.dry_run == false) || (github.event_name == 'schedule' && vars.DEPENDENCY_WATCH_ENABLED == 'true')) && 'false' || 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -48,14 +63,13 @@ jobs:
           app-id: ${{ vars.AUTOMATION_APP_ID }}
           private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-metadata: read
+          permission-issues: ${{ env.DRY_RUN == 'true' && 'read' || 'write' }}
 
       - name: Report pins that have fallen behind
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           ORG: ${{ github.repository_owner }}
-          # A manual run reports unless dry_run is unticked; the schedule acts.
-          # Gated on the event as well as the input: on a schedule `inputs` is
-          # empty, and GitHub coerces both sides of == to a number, so
-          # `inputs.dry_run == false` would be TRUE there.
-          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == true) && 'true' || 'false' }}
+          WATCHER_BOT: ${{ steps.token.outputs.app-slug }}[bot]
         run: python3 .github/scripts/watch-dependency-graph.py
