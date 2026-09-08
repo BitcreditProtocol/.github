@@ -122,6 +122,19 @@ The watcher reads nested Cargo, npm and pubspec manifests from immutable snapsho
 
 Only exact SemVer pins older than the producer's latest published full release trigger an issue. Prerelease and build-metadata precedence follow SemVer; an ahead pin is not behind. All affected branches and manifests share one open issue for each consumer/dependency. Identical reports do not refresh the issue.
 
+Explicit Git sources identify their own producer; an external source never falls
+back to an organisation package with the same name. Registry package lookup is
+limited to the matching ecosystem and default registry. Cargo patches retain both
+the source and package name, including aliases. A crates.io patch does not affect
+a Git dependency. A matching or ambiguous patch still needs Cargo resolution to
+prove whether it applies, so that dependency is reported as not measured.
+
+Dart `dependency_overrides` and tracked sibling `pubspec_overrides.yaml` files are
+read from the same commit as the manifest. A dependency with an override or an
+unmeasured source cannot open, update or automatically close an issue. Other
+dependencies continue to be checked. Missing or unreadable evidence never proves
+that an existing issue is resolved.
+
 A manual closure suppresses that target version only. A later release can notify again. The watcher closes its issue automatically after all mapped exact pins catch up or remaining declarations cease requiring an exact version; that automatically resolved issue can reopen after a regression. A dependency that disappears from the mapped graph remains open for manual review, since missing ownership evidence does not prove its removal. Failed consumer or recorded-producer reads cannot prove resolution. The issue body retains machine-readable target and closure state; native last-closure metadata takes precedence if a person later reopens and closes it.
 
 Only marked issues authored by the current automation App are managed; a marker in somebody else's issue does not grant ownership. All issue pages are read before any issue mutation. API failures and malformed/truncated inputs appear in the run summary; they do not mean every exact pin is current. Unknown write outcomes are read back before a subsequent run can create anything again.

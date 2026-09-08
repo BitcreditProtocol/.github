@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 import tomllib
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 ORG = os.environ.get("ORG", "BitcreditProtocol")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
@@ -22,7 +22,7 @@ SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
 MARKER = "bitcredit-dependency-watch"
 STATE = "bitcredit-dependency-watch-state"
 WATCHER_BOT = os.environ.get("WATCHER_BOT", "bitcredit-automation[bot]")
-MANIFESTS = {"Cargo.toml", "package.json", "pubspec.yaml"}
+MANIFESTS = {"Cargo.toml", "package.json", "pubspec.yaml", "pubspec_overrides.yaml"}
 EXCLUDED = {"node_modules", "vendor", "target", "build", ".dart_tool", "cargokit", "crowdin_sdk"}
 NPM_OWNER = {"@bitcredit/bcr-ebill-wasm": "Bitcredit-Core",
              "@bitcredit/ui-library": "ui", "@bitcreditprotocol/ui-library": "ui"}
@@ -94,17 +94,41 @@ def cargo_kind(body):
 
 
 def producer_of(spec):
-    match = re.search(r"(?:github\.com[:/]|github:)" + re.escape(ORG) + r"/([A-Za-z0-9_.-]+)", spec, re.I)
-    return match[1].removesuffix(".git") if match else None
+    spec = spec.removeprefix("git+")
+    if spec.startswith("github:"):
+        spec = "https://github.com/" + spec.removeprefix("github:")
+    if spec.startswith("git@github.com:"):
+        spec = "ssh://git@github.com/" + spec.removeprefix("git@github.com:")
+    url = urlsplit(spec)
+    parts = url.path.strip("/").split("/")
+    if url.hostname == "github.com" and len(parts) == 2 and parts[0].lower() == ORG.lower():
+        return parts[1].removesuffix(".git")
+    return None
 
 
-def owner_of(dep, spec, owners):
-    producer = producer_of(spec)
-    if producer:
-        return producer
-    if dep in owners and owners[dep] is None:
+def owner_of(dep, spec, owners, ecosystem):
+    if spec:
+        return producer_of(spec)  # An explicit source never falls back to a package name.
+    key = (ecosystem, dep)
+    if key in owners and owners[key] is None:
         raise ValueError(f"ambiguous producer for {dep}")
-    return owners.get(dep)
+    return owners.get(key)
+
+
+def cargo_source(url):
+    """Cargo's common URL equivalences, without guessing registry aliases."""
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    path, scheme, port = parsed.path.removesuffix("/"), parsed.scheme, parsed.port
+    if port == {"http": 80, "https": 443}.get(scheme):
+        port = None
+    if "+" not in scheme:
+        if parsed.hostname == "github.com":
+            scheme, path = "https", path.lower()
+        path = path.removesuffix(".git")
+    return (scheme, parsed.username, parsed.password, parsed.hostname, port,
+            path, parsed.query, parsed.fragment)
 
 
 def content(repo, path, sha):
@@ -150,7 +174,27 @@ def cargo_patches(path, manifests):
             if candidate in manifests and "workspace" in manifests[candidate]:
                 doc = manifests[candidate]
                 break
-    return {name for source in (doc.get("patch") or {}).values() for name in source}
+    return {(source, attrs.get("package", name) if isinstance(attrs, dict) else name)
+            for source, patches in (doc.get("patch") or {}).items()
+            for name, attrs in patches.items()}
+
+
+def cargo_patch_kind(package, attrs, patches):
+    for source, name in patches:
+        if name != package:
+            continue
+        if "git" in attrs:
+            original, replacement = cargo_source(attrs["git"]), cargo_source(source)
+            if original is not None and original == replacement:
+                return "patched"
+            if original is None or (":" in source and replacement is None):
+                return "unmeasured"
+        elif source == attrs.get("registry", "crates-io"):
+            return "patched"
+        elif ":" in source:
+            # A registry URL needs Cargo configuration to establish its identity.
+            return "unmeasured"
+    return None
 
 
 def edges_from(repo, branch, path, manifests, owners):
@@ -159,8 +203,8 @@ def edges_from(repo, branch, path, manifests, owners):
     name = PurePosixPath(path).name
 
     def add(dep, producer, pin, kind):
-        if producer and producer != repo:
-            edges.append(Edge(repo, branch, path, dep, producer, str(pin), kind))
+        if producer != repo and (producer or kind == "unmeasured"):
+            edges.append(Edge(repo, branch, path, dep, producer or "", str(pin), kind))
 
     if name == "Cargo.toml":
         patched = cargo_patches(path, manifests)
@@ -168,7 +212,10 @@ def edges_from(repo, branch, path, manifests, owners):
             attrs = value if isinstance(value, dict) else {"version": value}
             if attrs.get("workspace") or "path" in attrs:
                 continue  # Workspace declarations are read separately; path sources are local.
-            producer = owner_of(attrs.get("package", dep), attrs.get("git", ""), owners)
+            package = attrs.get("package", dep)
+            source = attrs.get("git", "")
+            registry = attrs.get("registry", "crates-io") == "crates-io"
+            producer = owner_of(package, source, owners, name) if source or registry else None
             if "rev" in attrs:
                 pin, kind = attrs["rev"], "revision"
             elif "tag" in attrs:
@@ -178,33 +225,58 @@ def edges_from(repo, branch, path, manifests, owners):
                 kind = "exact" if str(pin).startswith("=") else "range"
                 if kind == "exact":
                     pin = str(pin)[1:]
-            add(dep, producer, pin, "patched" if attrs.get("package", dep) in patched else kind)
+            if (source and not producer) or not registry:
+                kind = "unmeasured"
+            else:
+                kind = cargo_patch_kind(package, attrs, patched) or kind
+            add(dep, producer, pin, kind)
     elif name == "package.json":
         for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
             for dep, value in (doc.get(section) or {}).items():
                 if not isinstance(value, str):
                     continue
-                producer = owner_of(dep, value, owners)
+                registry = re.fullmatch(r"[A-Za-z0-9.*+~^<>=| -]*", value) is not None
+                producer = owner_of(dep, "" if registry else value, owners, name)
                 pin = value.removeprefix("=")
                 kind = "exact" if semver(pin) is not None else "range"
                 if "#" in value and producer_of(value):
                     pin = value.rsplit("#", 1)[1]
                     kind = "exact" if semver(pin) is not None else (
                         "revision" if re.fullmatch(r"[0-9a-f]{7,40}", pin) else "range")
-                add(dep, producer, pin, kind)
-    else:
+                add(dep, producer, pin, "unmeasured" if not registry and not producer else kind)
+    elif name == "pubspec.yaml":
+        overrides_path = str(PurePosixPath(path).with_name("pubspec_overrides.yaml"))
+        overrides = set(doc.get("dependency_overrides") or {})
+        overrides.update(manifests.get(overrides_path, {}).get("dependency_overrides") or {})
+        declared = {dep for section in ("dependencies", "dev_dependencies")
+                    for dep in (doc.get(section) or {})}
+        for dep in overrides - declared:
+            add(dep, None, "override", "unmeasured")
         for section in ("dependencies", "dev_dependencies"):
             for dep, attrs in (doc.get(section) or {}).items():
-                if not isinstance(attrs, dict) or "git" not in attrs:
+                attrs = attrs if isinstance(attrs, dict) else {"version": attrs}
+                if "path" in attrs or "sdk" in attrs:
+                    if dep in overrides:
+                        add(dep, None, "override", "unmeasured")
                     continue
-                git = attrs["git"]
-                git = {"url": git} if isinstance(git, str) else git
-                if not isinstance(git, dict):
-                    raise ValueError(f"{path}: invalid git dependency {dep}")
-                pin = git.get("ref", "default branch")
+                if "git" in attrs:
+                    git = attrs["git"]
+                    git = {"url": git} if isinstance(git, str) else git
+                    if not isinstance(git, dict):
+                        raise ValueError(f"{path}: invalid git dependency {dep}")
+                    pin, source = git.get("ref", "default branch"), git.get("url", "")
+                    producer = producer_of(source)
+                    measured = producer is not None
+                else:
+                    hosted = attrs.get("hosted", "https://pub.dev")
+                    if isinstance(hosted, dict):
+                        hosted = hosted.get("url", "https://pub.dev")
+                    measured = hosted.rstrip("/") in ("https://pub.dev", "https://pub.dartlang.org")
+                    producer = owner_of(dep, "", owners, name) if measured else None
+                    pin = attrs.get("version", "any")
                 kind = "exact" if semver(pin) is not None else (
                     "revision" if re.fullmatch(r"[0-9a-f]{7,40}", pin) else "range")
-                add(dep, producer_of(git.get("url", "")), pin, kind)
+                add(dep, producer, pin, "unmeasured" if dep in overrides or not measured else kind)
     return edges
 
 
@@ -237,8 +309,8 @@ def collect_graph(gaps, incomplete):
                             raise ValueError("manifest must be a mapping")
                         manifests[str(path)] = doc
                         package_name = doc.get("package", {}).get("name") if path.name == "Cargo.toml" else doc.get("name")
-                        if isinstance(package_name, str):
-                            package_owners[package_name].add(name)
+                        if path.name != "pubspec_overrides.yaml" and isinstance(package_name, str):
+                            package_owners[path.name, package_name].add(name)
                     except (APIError, ValueError, OSError, subprocess.SubprocessError) as exc:
                         gaps.append(f"{name}/{branch}/{path}: {exc}")
                         incomplete.add(name)
@@ -248,7 +320,7 @@ def collect_graph(gaps, incomplete):
                 incomplete.add(name)
     owners = {name: next(iter(values)) if len(values) == 1 else None
               for name, values in package_owners.items()}
-    owners.update(NPM_OWNER)
+    owners.update({("package.json", name): repo for name, repo in NPM_OWNER.items()})
     edges = []
     for (repo, branch), manifests in graphs.items():
         for path in manifests:
@@ -334,6 +406,9 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete):
     actions, latest = [], {}
     for (repo, dep), locations in sorted(groups.items()):
         if repo in incomplete:
+            continue
+        if any(e.kind in ("patched", "unmeasured") for e in locations):
+            gaps.append(f"{repo}/{dep}: source or override not evaluated; issue unchanged")
             continue
         if repo not in issues_by_repo:
             if any(e.kind == "exact" for e in locations):
@@ -471,7 +546,7 @@ def main():
             if DRY_RUN:
                 stream.write("**Dry run: no issues were opened, changed or closed.**\n\n")
             stream.write(f"{len(edges)} declarations across {len(repos)} active, non-fork repositories.\n\n")
-            for kind in ("exact", "range", "revision", "patched"):
+            for kind in ("exact", "range", "revision", "patched", "unmeasured"):
                 stream.write(f"- {kind}: {sum(e.kind == kind for e in edges)}\n")
             stream.write("\n| consumer | branch | manifest | dependency | kind | pin | producer |\n")
             stream.write("|---|---|---|---|---|---|---|\n")

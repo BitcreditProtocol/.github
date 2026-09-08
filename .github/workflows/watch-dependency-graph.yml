@@ -11,9 +11,9 @@ name: Watch the dependency graph
 # reviewing a native dry-run. Manual runs also default to dry_run=true.
 #
 # Only an exact pin can be behind in a way that needs a person: a range resolves on
-# the next install, a revision pin is precise already, and a pin overridden by a
-# cargo [patch] section is dead text. The script says which is which and opens an
-# issue only for the first.
+# the next install, and a revision pin is precise already. Matching Cargo patches
+# and Dart overrides require manual evaluation; they cannot open, update or close
+# dependency issues. The script reports these comparisons as not measured.
 
 on:
   pull_request:

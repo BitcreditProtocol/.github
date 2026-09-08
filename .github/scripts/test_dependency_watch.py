@@ -124,7 +124,7 @@ api = "=1.2.3"
         }
         docs = {path: watch.parse_manifest(path, text) for path, text in texts.items()}
         root = watch.edges_from("Consumer", "main", "Cargo.toml", docs, {})
-        nested = watch.edges_from("Consumer", "dev", "crates/client/Cargo.toml", docs, {"api": "API"})
+        nested = watch.edges_from("Consumer", "dev", "crates/client/Cargo.toml", docs, {("Cargo.toml", "api"): "API"})
         self.assertEqual([(e.dependency, e.kind) for e in root], [("library", "patched")])
         self.assertEqual({e.dependency: (e.pin, e.kind, e.producer) for e in nested}, {
             "alias": ("v1.0.0", "patched", "Producer"),
@@ -146,8 +146,106 @@ inherited = { workspace = true }
 renamed_local = { package = "ambiguous", path = "crates/ambiguous", version = "=1.0.0" }
 ''')
         edges = watch.edges_from("Consumer", "main", path, {path: doc},
-                                 {"ambiguous": None, "shadowed": "Producer"})
+                                 {("Cargo.toml", "ambiguous"): None, ("Cargo.toml", "shadowed"): "Producer"})
         self.assertEqual(edges, [self.edge(dep="external", pin="v1.0.0")])
+
+    def test_cargo_patch_source_must_match_the_git_dependency_including_aliases(self):
+        for source, replacement, expected in (
+            ("crates-io", 'library = { path = "local/library" }', "exact"),
+            ("https://github.com/ExampleOrg/Unrelated", 'library = { path = "local/library" }', "exact"),
+            ("https://gitlab.example/ExampleOrg/Producer.git", 'library = { path = "local/library" }', "exact"),
+            ("https://github.com/ExampleOrg/Producer.git.git", 'library = { path = "local/library" }', "exact"),
+            ("https://github.com/ExampleOrg/Producer", 'library = { path = "local/library" }', "patched"),
+            ("https://github.com:443/ExampleOrg/Producer", 'library = { path = "local/library" }', "patched"),
+            ("https://github.com/ExampleOrg/Producer.git", 'replacement = { package = "library", path = "local/library" }', "patched"),
+        ):
+            with self.subTest(source=source, replacement=replacement):
+                doc = watch.parse_manifest("Cargo.toml", f'''[dependencies]
+alias = {{ package = "library", git = "https://github.com/ExampleOrg/Producer.git", tag = "v1.0.0" }}
+[patch."{source}"]
+{replacement}
+''')
+                edges = watch.edges_from("Consumer", "main", "Cargo.toml", {"Cargo.toml": doc}, {})
+                self.assertEqual(len(edges), 1)
+                self.assertEqual(edges[0].kind, expected)
+
+    def test_crates_io_patch_cannot_close_an_existing_git_dependency_issue(self):
+        doc = watch.parse_manifest("Cargo.toml", '''[dependencies]
+library = { git = "https://github.com/ExampleOrg/Producer.git", tag = "v1.0.0" }
+[patch.crates-io]
+library = { path = "local/library" }
+''')
+        edges = watch.edges_from("Consumer", "main", "Cargo.toml", {"Cargo.toml": doc}, {})
+        self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+        actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, [], set())
+        self.assertEqual([(a["kind"], a["payload"]["state"]) for a in actions], [("update", "open")])
+
+    def test_matching_git_patch_blocks_its_group_without_blocking_other_dependencies(self):
+        doc = watch.parse_manifest("Cargo.toml", '''[dependencies]
+library = { git = "https://github.com/ExampleOrg/Producer.git", tag = "v1.0.0" }
+[patch."https://github.com/ExampleOrg/Producer"]
+replacement = { package = "library", path = "local/library" }
+''')
+        patched = watch.edges_from("Consumer", "main", "Cargo.toml", {"Cargo.toml": doc}, {})
+        edges = patched + [self.edge(branch="dev"), self.edge(dep="unaffected")]
+        for existing in ([], [self.issue()], [self.issue(state="closed", resolved=True)]):
+            with self.subTest(existing=[i["state"] for i in existing]):
+                self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+                gaps, incomplete = [], set()
+                actions = watch.plan_actions(edges, {"Consumer": existing}, gaps, incomplete)
+                self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
+                self.assertTrue(any("library" in gap for gap in gaps))
+                self.assertNotIn("Consumer", incomplete)
+
+    def test_dart_overrides_suppress_only_the_affected_dependency_group(self):
+        path = "apps/mobile/pubspec.yaml"
+        text = '''dependencies:
+  library:
+    git: {url: "https://github.com/ExampleOrg/Producer.git", ref: v1.0.0}
+  unaffected:
+    git: {url: "https://github.com/ExampleOrg/Producer.git", ref: v1.0.0}
+'''
+        overrides = "dependency_overrides:\n  library:\n    path: ../local-library\n"
+        for location in ("inline", "sibling", "other directory"):
+            with self.subTest(location=location):
+                docs = {path: watch.parse_manifest(path, text + (overrides if location == "inline" else ""))}
+                if location != "inline":
+                    override_path = ("apps/mobile/" if location == "sibling" else "apps/other/") + "pubspec_overrides.yaml"
+                    docs[override_path] = watch.parse_manifest(override_path, overrides)
+                edges = watch.edges_from("Consumer", "main", path, docs, {})
+                kinds = {edge.dependency: edge.kind for edge in edges}
+                self.assertEqual(kinds["unaffected"], "exact")
+                if location == "other directory":
+                    self.assertEqual(kinds["library"], "exact")
+                else:
+                    self.assertIn(kinds["library"], {"patched", "unmeasured"})
+                self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+                gaps, incomplete = [], set()
+                actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, gaps, incomplete)
+                self.assertEqual([a["dep"] for a in actions], ["library", "unaffected"] if location == "other directory" else ["unaffected"])
+                self.assertNotIn("Consumer", incomplete)
+
+    def test_override_only_dart_keys_block_opening_and_false_closure_across_branches(self):
+        path = "apps/mobile/pubspec.yaml"
+        text = 'dependencies:\n  unaffected:\n    git: {url: "https://github.com/ExampleOrg/Producer.git", ref: v1.0.0}\n'
+        overrides = "dependency_overrides:\n  library:\n    path: ../local-library\n"
+        for location in ("inline", "sibling"):
+            docs = {path: watch.parse_manifest(path, text + (overrides if location == "inline" else ""))}
+            if location == "sibling":
+                override_path = "apps/mobile/pubspec_overrides.yaml"
+                docs[override_path] = watch.parse_manifest(override_path, overrides)
+            edges = watch.edges_from("Consumer", "main", path, docs, {})
+            self.assertEqual({e.dependency: (e.producer, e.kind) for e in edges},
+                             {"library": ("", "unmeasured"), "unaffected": ("Producer", "exact")})
+            for pin, existing in (("v1.0.0", []), ("v2.0.0", [self.issue()])):
+                with self.subTest(location=location, other_branch_pin=pin):
+                    self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+                    gaps, incomplete = [], set()
+                    actions = watch.plan_actions(edges + [self.edge(branch="dev", path=path, pin=pin)],
+                                                 {"Consumer": existing}, gaps, incomplete)
+                    self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
+                    self.assertTrue(any("library" in gap for gap in gaps))
+                    self.assertNotIn("Consumer", incomplete)
 
     def test_nested_npm_and_pubspec_parse_exact_ranges_and_revisions(self):
         path = "packages/web/package.json"
@@ -156,7 +254,8 @@ renamed_local = { package = "ambiguous", path = "crates/ambiguous", version = "=
             "devDependencies": {"ui": "=1.1.0"},
             "peerDependencies": {"branch": "github:ExampleOrg/ui#dev"},
             "optionalDependencies": {"revision": "git+https://github.com/ExampleOrg/ui.git#abcdef12"}}))
-        npm = watch.edges_from("Consumer", "main", path, {path: doc}, dict(watch.NPM_OWNER, ui="ui"))
+        owners = {("package.json", name): producer for name, producer in watch.NPM_OWNER.items()}
+        npm = watch.edges_from("Consumer", "main", path, {path: doc}, owners | {("package.json", "ui"): "ui"})
         self.assertEqual({e.dependency: (e.pin, e.kind) for e in npm}, {
             "@bitcredit/ui-library": ("^1.0.0", "range"), "alias": ("v1.0.0", "exact"),
             "ui": ("1.1.0", "exact"), "branch": ("dev", "range"), "revision": ("abcdef12", "revision")})
@@ -182,6 +281,36 @@ dev_dependencies:
             with self.subTest(yaml=text), self.assertRaises(ValueError):
                 watch.parse_manifest(path, text)
 
+    def test_explicit_external_git_sources_never_inherit_internal_package_owners(self):
+        manifests = {
+            "Cargo.toml": '[dependencies]\nlibrary = {git = "https://github.com/OtherOrg/Producer.git", tag = "v1.0.0"}\n',
+            "package.json": '{"dependencies":{"library":"git+https://github.com/OtherOrg/Producer.git#v1.0.0"}}',
+            "pubspec.yaml": 'dependencies:\n  library:\n    git: {url: "https://github.com/OtherOrg/Producer.git", ref: v1.0.0}\n',
+        }
+        for path, text in manifests.items():
+            with self.subTest(path=path):
+                doc = watch.parse_manifest(path, text)
+                edges = watch.edges_from("Consumer", "main", path, {path: doc}, {(path, "library"): "Producer"})
+                self.assertEqual([(e.producer, e.kind) for e in edges], [("", "unmeasured")])
+                self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+                gaps, incomplete = [], set()
+                actions = watch.plan_actions(edges + [self.edge(branch="dev"), self.edge(dep="unaffected")],
+                                             {"Consumer": [self.issue()]}, gaps, incomplete)
+                self.assertEqual([a["dep"] for a in actions], ["unaffected"])
+                self.assertNotIn("Consumer", incomplete)
+
+    def test_registry_owners_are_scoped_to_the_matching_manifest_ecosystem(self):
+        manifests = {"Cargo.toml": '[dependencies]\nlibrary = "=1.0.0"\n',
+                     "package.json": '{"dependencies":{"library":"1.0.0"}}',
+                     "pubspec.yaml": 'dependencies:\n  library: 1.0.0\n'}
+        for path, text in manifests.items():
+            doc = watch.parse_manifest(path, text)
+            for ecosystem in manifests:
+                with self.subTest(path=path, owner_ecosystem=ecosystem):
+                    edges = watch.edges_from("Consumer", "main", path, {path: doc}, {(ecosystem, "library"): "Producer"})
+                    self.assertEqual([(e.producer, e.pin, e.kind) for e in edges],
+                                     [("Producer", "1.0.0", "exact")] if ecosystem == path else [])
+
     def test_collect_graph_reads_every_manifest_at_pinned_branch_shas(self):
         def blob(text):
             return {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}
@@ -189,8 +318,9 @@ dev_dependencies:
         consumer = {"name": "Consumer", "default_branch": "main", "archived": False, "fork": False}
         producer = dict(consumer, name="Producer")
         manifests = {"crates/client/Cargo.toml": '[dependencies]\nlibrary = "=1.0.0"\n',
-                     "packages/web/package.json": '{"dependencies":{"library":"1.0.0"}}',
-                     "apps/mobile/pubspec.yaml": 'dependencies:\n  library:\n    git: {url: "https://github.com/ExampleOrg/Producer.git", ref: v1.0.0}\n'}
+                     "packages/web/package.json": '{"dependencies":{"library":"1.0.0","rust_only":"1.0.0"}}',
+                     "apps/mobile/pubspec.yaml": 'dependencies:\n  library:\n    git: {url: "https://github.com/ExampleOrg/Producer.git", ref: v1.0.0}\n  overridden:\n    git: {url: "https://github.com/ExampleOrg/Producer.git", ref: v1.0.0}\n',
+                     "apps/mobile/pubspec_overrides.yaml": 'dependency_overrides:\n  overridden:\n    path: ../local\n'}
         tree = [{"path": path, "type": "blob"} for path in manifests]
         tree += [{"path": "vendor/ignored/Cargo.toml", "type": "blob"},
                  {"path": "node_modules/ignored/package.json", "type": "blob"},
@@ -207,11 +337,16 @@ dev_dependencies:
             ("GET", f"repos/ExampleOrg/Consumer/git/trees/{'2' * 40}?recursive=1"):
                 [{"truncated": False, "tree": [{"path": "crates/client/Cargo.toml", "type": "blob"}]}],
             ("GET", f"repos/ExampleOrg/Producer/git/trees/{'3' * 40}?recursive=1"):
-                [{"truncated": False, "tree": [{"path": "Cargo.toml", "type": "blob"}]}],
+                [{"truncated": False, "tree": [{"path": path, "type": "blob"}
+                                                for path in ("Cargo.toml", "package.json", "crates/rust-only/Cargo.toml")]}],
             ("GET", f"repos/ExampleOrg/Consumer/contents/crates/client/Cargo.toml?ref={'2' * 40}"):
                 [blob(manifests["crates/client/Cargo.toml"])],
             ("GET", f"repos/ExampleOrg/Producer/contents/Cargo.toml?ref={'3' * 40}"):
                 [blob('[package]\nname = "library"\n')],
+            ("GET", f"repos/ExampleOrg/Producer/contents/package.json?ref={'3' * 40}"):
+                [blob('{"name":"library"}')],
+            ("GET", f"repos/ExampleOrg/Producer/contents/crates/rust-only/Cargo.toml?ref={'3' * 40}"):
+                [blob('[package]\nname = "rust_only"\n')],
         }
         responses.update({("GET", f"repos/ExampleOrg/Consumer/contents/{path}?ref={'1' * 40}"): [blob(text)]
                           for path, text in manifests.items()})
@@ -220,8 +355,12 @@ dev_dependencies:
         repos, edges = watch.collect_graph(gaps, incomplete)
         self.assertEqual([r["name"] for r in repos], ["Consumer", "Producer"])
         self.assertEqual({(e.branch, e.path) for e in edges},
-                         {("main", path) for path in manifests} | {("dev", "crates/client/Cargo.toml")})
-        self.assertTrue(all(e.producer == "Producer" and e.kind == "exact" for e in edges))
+                         {("main", path) for path in manifests if not path.endswith("pubspec_overrides.yaml")}
+                         | {("dev", "crates/client/Cargo.toml")})
+        self.assertEqual({e.dependency for e in edges}, {"library", "overridden"})
+        self.assertTrue(all(e.producer == "Producer" for e in edges))
+        self.assertEqual({e.kind for e in edges if e.dependency == "library"}, {"exact"})
+        self.assertEqual({e.kind for e in edges if e.dependency == "overridden"}, {"unmeasured"})
         self.assertEqual((gaps, incomplete), ([], set()))
         self.consumed(pending)
 
@@ -255,7 +394,7 @@ dev_dependencies:
         behind = [self.edge(), self.edge(branch="dev", path="crates/client/Cargo.toml"),
                   self.edge(path="apps/mobile/pubspec.yaml", pin="v1.5.0")]
         edges = behind + [self.edge(path="current/Cargo.toml", pin="2.0.0"),
-                          self.edge(path="range/Cargo.toml", kind="range"), self.edge(path="patched/Cargo.toml", kind="patched")]
+                          self.edge(path="range/Cargo.toml", kind="range")]
         self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
         gaps, incomplete = [], set()
         actions = watch.plan_actions(edges, {"Consumer": []}, gaps, incomplete)
@@ -264,7 +403,7 @@ dev_dependencies:
         body = actions[0]["payload"]["body"]
         for edge in behind:
             self.assertIn(f"| {edge.branch} | [{edge.path}]", body)
-        for path in ("current/Cargo.toml", "range/Cargo.toml", "patched/Cargo.toml"):
+        for path in ("current/Cargo.toml", "range/Cargo.toml"):
             self.assertNotIn(path, body)
         self.assertEqual((gaps, incomplete), ([], set()))
 
