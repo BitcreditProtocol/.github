@@ -1,15 +1,14 @@
 # Organisation automation
 
-Two scheduled workflows keep settings from drifting apart across the
-organisation. Both discover repositories from the API and skip archived
-ones, so creating or archiving a repository needs no change here.
+Scheduled workflows maintain organisation settings and watch cross-repository dependencies. They discover repositories from the API, so creating or archiving a repository needs no configuration edit.
 
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
+| `watch-dependency-graph.yml` | `watch-dependency-graph.py` | dependency issues, after explicit activation | exact pins, ranges, revisions, overrides and incomplete reads |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
 | `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | configuration findings, coverage metrics and a list of what it could not read — see below |
 
-Both accept a `dry_run` input on manual runs, which prints the intended
+The workflows accept a `dry_run` input on manual runs, which prints the intended
 changes without writing anything. On `audit-repo-settings` a dry run stops after
 the job summary: it does **not** touch the drift issue, so a dry run is not a way
 to refresh that issue.
@@ -116,6 +115,33 @@ The empty-wiki check runs on public repositories only. An App installation token
 cannot read a wiki, so for an internal or private repository "no content" and "no
 access" are indistinguishable — checking those reported the repositories that
 actually use their wiki as empty.
+
+## Dependency notifications
+
+The watcher reads nested Cargo, npm and pubspec manifests from immutable snapshots of each default branch and dev, where present. It skips archived repositories, forks and the same generated/vendor paths as the audit. Package declarations identify producers; local workspace dependencies within one repository do not create cross-repository notifications. Cargo uses Python 3.11+ tomllib, JSON uses the standard library, and YAML uses the yq tool already used by the audit.
+
+Only exact SemVer pins older than the producer's latest published full release trigger an issue. Prerelease and build-metadata precedence follow SemVer; an ahead pin is not behind. All affected branches and manifests share one open issue for each consumer/dependency. Identical reports do not refresh the issue.
+
+Explicit Git sources identify their own producer; an external source never falls
+back to an organisation package with the same name. Registry package lookup is
+limited to the matching ecosystem and default registry. Cargo patches retain both
+the source and package name, including aliases. A crates.io patch does not affect
+a Git dependency. A matching or ambiguous patch still needs Cargo resolution to
+prove whether it applies, so that dependency is reported as not measured.
+
+Dart `dependency_overrides` and tracked sibling `pubspec_overrides.yaml` files are
+read from the same commit as the manifest. A dependency with an override or an
+unmeasured source cannot open, update or automatically close an issue. Other
+dependencies continue to be checked. Missing or unreadable evidence never proves
+that an existing issue is resolved.
+
+A manual closure suppresses that target version only. A later release can notify again. The watcher closes its issue automatically after all mapped exact pins catch up or remaining declarations cease requiring an exact version; that automatically resolved issue can reopen after a regression. A dependency that disappears from the mapped graph remains open for manual review, since missing ownership evidence does not prove its removal. Failed consumer or recorded-producer reads cannot prove resolution. The issue body retains machine-readable target and closure state; native last-closure metadata takes precedence if a person later reopens and closes it.
+
+Only marked issues authored by the current automation App are managed; a marker in somebody else's issue does not grant ownership. All issue pages are read before any issue mutation. API failures and malformed/truncated inputs appear in the run summary; they do not mean every exact pin is current. Unknown write outcomes are read back before a subsequent run can create anything again.
+
+Scheduled runs stay read-only until the repository variable DEPENDENCY_WATCH_ENABLED is exactly true. After this PR merges, dispatch watch-dependency-graph.yml with dry_run=true, inspect its native summary, then enable that variable when notifications are wanted. Manual runs also default to dry_run=true.
+
+The App token requests only Contents/Metadata read and Issues read for a dry run, or Issues write for an enabled run. PRs execute python3 .github/scripts/test_dependency_watch.py without App credentials; the operational job cannot run on pull_request.
 
 ## Setup
 

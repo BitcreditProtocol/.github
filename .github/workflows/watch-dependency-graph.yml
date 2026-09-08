@@ -1,0 +1,75 @@
+name: Watch the dependency graph
+
+# Tells a repository when its pin on another repository in this organisation has
+# fallen behind that repository's newest release.
+#
+# The graph is derived from manifests on every run -- package.json, Cargo.toml and
+# pubspec.yaml on each default branch, plus dev where it exists -- so a new
+# consumer or a new dependency is covered without any change here.
+#
+# The schedule is read-only until DEPENDENCY_WATCH_ENABLED=true is set after
+# reviewing a native dry-run. Manual runs also default to dry_run=true.
+#
+# Only an exact pin can be behind in a way that needs a person: a range resolves on
+# the next install, and a revision pin is precise already. Matching Cargo patches
+# and Dart overrides require manual evaluation; they cannot open, update or close
+# dependency issues. The script reports these comparisons as not measured.
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/watch-dependency-graph.py'
+      - '.github/scripts/test_dependency_watch.py'
+      - '.github/workflows/watch-dependency-graph.yml'
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be opened without opening anything
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_dependency_watch.py
+
+  watch:
+    if: github.event_name != 'pull_request'
+    needs: test
+    name: Watch the dependency graph
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    concurrency:
+      group: watch-dependency-graph
+      cancel-in-progress: false
+    env:
+      DRY_RUN: ${{ ((github.event_name == 'workflow_dispatch' && inputs.dry_run == false) || (github.event_name == 'schedule' && vars.DEPENDENCY_WATCH_ENABLED == 'true')) && 'false' || 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint an org-scoped token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-metadata: read
+          permission-issues: ${{ env.DRY_RUN == 'true' && 'read' || 'write' }}
+
+      - name: Report pins that have fallen behind
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          WATCHER_BOT: ${{ steps.token.outputs.app-slug }}[bot]
+        run: python3 .github/scripts/watch-dependency-graph.py
