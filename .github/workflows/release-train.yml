@@ -1,0 +1,109 @@
+name: Cut a release train
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/release-train.py'
+      - '.github/scripts/test_release_train.py'
+      - '.github/workflows/release-train.yml'
+  workflow_dispatch:
+    inputs:
+      product:
+        description: Product version for a new train, e.g. 0.5.0 or 0.5.0-rc2; blank when resuming
+        type: string
+      resume_run_id:
+        description: Original Actions run containing the release-train-plan artifact
+        type: string
+      dry_run:
+        description: Verify the candidate without writing tags, releases or issues
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_release_train.py
+
+  train:
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: release-train
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    env:
+      ORG: ${{ github.repository_owner }}
+      PRODUCT: ${{ inputs.product }}
+      RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+      DRY_RUN: ${{ inputs.dry_run == false && 'false' || 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require master for writes
+        if: inputs.dry_run == false
+        run: test "$GITHUB_REF" = refs/heads/master
+
+      - name: Read the candidate and checks
+        id: read-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Wildcat,Clowder,Wildcat-Auxiliary,Wildcat-deployment,wildcat-dashboard-ui,bcr-common
+          permission-contents: read
+          permission-checks: read
+          permission-issues: read
+          permission-metadata: read
+          permission-actions: read
+
+      - name: Prepare or restore the original candidate
+        id: prepare
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          GH_ARTIFACT_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/release-train.py --prepare "$RUNNER_TEMP/release-train-plan.json"
+
+      - name: Store the candidate before any release writes
+        if: steps.prepare.outputs.new_plan == 'true'
+        id: candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-train-plan
+          path: ${{ runner.temp }}/release-train-plan.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: false
+
+      - name: Grant writes only to the five train members
+        if: inputs.dry_run == false
+        id: write-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Wildcat,Clowder,Wildcat-Auxiliary,Wildcat-deployment,wildcat-dashboard-ui
+          permission-contents: write
+          permission-issues: write
+          permission-metadata: read
+
+      - name: Reconcile the saved candidate
+        if: inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          GH_WRITE_TOKEN: ${{ steps.write-token.outputs.token }}
+          GH_ARTIFACT_TOKEN: ${{ github.token }}
+          PLAN_ARTIFACT_ID: ${{ steps.candidate.outputs.artifact-id || steps.prepare.outputs.artifact_id }}
+        run: python3 .github/scripts/release-train.py --apply "$RUNNER_TEMP/release-train-plan.json"

@@ -221,3 +221,17 @@ Every label a `dependabot.yml` can ask for is in `required` rather than
 `managed`, deliberately. Dependabot applies only labels that already exist and
 **fails the update** when one is missing, so a label that exists everywhere costs
 nothing next to an update that does not run.
+
+## Release trains
+
+| Workflow | Script | Writes | Reports |
+| --- | --- | --- | --- |
+| `release-train.yml` | `release-train.py` | annotated tags and releases in the five members; dashboard snapshot issue | exact candidate, master checks, shared-crate revisions, migrations and image-build starts |
+
+See [the release contract](https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md), introduced by PR #36. Merge PR #39 and inspect a native dry-run dispatch from `master` before cutting a real train.
+
+A new dispatch takes `product`; recovery takes the original `resume_run_id` and leaves `product` blank. `dry_run` defaults to true. Preparation records all five full SHAs and the UTC tag in the immutable `release-train-plan` Actions artifact before any tags are written. Its retention is 90 days; an expired or missing plan stops recovery instead of recapturing current heads. Rerunning an attempt restores that run's original candidate. A new dispatch can resume the original dry-run to cut exactly what was inspected.
+
+The read token is scoped to the five members plus `bcr-common`, with Contents, Checks, Actions, Issues and Metadata read access. The write token is minted only for a real cut and grants Contents/Issues write and Metadata read in the five members. Artifact reads use the current repository's `GITHUB_TOKEN`. The App installation must grant Actions read; the application request alone is insufficient.
+
+Pull requests execute only `python3 .github/scripts/test_release_train.py`, without App credentials. The operational job is dispatch-only and writes only from `master`. Matching tag/release readback makes retry safe after a lost response. A started image build is not proof of a successful build or deployment; wait for the four successful builds before the separate deployment step.
