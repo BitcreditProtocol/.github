@@ -12,8 +12,7 @@
 #
 # App permissions. The App was set up with Metadata, Issues, Administration,
 # Contents and Dependabot alerts, which is what everything above the credential
-# checks needs. The checks added since need more, and none of them is granted at
-# the time of writing:
+# checks needs. Additional reads are probed at runtime; a grant can change:
 #
 #   Members: read                organisation      environment reviewers
 #   Secrets: read                organisation      shadowing, not-granted
@@ -23,6 +22,7 @@
 #   Variables: read              repository        orphaned credentials
 #   Environments: read           repository        unprotected environments,
 #                                                  non-member reviewers
+#   Pages: read                  repository        public Pages sites
 #
 # Each is probed once at startup rather than assumed, and whatever is missing is
 # named in a "Not measured on this run" section. A check whose input could not be
@@ -88,6 +88,33 @@ gh api "orgs/$ORG/repos?per_page=100" --paginate --slurp > "$WORK/repos.json"
 : > "$WORK/gaps"
 gap() { echo "$1" >> "$WORK/gaps"; }
 
+# Keep transport errors out of data. Return 44 only for an explicit HTTP 404;
+# each caller decides whether absence is expected for that endpoint.
+read_api() {
+  local endpoint=$1 output=$2
+  shift 2
+  if gh api "$endpoint" "$@" > "$output" 2>"$WORK/read-error"; then
+    return 0
+  fi
+  : > "$output"
+  if grep -q '(HTTP 404)' "$WORK/read-error"; then return 44; fi
+  gap "$endpoint — $(tr '\n' ' ' < "$WORK/read-error")"
+  return 1
+}
+
+read_count() {
+  local endpoint=$1
+  if read_api "$endpoint" "$WORK/count.json"; then
+    if jq -er '.total_count | select(type == "number" and . >= 0 and . == floor)' "$WORK/count.json"; then
+      return 0
+    fi
+    gap "$endpoint — invalid count response"
+  else
+    [ "$?" != 44 ] || gap "$endpoint — HTTP 404, count unknown"
+  fi
+  return 1
+}
+
 have_props=""
 if gh api "orgs/$ORG/properties/values?per_page=100" --paginate --slurp > "$WORK/props.json" 2>/dev/null \
    && jq -e 'type == "array"' "$WORK/props.json" >/dev/null 2>&1; then
@@ -148,7 +175,7 @@ fi
 # once against this repository, because the answer describes the token and not
 # the target, and probing per repository would cost 29 requests to learn one
 # fact.
-have_reposecrets=""; have_repovars=""; have_envs=""; envsec_gap=""
+have_reposecrets=""; have_repovars=""; have_envs=""
 if gh api "repos/$ORG/.github/actions/secrets?per_page=1" >/dev/null 2>&1; then
   have_reposecrets=1
 else
@@ -167,16 +194,17 @@ fi
 
 # Pages needs its own probe shape, because here a failure is ambiguous in a way
 # the others are not: 403 is "no permission" and 404 is "this repository has no
-# site", and a repository with no site is the normal case. Testing only the exit
-# code would declare the permission missing on any organisation whose .github
-# repository does not publish, so the error text decides. Succeeded, or failed
-# for any reason other than the App wall, means the endpoint is readable.
+# site", and a repository with no site is the normal case. Other failures are
+# unknown, never evidence that the endpoint is readable.
 have_pages=""
-if gh api "repos/$ORG/.github/pages" >/dev/null 2>"$WORK/pageprobe" \
-   || ! grep -q 'Resource not accessible by integration' "$WORK/pageprobe"; then
-  have_pages=1
+if read_api "repos/$ORG/.github/pages" "$WORK/pageprobe"; then
+  if jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pageprobe" >/dev/null 2>&1; then
+    have_pages=1
+  else
+    gap "Pages permission probe — invalid response"
+  fi
 else
-  gap "Pages sites — needs \`Pages: read\`; the check for a repository publishing a public site is skipped"
+  [ "$?" != 44 ] || have_pages=1
 fi
 
 # Counters for the metrics that are deliberately not findings.
@@ -278,8 +306,18 @@ while IFS= read -r repo; do
   # of repository names, so a repository that later gains a manifest starts being
   # reported without anyone editing this script.
   branch=$(echo "$meta" | jq -r '.default_branch')
-  gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
-    --jq '[.tree[]? | select(.type == "blob") | .path] | join("\n")' 2>/dev/null > "$WORK/tree.all" || : > "$WORK/tree.all"
+  tree_complete=""
+  if read_api "repos/$ORG/$repo/git/trees/$branch?recursive=1" "$WORK/tree.json"; then
+    if jq -e '.truncated == false and (.tree | type == "array")' "$WORK/tree.json" >/dev/null 2>&1; then
+      jq -r '[.tree[] | select(.type == "blob") | .path] | join("\n")' "$WORK/tree.json" > "$WORK/tree.all"
+      tree_complete=1
+    else
+      gap "$repo workflow tree — truncated or invalid response"
+    fi
+  else
+    [ "$?" != 44 ] || gap "$repo workflow tree — HTTP 404"
+  fi
+  [ -n "$tree_complete" ] || : > "$WORK/tree.all"
 
   # Vendored and generated paths carry manifests that are not ours to update.
   # Dependabot pointed at a vendored copy would diverge it from upstream, so a
@@ -443,6 +481,7 @@ while IFS= read -r repo; do
   # attestations: write and produced no attestation, while ten container images
   # shipped with no provenance at all.
   : > "$WORK/wfbody"
+  workflows_complete="$tree_complete"
   : > "$WORK/prt"
   : > "$WORK/floating"
   : > "$WORK/idtoken"
@@ -455,7 +494,13 @@ while IFS= read -r repo; do
     # that window does it -- and the weekly audit died with no report. And gh
     # writes its error body to stdout, so [ -z ] could never have been the guard.
     # [ -z ] stays for what it does cover: an empty file, empty with status 0.
-    body=$(gh api "repos/$ORG/$repo/contents/$wf?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null) || continue
+    if read_api "repos/$ORG/$repo/contents/$wf?ref=$branch" "$WORK/workflow.raw" -H "Accept: application/vnd.github.raw"; then
+      body=$(cat "$WORK/workflow.raw")
+    else
+      [ "$?" != 44 ] || gap "$repo workflow $wf — disappeared after the tree was read"
+      workflows_complete=""
+      continue
+    fi
     [ -z "$body" ] && continue
     # kept for the credential check below: these bodies are already paid for here
     printf '%s\n' "$body" >> "$WORK/wfbody"
@@ -580,7 +625,7 @@ while IFS= read -r repo; do
   # since January, and granting the secret to satisfy it would have widened the
   # blast radius for nothing. Live branches block a deletion; dead ones must not
   # block it. Ninety days is where that line sits.
-  if [ -s "$WORK/wfbody" ] && [ -n "$have_reposecrets" ]; then
+  if [ -n "$workflows_complete" ] && [ -s "$WORK/wfbody" ] && [ -n "$have_reposecrets" ]; then
     { gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate \
         --jq '.secrets[]?.name' 2>/dev/null
       if [ -n "$have_repovars" ]; then
@@ -764,16 +809,31 @@ while IFS= read -r repo; do
   # keeps AI-Credit (its own tobo-ai-credit-testnet-N scheme) and the crowdin-sdk
   # fork (21 upstream tags) out, and it lets either in on the day it cuts a first
   # release, with no edit here. Owner decision 2026-09-02.
-  top_tag=$(gh api "repos/$ORG/$repo/tags?per_page=1" --jq '.[0].name // empty' 2>/dev/null || true)
-  if [ -n "$top_tag" ] && ! gh api "repos/$ORG/$repo/releases/tags/$top_tag" >/dev/null 2>&1; then
-    # Only now is it worth asking whether this repository releases at all. The
-    # question costs a request and its answer only matters once that tag has
-    # turned out to have no release, which is true in four repositories out
-    # of twenty-nine -- so asking first spent a request on all twenty-nine.
-    n_rel=$(gh api "repos/$ORG/$repo/releases?per_page=1" --jq 'length' 2>/dev/null || echo 0)
-    case "$n_rel" in ''|*[!0-9]*) n_rel=0 ;; esac
-    [ "$n_rel" = "0" ] ||
-      echo "$repo|highest-versioned tag \`$top_tag\` has no GitHub release" >> "$WORK/findings"
+  if read_api "repos/$ORG/$repo/tags?per_page=1" "$WORK/tags.json"; then
+    if ! top_tag=$(jq -er 'if type == "array" then (if length == 0 then "" else .[0].name | strings end) else error("invalid tags") end' "$WORK/tags.json"); then
+      gap "$repo highest-versioned tag — invalid response"
+    elif [ -n "$top_tag" ]; then
+      if ! git check-ref-format "refs/tags/$top_tag" >/dev/null 2>&1; then
+        gap "$repo highest-versioned tag — invalid tag name"
+      else
+        encoded_tag=$(jq -nr --arg tag "$top_tag" '$tag | @uri')
+        if read_api "repos/$ORG/$repo/releases/tags/$encoded_tag" "$WORK/release.json"; then
+          jq -e '.id | type == "number"' "$WORK/release.json" >/dev/null 2>&1 || gap "$repo release for $top_tag — invalid response"
+        elif [ "$?" = 44 ]; then
+          if read_api "repos/$ORG/$repo/releases?per_page=1" "$WORK/releases.json"; then
+            if ! n_rel=$(jq -er 'if type == "array" then length else error("invalid releases") end' "$WORK/releases.json"); then
+              gap "$repo release history — invalid response"
+            elif [ "$n_rel" != 0 ]; then
+              echo "$repo|highest-versioned tag \`$top_tag\` has no GitHub release" >> "$WORK/findings"
+            fi
+          else
+            [ "$?" != 44 ] || gap "$repo release history — HTTP 404"
+          fi
+        fi
+      fi
+    fi
+  else
+    [ "$?" != 44 ] || gap "$repo tag listing — HTTP 404"
   fi
 
   # A repository publishing a public Pages site. Not a defect by itself -- one
@@ -781,13 +841,15 @@ while IFS= read -r repo; do
   # repository serving a public site is an exposure nobody chose on purpose, so
   # the visibility of the repository is reported beside the URL.
   if [ -n "$have_pages" ]; then
-    pg=$(gh api "repos/$ORG/$repo/pages" 2>/dev/null || true)
-    pg_url=$(echo "$pg" | jq -r '.html_url // empty' 2>/dev/null || true)
-    pg_public=$(echo "$pg" | jq -r '.public // false' 2>/dev/null || echo false)
-    if [ -n "$pg_url" ] && [ "$pg_public" = "true" ]; then
-      pg_src=$(echo "$pg" | jq -r '.source.branch // "?"' 2>/dev/null || echo "?")
-      vis=$(echo "$meta" | jq -r '.visibility')
-      echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
+    if read_api "repos/$ORG/$repo/pages" "$WORK/pages.json"; then
+      if ! jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pages.json" >/dev/null 2>&1; then
+        gap "$repo Pages site — invalid response"
+      elif [ "$(jq -r .public "$WORK/pages.json")" = true ]; then
+        pg_url=$(jq -r .html_url "$WORK/pages.json")
+        pg_src=$(jq -r '.source.branch // "?"' "$WORK/pages.json")
+        vis=$(echo "$meta" | jq -r '.visibility')
+        echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
+      fi
     fi
   fi
 
@@ -795,7 +857,8 @@ while IFS= read -r repo; do
   # Counted here as a flag, which is a fact, and left as a metric rather than a
   # finding by owner decision 2026-09-02 -- three wiki questions are still open,
   # and three findings a week ahead of the answer is noise.
-  if [ "$(echo "$meta" | jq -r '.has_wiki')" = "true" ]; then
+  has_wiki=$(echo "$meta" | jq -r '.has_wiki')
+  if [ "$has_wiki" = "true" ]; then
     n_wiki=$((n_wiki + 1))
     echo "$repo ($(echo "$meta" | jq -r '.visibility'))" >> "$WORK/wikirepos"
   fi
@@ -804,7 +867,7 @@ while IFS= read -r repo; do
   # for an internal or private one "no content" and "no access" look identical.
   # Checking those reported the two repositories that actually use their wiki as
   # empty, which is worse than not checking at all.
-  if [ "$(echo "$meta" | jq -r '.has_wiki')" = "true" ] &&
+  if [ "$has_wiki" = "true" ] &&
      [ "$(echo "$meta" | jq -r '.visibility')" = "public" ]; then
     git ls-remote "https://github.com/$ORG/$repo.wiki.git" >/dev/null 2>&1 ||
       echo "$repo|wiki enabled but empty" >> "$WORK/findings"
@@ -839,7 +902,7 @@ while IFS= read -r repo; do
   # file makes granted secrets look ungranted, which fault injection caught
   # after the sibling check had already been gated and this one had not.
   notgranted=""
-  while [ -n "$have_orgsecrets" ] && IFS= read -r s; do
+  while [ -n "$have_orgsecrets" ] && [ -n "$workflows_complete" ] && IFS= read -r s; do
     [ -z "$s" ] && continue
     grep -qE "secrets\.$s([^A-Za-z0-9_]|\$)" "$WORK/wfbody" || continue
     grep -qxF "$s" "$WORK/reposecrets" && continue
@@ -868,12 +931,7 @@ while IFS= read -r repo; do
       # fallback appends to it rather than replacing it and ns became the whole
       # 403 JSON -- which is not "0", so every environment was reported as holding
       # secrets. Unreadable is skipped and named once, never counted as a number.
-      if ! ns=$(gh api "repos/$ORG/$repo/environments/$env/secrets" --jq '.total_count' 2>/dev/null); then
-        [ -n "$envsec_gap" ] || gap "environment secret counts — needs \`Secrets: read\`; the unprotected-environment check is skipped"
-        envsec_gap=1
-        continue
-      fi
-      case "$ns" in ''|*[!0-9]*) ns=0 ;; esac
+      ns=$(read_count "repos/$ORG/$repo/environments/$env/secrets") || continue
       # if, not [ ] && -- this while is the right-hand side of a pipeline, so its
       # body's last command is the pipeline's exit status, and a false AND-list
       # there aborts the whole script under set -e. Demonstrated, not assumed:
@@ -1000,9 +1058,19 @@ if [ -f "$rt_script" ]; then
 fi
 
 : > "$WORK/trainrefs"
+train_complete=1
 for m in $TRAIN_MEMBERS; do
-  gh api "repos/$ORG/$m/git/matching-refs/tags/v" \
-    --jq '.[].ref | sub("^refs/tags/"; "")' 2>/dev/null > "$WORK/trainone" || : > "$WORK/trainone"
+  if read_api "repos/$ORG/$m/git/matching-refs/tags/v" "$WORK/train.json"; then
+    if ! jq -er 'if type == "array" and all(.[]; .ref | type == "string") then [.[] .ref | sub("^refs/tags/"; "")] | join("\n") else error("invalid refs") end' "$WORK/train.json" > "$WORK/trainone"; then
+      gap "$m train tags — invalid response; completeness not measured"
+      train_complete=""
+      continue
+    fi
+  else
+    [ "$?" != 44 ] || gap "$m train tags — HTTP 404; completeness not measured"
+    train_complete=""
+    continue
+  fi
   while IFS= read -r t; do
     [ -z "$t" ] && continue
     case "$t" in
@@ -1011,7 +1079,7 @@ for m in $TRAIN_MEMBERS; do
   done < "$WORK/trainone"
 done
 cut -d'|' -f1 "$WORK/trainrefs" | sort -u > "$WORK/trainnames"
-while IFS= read -r t; do
+while [ -n "$train_complete" ] && IFS= read -r t; do
   [ -z "$t" ] && continue
   awk -F'|' -v t="$t" '$1 == t {print $2}' "$WORK/trainrefs" | sort -u > "$WORK/trainhave"
   n_have=$(wc -l < "$WORK/trainhave" | tr -d ' ')
@@ -1032,8 +1100,7 @@ if [ -n "$have_reposecrets" ]; then
   jq -r 'add | .[] | select(.archived == true) | .name' "$WORK/repos.json" > "$WORK/archived"
   while IFS= read -r arch; do
     [ -z "$arch" ] && continue
-    ns=$(gh api "repos/$ORG/$arch/actions/secrets" --jq '.total_count' 2>/dev/null || echo 0)
-    case "$ns" in ''|*[!0-9]*) ns=0 ;; esac
+    ns=$(read_count "repos/$ORG/$arch/actions/secrets") || continue
     if [ "$ns" != "0" ]; then
       echo "$arch|archived, but still holds $ns repository secret(s) — archiving does not revoke a credential" >> "$WORK/findings"
     fi
@@ -1083,10 +1150,16 @@ have_surface=""
 : > "$WORK/secsurface"
 if [ -n "$have_reposecrets" ] && [ -n "$have_envs" ]; then have_surface=1; fi
 while [ -n "$have_surface" ] && read -r repo; do
-  n=$(gh api "repos/$ORG/$repo/actions/secrets" --jq '.total_count' 2>/dev/null || echo 0)
-  n=${n:-0}
+  if ! n=$(read_count "repos/$ORG/$repo/actions/secrets"); then have_surface=""; break; fi
   repo_level=$((repo_level + n))
-  envs=$(gh api "repos/$ORG/$repo/environments?per_page=100" 2>/dev/null || echo '{}')
+  if ! read_api "repos/$ORG/$repo/environments?per_page=100" "$WORK/surface-envs.json"; then
+    gap "$repo secret surface — environments unavailable"
+    have_surface=""; break
+  fi
+  if ! jq -e '.environments | type == "array"' "$WORK/surface-envs.json" >/dev/null 2>&1; then
+    gap "$repo secret surface — invalid environments response"
+    have_surface=""; break
+  fi
   g=0
   u=0
   # protection_rules is empty for an unprotected environment, so its length is the
@@ -1094,11 +1167,10 @@ while [ -n "$have_surface" ] && read -r repo; do
   # nothing either way.
   while IFS=$'\t' read -r ename prot; do
     [ -z "$ename" ] && continue
-    es=$(gh api "repos/$ORG/$repo/environments/$ename/secrets" --jq '.total_count' 2>/dev/null || echo 0)
-    es=${es:-0}
+    if ! es=$(read_count "repos/$ORG/$repo/environments/$ename/secrets"); then have_surface=""; break; fi
     [ "$es" -eq 0 ] && continue
     if [ "$prot" = "0" ]; then u=$((u + es)); else g=$((g + es)); fi
-  done < <(printf '%s' "$envs" | jq -r '.environments[]? | [.name, ((.protection_rules//[])|length)] | @tsv')
+  done < <(jq -r '.environments[] | [.name, ((.protection_rules//[])|length)] | @tsv' "$WORK/surface-envs.json")
   gated=$((gated + g))
   ungated_env=$((ungated_env + u))
   if [ $((n + g + u)) -gt 0 ]; then
@@ -1126,6 +1198,8 @@ done < "$WORK/repos"
     echo "| repository | finding |"
     echo "| --- | --- |"
     sort "$WORK/findings" | awk -F'|' '{printf "| `%s` | %s |\n", $1, $2}'
+  elif [ -s "$WORK/gaps" ]; then
+    echo "No drift found in the completed checks; coverage is incomplete."
   else
     echo "No drift found."
   fi
@@ -1195,7 +1269,7 @@ if [ -s "$WORK/findings" ]; then
       | gh api -X POST "repos/$REPORT_REPO/issues" --input - --jq '.number')
     echo "Opened issue #$n ($count findings)"
   fi
-elif [ -n "$existing" ]; then
+elif [ -n "$existing" ] && [ ! -s "$WORK/gaps" ]; then
   gh api -X POST "repos/$REPORT_REPO/issues/$existing/comments" \
     -f "body=No drift found across $total repositories. Closing; it will reopen if anything drifts again." >/dev/null
   gh api -X PATCH "repos/$REPORT_REPO/issues/$existing" -f state=closed >/dev/null
