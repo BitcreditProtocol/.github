@@ -102,6 +102,21 @@ read_api() {
   return 1
 }
 
+# Validate every row before projecting paths or workflow blobs. These consumers
+# use line/TSV records, so paths with control characters cannot be measured.
+valid_tree() {
+  jq -e '
+    type == "object" and .truncated == false and (.tree | type == "array")
+    and all(.tree[];
+      type == "object" and (.path | type == "string") and (.path | length > 0)
+      and (.path | test("[[:cntrl:]]") | not)
+      and (.path | split("/") | all(. != "" and . != "." and . != ".."))
+      and (.type == "blob" or .type == "tree" or .type == "commit")
+      and (.sha | type == "string") and (.sha | test("^[0-9a-f]{40}$")))
+    and ((.tree | length) == (.tree | unique_by(.path) | length))
+    ' "$1" >/dev/null 2>&1
+}
+
 read_count() {
   local endpoint=$1
   if read_api "$endpoint" "$WORK/count.json"; then
@@ -224,21 +239,6 @@ if gh api "repos/$ORG/.github/environments?per_page=1" >/dev/null 2>&1; then
   have_envs=1
 else
   gap "environments — needs \`Environments: read\`; the unprotected-environment check, the non-member-reviewer check and the environment half of the secret surface are skipped"
-fi
-
-# Pages needs its own probe shape, because here a failure is ambiguous in a way
-# the others are not: 403 is "no permission" and 404 is "this repository has no
-# site", and a repository with no site is the normal case. Other failures are
-# unknown, never evidence that the endpoint is readable.
-have_pages=""
-if read_api "repos/$ORG/.github/pages" "$WORK/pageprobe"; then
-  if jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pageprobe" >/dev/null 2>&1; then
-    have_pages=1
-  else
-    gap "Pages permission probe — invalid response"
-  fi
-else
-  [ "$?" != 44 ] || have_pages=1
 fi
 
 # Counters for the metrics that are deliberately not findings.
@@ -366,7 +366,7 @@ while IFS= read -r repo; do
   branch=$(echo "$meta" | jq -r '.default_branch')
   tree_complete=""
   if read_api "repos/$ORG/$repo/git/trees/$branch?recursive=1" "$WORK/tree.json"; then
-    if jq -e '.truncated == false and (.tree | type == "array")' "$WORK/tree.json" >/dev/null 2>&1; then
+    if valid_tree "$WORK/tree.json"; then
       jq -r '[.tree[] | select(.type == "blob") | .path] | join("\n")' "$WORK/tree.json" > "$WORK/tree.all"
       tree_complete=1
     else
@@ -771,7 +771,7 @@ while IFS= read -r repo; do
           [ -z "$bname" ] && continue
           [ "$bname" = "$branch" ] && continue
           if ! read_api "repos/$ORG/$repo/git/trees/$bname?recursive=1" "$WORK/branch-tree.json" ||
-             ! jq -e '.truncated == false and (.tree | type == "array")' "$WORK/branch-tree.json" >/dev/null 2>&1; then
+             ! valid_tree "$WORK/branch-tree.json"; then
             cred_unknown="the complete tree of branch $bname"
             break
           fi
@@ -950,16 +950,16 @@ while IFS= read -r repo; do
   # repository is a documentation site and is meant to -- but an internal
   # repository serving a public site is an exposure nobody chose on purpose, so
   # the visibility of the repository is reported beside the URL.
-  if [ -n "$have_pages" ]; then
-    if read_api "repos/$ORG/$repo/pages" "$WORK/pages.json"; then
-      if ! jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pages.json" >/dev/null 2>&1; then
-        gap "$repo Pages site — invalid response"
-      elif [ "$(jq -r .public "$WORK/pages.json")" = true ]; then
-        pg_url=$(jq -r .html_url "$WORK/pages.json")
-        pg_src=$(jq -r '.source.branch // "?"' "$WORK/pages.json")
-        vis=$(echo "$meta" | jq -r '.visibility')
-        echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
-      fi
+  # Read each repository independently: one inaccessible site says nothing about
+  # another repository. read_api records failures and keeps confirmed 404 absence distinct.
+  if read_api "repos/$ORG/$repo/pages" "$WORK/pages.json"; then
+    if ! jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pages.json" >/dev/null 2>&1; then
+      gap "$repo Pages site — invalid response"
+    elif [ "$(jq -r .public "$WORK/pages.json")" = true ]; then
+      pg_url=$(jq -r .html_url "$WORK/pages.json")
+      pg_src=$(jq -r '.source.branch // "?"' "$WORK/pages.json")
+      vis=$(echo "$meta" | jq -r '.visibility')
+      echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
     fi
   fi
 

@@ -267,13 +267,54 @@ jobs:
         self.assertIn('KEEP_ME is read by no workflow on any branch — safe to delete', control)
         self.assertIn('references organisation secret(s) it was not granted: ORG_ONLY', control)
 
+    def test_malformed_tree_rows_leave_dependent_checks_unmeasured(self):
+        files = {'.github/workflows/check.yml': 'on: push\njobs: {}\n# secrets.ORG_ONLY\n'}
+        valid = dict(path='.github/workflows/check.yml', type='blob', sha='a'*40)
+        hidden = dict(path='.github/workflows/hidden.yml', type='blob', sha='b'*40)
+        malformed = [None, {k: v for k, v in hidden.items() if k != 'type'},
+                     {**hidden, 'type': 'unknown'}, {**hidden, 'path': None}, {**hidden, 'path': ''},
+                     {**hidden, 'path': 'invalid\nworkflow.yml'}, {**hidden, 'sha': None},
+                     {**hidden, 'sha': 'not-a-sha'}, valid]
+        base = {'orgs/Fixture/actions/secrets': [200, {'total_count': 1, 'secrets': [{'name': 'ORG_ONLY'}]}],
+                'repos/Fixture/.github/issues': [200, [{'number': 123, 'title': 'Repository settings drift'}]]}
+        for row in malformed:
+            with self.subTest(row=row):
+                summary, writes = self.run_audit({**base, 'repos/Fixture/demo/git/trees/master':
+                    [200, {'truncated': False, 'tree': [valid, row]}]}, files=files, dry_run=False)
+                self.assertIn('workflow tree', summary)
+                self.assertIn('coverage is incomplete', summary)
+                self.assertNotIn('— safe to delete', summary)
+                self.assertNotIn('references organisation secret(s)', summary)
+                self.assertEqual(writes, [])
+
+    def test_malformed_other_branch_rows_cannot_prove_credential_absence(self):
+        hidden = dict(path='.github/workflows/hidden.yml', type='blob', sha='b'*40)
+        for row in ({k: v for k, v in hidden.items() if k != 'type'},
+                    {**hidden, 'path': None}, {**hidden, 'sha': None}, {**hidden, 'sha': '../invalid'}):
+            with self.subTest(row=row):
+                faults = {'repos/Fixture/demo/branches': [200, [{'name': 'master'}, {'name': 'feature'}]],
+                          'repos/Fixture/demo/git/trees/feature': [200, {'truncated': False, 'tree': [row]}]}
+                summary = self.run_audit(faults, files={'.github/workflows/check.yml': 'on: push\njobs: {}\n'})
+                self.assertIn('UNKNOWN', summary)
+                self.assertNotIn('— safe to delete', summary)
+
+    def test_valid_tree_kinds_and_empty_tree_remain_measured(self):
+        rows = [dict(path='.github', type='tree', sha='b'*40),
+                dict(path='submodule', type='commit', sha='c'*40),
+                dict(path='.github/workflows/check.yml', type='blob', sha='a'*40)]
+        for tree in (rows, []):
+            with self.subTest(tree=tree):
+                summary = self.run_audit({'repos/Fixture/demo/git/trees/master': [200, {'truncated': False, 'tree': tree}]},
+                                        files={'.github/workflows/check.yml': 'on: push\njobs: {}\n# secrets.KEEP_ME\n'})
+                self.assertNotIn('Not measured on this run', summary)
+
     def test_incomplete_train_is_unknown(self):
         summary = self.run_audit({'repos/Fixture/Clowder/git/matching-refs/tags/v':[500,{}]})
         self.assertIn('Not measured on this run', summary)
         self.assertNotIn('was cut in', summary)
 
     def test_pages_and_archived_counts_are_not_false_zeroes(self):
-        for route, data in (('repos/Fixture/.github/pages',[500,{}]),
+        for route, data in (('repos/Fixture/demo/pages',[500,{}]),
                             ('repos/Fixture/demo/pages',[429,{}]),
                             ('repos/Fixture/archived/actions/secrets',[403,{}]),
                             ('repos/Fixture/archived/actions/secrets',[200,{'total_count':None}]),
@@ -282,6 +323,29 @@ jobs:
                 summary = self.run_audit({route:data})
                 self.assertIn('Not measured on this run', summary)
                 self.assertNotIn('archived, but still holds', summary)
+
+    def test_pages_are_read_independently_for_every_repository(self):
+        meta = dict(archived=False, default_branch='master', fork=False, description='Fixture',
+                    visibility='private', has_issues=True, has_wiki=False, allow_merge_commit=True,
+                    allow_squash_merge=True, allow_rebase_merge=True, delete_branch_on_merge=True,
+                    allow_update_branch=True)
+        base = {'orgs/Fixture/repos': [200, [{**meta, 'name': name} for name in ('.github', 'demo')]],
+                'repos/Fixture/.github': [200, {**meta, 'name': '.github'}],
+                'orgs/Fixture/properties/values': [200, [dict(repository_name=name,
+                    properties=[dict(property_name='stack', value='infra')]) for name in ('.github', 'demo')]],
+                'repos/Fixture/demo/pages': [200, {'html_url': 'https://example.test/demo/', 'public': True,
+                                                'source': {'branch': 'gh-pages'}}]}
+        for response in ([403, {}], [429, {}], [503, {}], [200, {'html_url': None, 'public': True}]):
+            with self.subTest(response=response):
+                summary = self.run_audit({**base, 'repos/Fixture/.github/pages': response})
+                self.assertIn('Not measured on this run', summary)
+                self.assertIn('private repository publishes a public Pages site at https://example.test/demo/', summary)
+        for response in ([404, {}], [200, {'html_url': 'https://example.test/private/', 'public': False}]):
+            with self.subTest(response=response):
+                summary = self.run_audit({**base, 'repos/Fixture/.github/pages': response})
+                self.assertNotIn('Not measured on this run', summary)
+                self.assertIn('public Pages site at https://example.test/demo/', summary)
+                self.assertNotIn('public Pages site at https://example.test/private/', summary)
 
     def test_failed_community_reads_cannot_close_the_existing_issue(self):
         files = {'.github/workflows/check.yml': 'on: push\njobs: {}\n# secrets.KEEP_ME\n',
