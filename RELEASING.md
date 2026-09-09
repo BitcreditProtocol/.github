@@ -1,7 +1,7 @@
 # Releasing
 
-This is the organisation-wide release contract. Update this file when the
-contract changes.
+This contract covers the product release workflows below. Update it when their
+behaviour changes. Governance retains its separate process.
 
 ## The two kinds
 
@@ -61,12 +61,11 @@ whole tag fails to parse. `type=semver` would produce nothing.
 
 ### Prepare, cut and resume
 
-**Before the first real cut, merge [PR #39][release-train-pr], then run the native
-`release-train.yml` workflow from `master` with `dry_run=true`.** Inspect its
-summary and saved candidate before enabling writes. The workflow requires the
-automation GitHub App to be configured.
+**Prepare each new candidate with the native `release-train.yml` workflow from
+`master` and `dry_run=true`.** Inspect its summary and saved candidate before
+enabling writes. The automation GitHub App must be configured.
 
-After that merge, prepare a candidate without writing tags, releases or issues:
+Preparation does not write tags, releases or issues:
 
 ```bash
 gh workflow run release-train.yml --repo BitcreditProtocol/.github --ref master \
@@ -116,8 +115,17 @@ gh workflow run deploy.yml --repo BitcreditProtocol/Wildcat-deployment \
   --ref "$TRAIN" -f environment="$DEPLOY_ENVIRONMENT" -f image_tag="${TRAIN#v}"
 ```
 
-`deploy.yml` is the dispatch entrypoint; it calls the reusable
-`deploy-wildcat.yml` workflow. Check the deployment result separately.
+`deploy.yml` routes the selected environment to `deploy-wildcat.yml` or
+`deploy-gcp.yml`. Deployments of one target serialize across branches and tags;
+a new run does not cancel the active deployment. The standard GitHub concurrency
+limit keeps only one pending run per target.
+
+Application and reverse-proxy startup use bounded Compose readiness waits and
+independent state checks. Existing healthchecks must pass; a service without a
+healthcheck is confirmed only as running. Success also requires a complete saved
+image manifest. Inspect actual image IDs, available registry digests and capture
+errors in the deployment summary/artifact. Missing digests remain unmeasured.
+These checks do not establish application acceptance or rollback compatibility.
 
 ### Manual fallback
 
@@ -172,7 +180,7 @@ diagnostics; commit distance and source dates do not prove compatibility.
 ## Cutting a release when checks are red
 
 **Gate the exact candidate commits before release writes.** Branch rules do not
-replace this check. The workflow in PR #39 checks all five saved SHAs during
+replace this check. `release-train.yml` checks all five saved SHAs during
 preparation and again before reconciliation.
 
 It considers check suites whose branch is `master` and whose head SHA is the
@@ -221,27 +229,71 @@ then fix forward. Keep the original train tags as the release record.
 
 ## Package releases
 
-Package release workflows include:
+| Line | Workflow | Version/source identity | Saved output | First publication write |
+|---|---|---|---|---|
+| Wildcat train | `.github/release-train.yml` | Product input, UTC tag, five saved SHAs | `release-train-plan` Actions artifact, 90 days | First missing annotated tag |
+| WASM | `Bitcredit-Core/wasm_release.yml` | Workspace Cargo version, matching generated npm manifest, saved SHA | `release-package`: tarball, release assets and checksums, 90 days | First missing tag |
+| UI library | `ui/npm_release.yml` | SemVer tag applied to the two staged package manifests, saved SHA | `release-package`: separate npmjs/GitHub tarballs and checksums, 90 days | First missing registry version |
+| Mobile candidate | `wallet/build-candidate.yml` | Tag marketing version, resolved build number and original run/SHA | Original APK/IPA Actions artifacts; `candidate-manifest.json` in GitHub release | Store candidate upload, before the later GitHub asset job |
+| Precompiled binaries | `Wallet-Core/cd_precompiled.yml` | Cargokit content-derived key and the tag's original build SHA | `precompiled_<hash>` release with binary/signature pairs | Release creation or metadata update, before target reconciliation |
 
-| repository | workflow | trigger |
-|---|---|---|
-| `Bitcredit-Core` | `wasm_release.yml` — npm publish and the GitHub release | `workflow_dispatch`, `environment: release-wasm` |
-| `wallet` | `build-candidate.yml` — creates the release if absent | `push: tags: v*.*.*` |
-| `ui` | `npm_release.yml` — publishes to npmjs and GitHub Packages | `push: tags: v*` |
-| `Wallet-Core` | cargokit publishes the `precompiled_*` releases | build |
+Workflow filenames above live under each repository's `.github/workflows/`.
+For every package candidate, inspect that repository's CI at the source SHA and
+its workflow-specific evidence before approving publication. The train gate does
+not validate independent packages. Environment settings are the source of truth
+for required reviewers; repository instructions describe their release inputs.
 
-For `ui`, package publishing is automated; create and document its GitHub release
-separately.
+### Package channels and prepared bytes
 
-Package release tags keep the plain `vX.Y.Z` form, with no date. They are the
-repository's own numbering, and the absence of a date suffix is what tells them
-apart from a train tag.
+WASM and UI prepare their exact publication bytes before the first write and
+retain immutable artifacts with original run identity and checksums. A repeat
+verifies existing remote content; matching results are preserved, missing results
+are added, and conflicts or unreadable state stop the operation. Never substitute
+fresh build output to complete a version that has already been published.
+
+Stable packages use npm `latest`. WASM prereleases use `next`. UI prereleases with
+first identifier `alpha`, `beta`, `rc` or `test` use that named channel; other UI
+prereleases use `next`. SemVer build metadata stays in source tags and package
+manifests, but does not create a distinct npm registry version identity.
+
+WASM keeps its GitHub release draft until assets and npm integrity are confirmed.
+UI's GitHub release is still created and documented separately. Package versions
+use repository-owned SemVer tags without the train date suffix. Cargokit's
+`precompiled_<hash>` tags are a separate existing content-derived convention.
+
+### Recover the original operation
+
+For a train, dispatch `release-train.yml` with the original `resume_run_id` while
+its 90-day candidate artifact remains available. This is a new dispatch restoring
+saved state, so it does not rely on the native rerun window.
+
+For WASM and UI, use **Re-run failed jobs** or **Re-run all jobs** on the original
+run to restore saved archives. For wallet, if both mobile jobs succeeded, rerun
+only the failed GitHub asset job; it reuses the original APK/IPA files and build
+number. A stable candidate manifest and checksums protect those identities.
+`promote-release.yml` continues to promote existing store builds without rebuilding.
+
+GitHub's [native rerun window][reruns] is 30 days. Longer artifact retention does
+not extend it. Missing, expired, ambiguous or conflicting recovery data requires
+an operator recovery decision; a fresh run must not silently adopt a previous
+publication. Native regression and packaging checks do not exercise production
+registry authentication, store delivery or a hosted deployment.
+
+For Wallet-Core, complete platform targets are preserved during retries;
+incomplete targets are rebuilt by existing Cargokit behaviour. Verify the expected
+three iOS and four Android binary/signature pairs. A retry may update release
+metadata even when all target assets are complete. Consumers verify signatures;
+handled HTTP failures and rejected signatures fall back to a local build, while
+transport errors may stop the build. The vendored
+[content-hash defect #336][crate-hash] remains a developer task; valid signatures
+alone do not prove that the content key distinguishes every meaningful source change.
 
 ## `bcr-common`
 
-The wire crate is being published to **crates.io** — decided 2026-09-01, tracked in
-its own repository. Until that lands, consumers pin git revisions, and that is the
-documented state rather than an oversight.
+The crates.io publication decision is tracked in [bcr-common#219][common-publish],
+with signed wire-format regression coverage tracked in [#209][wire-tests]. These
+remain developer tasks. Until publication lands, consumers pin Git revisions.
+Revision differences and overrides are diagnostic information, not a new train gate.
 
 Resolve the revision each consumer actually uses; do not infer it from the latest
 tag or a manifest version. A `[patch]` or submodule can override a declared tag.
@@ -259,4 +311,7 @@ Questions about a specific repository's build belong in its own `README.md`. How
 contribute at all is in [CONTRIBUTING.md][contributing].
 
 [contributing]: https://github.com/BitcreditProtocol/.github/blob/master/CONTRIBUTING.md
-[release-train-pr]: https://github.com/BitcreditProtocol/.github/pull/39
+[reruns]: https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs
+[crate-hash]: https://github.com/BitcreditProtocol/Wallet-Core/issues/336
+[common-publish]: https://github.com/BitcreditProtocol/bcr-common/issues/219
+[wire-tests]: https://github.com/BitcreditProtocol/bcr-common/issues/209
