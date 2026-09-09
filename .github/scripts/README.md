@@ -4,6 +4,7 @@ Scheduled workflows maintain organisation settings and watch cross-repository de
 
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
+| `watch-openapi.yml` | `watch-openapi.py` | one open dashboard issue | exact Wildcat/master artifact compared with dashboard/dev |
 | `watch-dependency-graph.yml` | `watch-dependency-graph.py` | dependency issues, after explicit activation | exact pins, ranges, revisions, overrides and incomplete reads |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
 | `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | configuration findings, coverage metrics and a list of what it could not read — see below |
@@ -142,6 +143,26 @@ Only marked issues authored by the current automation App are managed; a marker 
 Scheduled runs stay read-only until the repository variable DEPENDENCY_WATCH_ENABLED is exactly true. After this PR merges, dispatch watch-dependency-graph.yml with dry_run=true, inspect its native summary, then enable that variable when notifications are wanted. Manual runs also default to dry_run=true.
 
 The App token requests only Contents/Metadata read and Issues read for a dry run, or Issues write for an enabled run. PRs execute python3 .github/scripts/test_dependency_watch.py without App credentials; the operational job cannot run on pull_request.
+
+## OpenAPI notifications
+
+`watch-openapi.yml` polls every 15 minutes. The interval is a polling schedule,
+not a delivery deadline. It reads the current Wildcat `master` SHA, selects a
+successful `openapi.yml` run for that exact commit, and compares its unexpired
+`openapi.json` artifact with `opt/wildcat/openapi.json` at the captured dashboard
+`dev` SHA. Canonical JSON ignores key order and formatting.
+
+Only the automation App's marked issue is managed. Identical hashes do not
+refresh it. A manual closure dismisses that source hash; a later hash can notify
+again. Confirmed synchronization closes an open issue. Missing, stale, corrupt
+or unreadable evidence leaves the issue unchanged and is reported as unmeasured.
+The generator and generated frontend code are unchanged.
+
+Before merging, run the candidate with `dry_run=true` and inspect the recorded
+SHAs, run and artifact IDs, hashes and planned actions. The synchronized baseline
+must produce zero issue writes. PRs run only offline tests, without App secrets.
+Read tokens cover Wildcat and the dashboard; write tokens cover dashboard issues
+only. No artifact or private-key credential is copied into an issue.
 
 ## Setup
 
