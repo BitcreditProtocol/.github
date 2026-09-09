@@ -111,7 +111,7 @@ def owner_of(dep, spec, owners, ecosystem):
         return producer_of(spec)  # An explicit source never falls back to a package name.
     key = (ecosystem, dep)
     if key in owners and owners[key] is None:
-        raise ValueError(f"ambiguous producer for {dep}")
+        return ""  # Known ambiguous ownership is an unmeasured source.
     return owners.get(key)
 
 
@@ -203,6 +203,8 @@ def edges_from(repo, branch, path, manifests, owners):
     name = PurePosixPath(path).name
 
     def add(dep, producer, pin, kind):
+        if producer == "":
+            kind = "unmeasured"
         if producer != repo and (producer or kind == "unmeasured"):
             edges.append(Edge(repo, branch, path, dep, producer or "", str(pin), kind))
 
@@ -393,7 +395,7 @@ def issue_payload(dep, producer, target, edges, *, resolved=False):
     return {"title": f"{dep}: update exact pins for {producer} {target}", "body": body}
 
 
-def plan_actions(edges, issues_by_repo, gaps, incomplete):
+def plan_actions(edges, issues_by_repo, gaps, incomplete, errors):
     source_incomplete = frozenset(incomplete)
     groups = defaultdict(list)
     for edge in edges:
@@ -429,14 +431,18 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete):
                     continue
             producers = {e.producer for e in locations}
             if len(producers) > 1:
-                raise ValueError(f"{repo}/{dep}: manifests refer to different producers")
+                gaps.append(f"{repo}/{dep}: manifests refer to different producers; issue unchanged")
+                incomplete.add(repo)
+                continue
             producer = next(iter(producers), None)
             exact = [e for e in locations if e.kind == "exact"]
             behind, target = [], None
             if exact:
                 target = latest_release(producer, latest)
                 if target is None:
-                    raise ValueError(f"{producer}: no published full release; exact pins not compared")
+                    gaps.append(f"{producer}: no published full release; exact pins not compared")
+                    incomplete.add(repo)
+                    continue
                 for edge in exact:
                     pin = semver(edge.pin)
                     if pin is None:
@@ -465,7 +471,9 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete):
                 if not locations:
                     # Missing ownership evidence is not proof the pin was removed.
                     # Keep the issue for manual review instead of silently closing it.
-                    raise ValueError(f"{repo}/{dep}: previous dependency is no longer mapped; issue unchanged")
+                    gaps.append(f"{repo}/{dep}: previous dependency is no longer mapped; issue unchanged")
+                    incomplete.add(repo)
+                    continue
                 state = issue_state(existing)
                 if state is None:
                     raise ValueError(f"{repo}/{dep}: open watcher issue has no version state")
@@ -473,7 +481,7 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete):
                 payload.update(state="closed", state_reason="completed")
                 actions.append(dict(repo=repo, dep=dep, kind="close", existing=existing, payload=payload))
         except (APIError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
-            gaps.append(str(exc))
+            errors.append(str(exc))
             incomplete.add(repo)
     # An error found later in this pass must also suppress earlier planned actions
     # for that consumer. No writes happen until the whole pass has finished.
@@ -508,10 +516,9 @@ def apply_action(action):
 
 
 def main():
-    gaps, incomplete, edges, actions, repos = [], set(), [], [], []
-    failed = False
+    gaps, errors, incomplete, edges, actions, repos = [], [], set(), [], [], []
     try:
-        repos, edges = collect_graph(gaps, incomplete)
+        repos, edges = collect_graph(errors, incomplete)
         # Read every issue page before the first write. This also finds issues for
         # dependencies that have been removed entirely since the previous run.
         issues = {}
@@ -527,7 +534,7 @@ def main():
                         if not isinstance(current, dict) or current.get("number") != issue["number"]:
                             raise APIError(f"{repo['name']}: invalid issue detail response")
                         issues[repo["name"]][index] = current
-        actions = plan_actions(edges, issues, gaps, incomplete)
+        actions = plan_actions(edges, issues, gaps, incomplete, errors)
         for action in actions:
             if DRY_RUN:
                 action["result"] = "would " + action["kind"]
@@ -538,8 +545,7 @@ def main():
                 action["result"] = f"FAILED: {exc}"
                 raise
     except (APIError, ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
-        gaps.append(str(exc))
-        failed = True
+        errors.append(str(exc))
     finally:
         with open(SUMMARY, "a") as stream:
             stream.write("## Dependency graph\n\n")
@@ -559,11 +565,16 @@ def main():
             if not actions:
                 stream.write("No issue changes planned from the completed reads.\n")
             if gaps:
-                stream.write("\n### Not measured or stopped\n\n")
+                stream.write("\n### Not measured\n\n")
                 for gap in sorted(set(gaps)):
                     stream.write(f"- {gap}\n")
+            if errors:
+                stream.write("\n### Execution errors\n\n")
+                for error in sorted(set(errors)):
+                    stream.write(f"- {error}\n")
+            if gaps or errors:
                 stream.write("\nThis run does not establish that all exact pins are current.\n")
-    return 1 if failed or gaps else 0
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

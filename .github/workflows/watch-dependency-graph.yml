@@ -22,7 +22,7 @@ on:
       - '.github/scripts/test_dependency_watch.py'
       - '.github/workflows/watch-dependency-graph.yml'
   schedule:
-    - cron: '23 7 * * 1'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:

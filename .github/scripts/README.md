@@ -139,6 +139,8 @@ A manual closure suppresses that target version only. A later release can notify
 
 Only marked issues authored by the current automation App are managed; a marker in somebody else's issue does not grant ownership. All issue pages are read before any issue mutation. API failures and malformed/truncated inputs appear in the run summary; they do not mean every exact pin is current. Unknown write outcomes are read back before a subsequent run can create anything again.
 
+The watcher polls every 15 minutes; GitHub may delay scheduled runs. Expected source and override comparisons appear under **Not measured** without failing execution. API, response-schema, input parsing and write failures appear under **Execution errors** and fail the run. Neither category proves that an affected dependency is current.
+
 Scheduled runs stay read-only until the repository variable DEPENDENCY_WATCH_ENABLED is exactly true. After this PR merges, dispatch watch-dependency-graph.yml with dry_run=true, inspect its native summary, then enable that variable when notifications are wanted. Manual runs also default to dry_run=true.
 
 The App token requests only Contents/Metadata read and Issues read for a dry run, or Issues write for an enabled run. PRs execute python3 .github/scripts/test_dependency_watch.py without App credentials; the operational job cannot run on pull_request.
