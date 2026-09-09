@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import PurePosixPath
+from posixpath import normpath
 import re
 import subprocess
 import sys
@@ -168,7 +169,25 @@ def declarations(doc):
 
 def cargo_patches(path, manifests):
     doc = manifests[path]
-    if "workspace" not in doc:
+    package = doc.get("package", {})
+    if not isinstance(package, dict):
+        return None
+    if "workspace" in package:
+        selected = package["workspace"]
+        # An explicit root overrides ancestor discovery. Only repo-tree paths
+        # can be established here; unresolved selection is not "no patches".
+        if ("workspace" in doc or not isinstance(selected, str) or not selected
+                or "\0" in selected or "\\" in selected or re.match(r"^[A-Za-z]:", selected)
+                or PurePosixPath(selected).is_absolute()):
+            return None
+        directory = normpath(str(PurePosixPath(path).parent / selected))
+        if directory == ".." or directory.startswith("../"):
+            return None
+        doc = manifests.get(str(PurePosixPath(directory) / "Cargo.toml"))
+        if (not isinstance(doc, dict) or not isinstance(doc.get("workspace"), dict)
+                or not isinstance(doc.get("package", {}), dict) or "workspace" in doc.get("package", {})):
+            return None
+    elif "workspace" not in doc:
         for parent in PurePosixPath(path).parents:
             candidate = str(parent / "Cargo.toml")
             if candidate in manifests and "workspace" in manifests[candidate]:
@@ -180,6 +199,8 @@ def cargo_patches(path, manifests):
 
 
 def cargo_patch_kind(package, attrs, patches):
+    if patches is None:
+        return "unmeasured"
     for source, name in patches:
         if name != package:
             continue
@@ -212,8 +233,12 @@ def edges_from(repo, branch, path, manifests, owners):
         patched = cargo_patches(path, manifests)
         for dep, value in declarations(doc):
             attrs = value if isinstance(value, dict) else {"version": value}
-            if attrs.get("workspace") or "path" in attrs:
-                continue  # Workspace declarations are read separately; path sources are local.
+            if attrs.get("workspace"):
+                if patched is None:
+                    add(dep, None, "workspace", "unmeasured")
+                continue  # A verified workspace's declarations are read separately.
+            if "path" in attrs:
+                continue  # Path sources are local.
             package = attrs.get("package", dep)
             source = attrs.get("git", "")
             registry = attrs.get("registry", "crates-io") == "crates-io"

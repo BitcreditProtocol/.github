@@ -149,6 +149,85 @@ renamed_local = { package = "ambiguous", path = "crates/ambiguous", version = "=
                                  {("Cargo.toml", "ambiguous"): None, ("Cargo.toml", "shadowed"): "Producer"})
         self.assertEqual(edges, [self.edge(dep="external", pin="v1.0.0")])
 
+    def explicit_workspace_manifests(self):
+        texts = {
+            "Cargo.toml": '[workspace]\nmembers = ["member"]\n',
+            "member/Cargo.toml": '''[package]
+name = "member"
+version = "0.1.0"
+workspace = "../selected"
+[dependencies]
+library = { package = "actual-library", git = "https://github.com/ExampleOrg/Producer.git", tag = "v1.0.0" }
+''',
+            "selected/Cargo.toml": '''[workspace]
+members = ["../member"]
+[patch."https://github.com/ExampleOrg/Producer"]
+replacement = { package = "actual-library", path = "../local-library" }
+''',
+        }
+        return {path: watch.parse_manifest(path, text) for path, text in texts.items()}
+
+    def test_explicit_workspace_selects_sibling_patch_source_and_package_alias(self):
+        for selection in ("../selected", "../selected/../selected", ".././selected/"):
+            for source, expected in (("https://github.com/ExampleOrg/Producer", "patched"), ("crates-io", "exact")):
+                with self.subTest(selection=selection, source=source):
+                    docs = self.explicit_workspace_manifests()
+                    docs["member/Cargo.toml"]["package"]["workspace"] = selection
+                    patches = docs["selected/Cargo.toml"]["patch"]
+                    docs["selected/Cargo.toml"]["patch"] = {source: next(iter(patches.values()))}
+                    edges = watch.edges_from("Consumer", "dev", "member/Cargo.toml", docs, {})
+                    self.assertEqual(edges, [self.edge(branch="dev", path="member/Cargo.toml", pin="v1.0.0", kind=expected)])
+
+    def test_explicit_workspace_does_not_inherit_unrelated_ancestor_or_member_patches(self):
+        docs = self.explicit_workspace_manifests()
+        patches = docs["selected/Cargo.toml"].pop("patch")
+        docs["Cargo.toml"]["patch"] = patches
+        docs["member/Cargo.toml"]["patch"] = patches
+        edges = watch.edges_from("Consumer", "main", "member/Cargo.toml", docs, {})
+        self.assertEqual(edges, [self.edge(path="member/Cargo.toml", pin="v1.0.0")])
+
+    def test_invalid_explicit_workspace_cannot_close_an_issue_or_block_other_manifests(self):
+        cases = []
+        for selection in ("../missing", "../../outside", "/absolute", "C:/workspace", "..\\selected",
+                          "", "../selected\0", [], {}, True, 12):
+            cases.append((repr(selection), lambda docs, value=selection:
+                          docs["member/Cargo.toml"]["package"].update(workspace=value)))
+        cases.extend([
+            ("member declares both workspace forms", lambda docs: docs["member/Cargo.toml"].update(workspace={})),
+            ("selected manifest is not a root", lambda docs: docs["selected/Cargo.toml"].pop("workspace")),
+            ("selected workspace is not a table", lambda docs: docs["selected/Cargo.toml"].update(workspace=[])),
+            ("selected root points elsewhere", lambda docs: docs["selected/Cargo.toml"].update(package={"workspace": ".."})),
+        ])
+        for name, change in cases:
+            with self.subTest(case=name):
+                docs = self.explicit_workspace_manifests()
+                docs["member/Cargo.toml"]["dependencies"]["library"]["tag"] = "v2.0.0"
+                change(docs)
+                edges = watch.edges_from("Consumer", "main", "member/Cargo.toml", docs, {})
+                self.assertEqual(edges, [self.edge(path="member/Cargo.toml", pin="v2.0.0", kind="unmeasured")])
+                self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+                gaps, errors, incomplete = [], [], set()
+                actions = watch.plan_actions(edges + [self.edge(dep="unaffected", path="other/Cargo.toml")],
+                                             {"Consumer": [self.issue()]}, gaps, incomplete, errors)
+                self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
+                self.assertTrue(any("library" in gap for gap in gaps))
+                self.assertEqual((errors, incomplete), ([], set()))
+
+    def test_unavailable_explicit_workspace_inheritance_blocks_false_closure_across_branches(self):
+        docs = self.explicit_workspace_manifests()
+        member = docs["member/Cargo.toml"]
+        member["package"]["workspace"] = "../missing"
+        member["dependencies"]["library"] = {"workspace": True}
+        edges = watch.edges_from("Consumer", "main", "member/Cargo.toml", docs, {})
+        self.assertEqual(edges, [self.edge(path="member/Cargo.toml", producer="", pin="workspace", kind="unmeasured")])
+        self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+        gaps, errors, incomplete = [], [], set()
+        actions = watch.plan_actions(edges + [self.edge(branch="dev", pin="v2.0.0"), self.edge(dep="unaffected")],
+                                     {"Consumer": [self.issue()]}, gaps, incomplete, errors)
+        self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
+        self.assertTrue(any("library" in gap for gap in gaps))
+        self.assertEqual((errors, incomplete), ([], set()))
+
     def test_cargo_patch_source_must_match_the_git_dependency_including_aliases(self):
         for source, replacement, expected in (
             ("crates-io", 'library = { path = "local/library" }', "exact"),
