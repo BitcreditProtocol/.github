@@ -28,17 +28,17 @@ Three files at the root state what should be true everywhere. Each is read by a 
 
 They record the *expected value* rather than a list of repositories to skip, so an exception that stops being true is noticed instead of staying silent forever.
 
-`.github/scripts/README.md` covers how the workflows use them, what they refuse to do, and the GitHub App they need.
+`.github/scripts/README.md` covers how the workflows use them, what they refuse to do, and the GitHub App they need. [RELEASING.md](RELEASING.md) covers product release preparation, publication and recovery.
 
 ## Adding a repository
 
-Most of it happens on its own. A new repository is picked up by the next scheduled run because both workflows list repositories from the API rather than from a file.
+Most of it happens on its own. A new repository is picked up by the next scheduled run because the scheduled workflows list repositories from the API rather than from a file.
 
-**Arrives by itself** — labels, organisation topics, merge settings, branch and tag rules (every ruleset targets `~ALL`), `GITHUB_TOKEN` permissions, the issue and pull request templates above, and the baseline security configuration, which is the default for new repositories.
+**Arrives by itself** — labels, organisation topics, merge settings, branch and tag rules within their configured repository scope, `GITHUB_TOKEN` permissions, the issue and pull request templates above, and the baseline security configuration, which is the default for new repositories.
 
-**Shows up in the weekly report** — no description, no `LICENSE`, the wrong copyright holder, no `dependabot.yml` where a package manifest or a workflow exists, no entry in `dependabot-assignees.yml`, an empty public wiki, or a security configuration other than the baseline.
+**Shows up in the weekly report** — no description, no `LICENSE`, the wrong copyright holder, no `dependabot.yml` for detected package ecosystems or external GitHub Actions references, no entry in `dependabot-assignees.yml`, an empty public wiki, or a security configuration other than the baseline.
 
-**Nobody checks** — which project board the repository belongs to, its environments, whether discussions are on, and whether its default branch is `master` or `main`. These are decisions rather than drift, so no automation touches them.
+**Operator decisions** — project boards, environment purpose, discussions and the choice of default branch. The audit reports environment protection and reviewer findings; it does not decide which environments should exist or change their settings.
 
 ## Removing a repository
 
