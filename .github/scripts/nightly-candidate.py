@@ -28,6 +28,10 @@ IMAGES = {
 }
 ARTIFACT = "clowder-nightly-plan"
 IMAGES_ARTIFACT = "clowder-nightly-images"
+SAVE_IMAGES_STEP = "Preserve images before deployment"
+DISPATCH_OUTPUTS = {"Wildcat": "dispatch_wildcat", "Clowder": "dispatch_clowder",
+                    "Wildcat-Auxiliary": "dispatch_auxiliary", "wildcat-dashboard-ui": "dispatch_dashboard"}
+DISPATCH_STEPS = {repo: f"Dispatch {repo} nightly candidate" for repo in IMAGES}
 GAR = "europe-west1-docker.pkg.dev/bitcr-shared/bitcr-wildcat-dev"
 SHA = re.compile(r"[0-9a-f]{40}")
 ID = re.compile(r"[1-9][0-9]*")
@@ -101,10 +105,10 @@ def api(cfg, path, method="GET", body=None, *, own=False, raw=False):
     if not any(path == root or path.startswith(root + "/") for root in roots):
         raise CandidateError("GitHub request is outside the candidate repositories")
     if own and not path.startswith(f"repos/{cfg['org']}/.github/"):
-        raise CandidateError("The native token is restricted to this repository's artifacts")
+        raise CandidateError("The native token is restricted to this repository")
     if method != "GET":
         allowed = {f"repos/{cfg['org']}/{r}/actions/workflows/nightly.yml/dispatches" for r in IMAGES}
-        if cfg["dry"] or method != "POST" or path not in allowed or own:
+        if cfg["dry"] or cfg.get("read_only") or method != "POST" or path not in allowed or own:
             raise CandidateError("Only producer dispatches are permitted, outside dry-run")
         if (not isinstance(body, dict) or body.get("ref") != "master"
                 or set(body.get("inputs", {})) != {"expected_sha", "candidate_run_id"}
@@ -445,12 +449,101 @@ def scan(cfg, plan, repo, cache, *, require_own=False):
     return None, None
 
 
-def dispatch(cfg, plan, repo):
+def prior_image_steps(cfg):
+    history = []
+    for attempt in range(1, cfg["attempt"]):
+        jobs = pages(cfg, f"repos/{cfg['org']}/.github/actions/runs/{cfg['run']}/attempts/{attempt}/jobs", "jobs", own=True)
+        if any(type(job.get("run_id")) is not int or str(job["run_id"]) != cfg["run"]
+               or type(job.get("run_attempt")) is not int or job["run_attempt"] != attempt
+               or job.get("head_sha") != cfg["sha"] or not isinstance(job.get("name"), str) or not job["name"]
+               or job.get("status") != "completed" or not isinstance(job.get("conclusion"), str) or not job["conclusion"]
+               or not isinstance(job.get("steps"), list) for job in jobs):
+            raise CandidateError("Prior image job history is incomplete or belongs to another attempt")
+        matched = [job for job in jobs if job["name"] == "images"]
+        if len(matched) > 1:
+            raise CandidateError("Prior image job is ambiguous")
+        if not matched or matched[0]["conclusion"] == "skipped" and not matched[0]["steps"]:
+            history.append(None)
+            continue
+        steps = matched[0]["steps"]
+        if (any(not isinstance(step, dict) or not isinstance(step.get("name"), str) or not step["name"]
+                or not positive(step.get("number")) for step in steps)
+                or len({step["number"] for step in steps}) != len(steps)
+                or len({step["name"] for step in steps}) != len(steps)):
+            raise CandidateError("Prior image step history is incomplete or ambiguous")
+        history.append({step["name"]: step for step in steps})
+    return history
+
+
+def may_have_started(history, name):
+    for steps in history:
+        if steps is None:
+            continue
+        step = steps.get(name, {})
+        unstarted = ((step.get("status") == "completed" and step.get("conclusion") == "skipped")
+                     or (step.get("status") == "queued" and "conclusion" in step and step["conclusion"] is None
+                         and "started_at" in step and step["started_at"] is None))
+        if not unstarted:
+            return True
+    return False
+
+
+def image_inputs(cfg, path):
+    plan = read_plan(cfg, path)
+    stored = saved_plan(cfg)
+    if stored is None or stored[0] != plan:
+        raise CandidateError("Image preparation requires the immutable original plan artifact")
+    captured = saved_images(cfg, plan)
+    history = [] if captured is not None else prior_image_steps(cfg)
+    if captured is None and may_have_started(history, SAVE_IMAGES_STEP):
+        raise CandidateError("Original image aggregate is missing after it may have been saved; refusing replacement images")
+    return plan, captured, history
+
+
+def inspect_images(cfg, path):
+    cfg = {**cfg, "read_only": True, "deadline": time.monotonic() + WAIT_SECONDS}
+    plan, captured, history = image_inputs(cfg, path)
+    required, verified = dict.fromkeys(IMAGES, False), {}
+    if captured is None:
+        for repo in IMAGES:
+            attempted = may_have_started(history, DISPATCH_STEPS[repo])
+            run, records = scan(cfg, plan, repo, verified, require_own=attempted)
+            required[repo] = run is None and records is None and not attempted
+            if run is None and attempted:
+                progress(f"{repo}: earlier dispatch outcome is unconfirmed; no repeat POST is permitted")
+        if not cfg["dry"]:
+            for repo, needed in required.items():
+                if needed and head_of(cfg, repo) != plan["members"][repo]:
+                    raise CandidateError(f"{repo}: master moved after capture; no dispatch")
+    for repo, needed in required.items():
+        output(DISPATCH_OUTPUTS[repo], str(needed).lower())
+    output("dispatch_needed", str(any(required.values())).lower())
+    return required
+
+
+def dispatch(cfg, path, repo):
+    if cfg["dry"] or repo not in IMAGES:
+        raise CandidateError("Only named producer dispatches outside dry-run are permitted")
+    cfg = {**cfg, "deadline": time.monotonic() + WAIT_SECONDS}
+    output("require_own", "false")
+    plan, captured, history = image_inputs(cfg, path)
+    if captured is not None:
+        return None
+    attempted = may_have_started(history, DISPATCH_STEPS[repo])
+    run, records = scan(cfg, plan, repo, {}, require_own=attempted)
+    if run is not None:
+        own = run["event"] == "workflow_dispatch" and run["display_title"] == title(cfg["run"], plan["members"][repo])
+        output("require_own", str(own).lower())
+        progress(f"{repo}: preserving existing run {run['id']}")
+        return str(run["id"])
+    if attempted:
+        raise CandidateError(f"{repo}: prior dispatch may have started; refusing another POST")
     expected = plan["members"][repo]
     if head_of(cfg, repo) != expected:
         raise CandidateError(f"{repo}: master moved after capture; refusing a different build")
     path = f"repos/{cfg['org']}/{repo}/actions/workflows/nightly.yml/dispatches"
     body = {"ref": "master", "inputs": {"expected_sha": expected, "candidate_run_id": cfg["run"]}}
+    output("require_own", "true")  # Retain same-attempt uncertainty before the network write.
     try:
         value = api(cfg, path, "POST", body)
         run_id = value.get("workflow_run_id") if isinstance(value, dict) else None
@@ -471,14 +564,11 @@ def dispatch(cfg, plan, repo):
 
 
 def images(cfg, plan_path, destination, *, timeout=WAIT_SECONDS):
-    cfg = {**cfg, "deadline": min(cfg.get("deadline", float("inf")), time.monotonic() + min(timeout, WAIT_SECONDS))}
+    cfg = {**cfg, "read_only": True,
+           "deadline": min(cfg.get("deadline", float("inf")), time.monotonic() + min(timeout, WAIT_SECONDS))}
     output("created", "false")
     output("complete", "false")
-    plan = read_plan(cfg, plan_path)
-    stored = saved_plan(cfg)
-    if stored is None or stored[0] != plan:
-        raise CandidateError("Image preparation requires the immutable original plan artifact")
-    captured = saved_images(cfg, plan)
+    plan, captured, history = image_inputs(cfg, plan_path)
     if captured is not None:
         value, raw, artifact_id = captured
         destination.write_bytes(raw)
@@ -487,14 +577,18 @@ def images(cfg, plan_path, destination, *, timeout=WAIT_SECONDS):
         output("complete", "true")
         progress(f"Restored candidate {cfg['run']} images from artifact {artifact_id}; preserved the original producer results")
         return value
+    current = json.loads(os.environ.get("CURRENT_DISPATCHES", "null"))
+    if not isinstance(current, dict) or set(current) != set(IMAGES) or any(v not in ("true", "false") for v in current.values()):
+        raise CandidateError("CURRENT_DISPATCHES must contain all four native producer-step outcomes")
+    required_own = {repo for repo in IMAGES if current[repo] == "true" or may_have_started(history, DISPATCH_STEPS[repo])}
     destination.unlink(missing_ok=True)
-    attempted, selected, verified = set(), {}, {}
+    selected, verified = {}, {}
     while True:
         check_deadline(cfg)
         states = {}
         for repo in IMAGES:
             progress(f"{repo}: reading builds and image artifacts for {plan['members'][repo]}")
-            states[repo] = scan(cfg, plan, repo, verified, require_own=repo in attempted)
+            states[repo] = scan(cfg, plan, repo, verified, require_own=repo in required_own)
         selected = {r: str(run["id"]) for r, (run, _) in states.items() if run is not None}
         output("source_run_ids", json.dumps(selected, sort_keys=True))
         if all(records is not None for _, records in states.values()):
@@ -506,20 +600,11 @@ def images(cfg, plan_path, destination, *, timeout=WAIT_SECONDS):
             output("complete", "true")
             progress(f"Candidate {cfg['run']}: all 12 image records verified; no deployment performed")
             return value
-        missing = [r for r, (run, records) in states.items() if run is None and records is None and r not in attempted]
         if cfg["dry"]:
             for repo, (run, records) in states.items():
                 if records is None:
                     progress(f"Dry run: {repo}: " + (f"existing run {run['id']} is {run['status']}" if run else "build required; no dispatch"))
             return None
-        # All available image artifacts and all missing masters are read before the first dispatch.
-        for repo in missing:
-            if head_of(cfg, repo) != plan["members"][repo]:
-                raise CandidateError(f"{repo}: master moved after capture; no dispatch")
-        for repo in missing:
-            attempted.add(repo)
-            run_id = dispatch(cfg, plan, repo)
-            progress(f"{repo}: " + (f"dispatched run {run_id}" if run_id else "waiting for dispatch readback; no repeat POST"))
         progress("Waiting for producer completion and immutable image artifacts")
         time.sleep(min(POLL_SECONDS, check_deadline(cfg)))
 
@@ -528,6 +613,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="phase", required=True)
     commands.add_parser("prepare").add_argument("plan", type=Path)
+    commands.add_parser("inspect").add_argument("plan", type=Path)
+    submit = commands.add_parser("dispatch")
+    submit.add_argument("plan", type=Path)
+    submit.add_argument("repository", choices=IMAGES)
     collect = commands.add_parser("images")
     collect.add_argument("plan", type=Path)
     collect.add_argument("images", type=Path)
@@ -536,6 +625,10 @@ def main():
         cfg = context()
         if args.phase == "prepare":
             prepare(cfg, args.plan)
+        elif args.phase == "inspect":
+            inspect_images(cfg, args.plan)
+        elif args.phase == "dispatch":
+            dispatch(cfg, args.plan, args.repository)
         else:
             images(cfg, args.plan, args.images)
         return 0

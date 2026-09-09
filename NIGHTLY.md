@@ -27,6 +27,11 @@ are complete. The older deployment `nightly.yml` remains disabled: it targets
    the coordinator requests dispatch access only for the current stage's targets.
    Confirm token issuance and repository scope before deployment. Do not copy
    private keys into plans, issues, logs or artifacts.
+   Review the signing-key trust boundary before provisioning those child keys:
+   product jobs and the App-token Action's post step still share a runner. Early
+   token creation and scoped-token reuse do not isolate the signing key from
+   compromised code. Regression jobs do not receive App keys. Do not treat the
+   current ordering as proof of credential isolation or waive this activation review.
 5. Demonstrate backup and restore for the self-hosted clowder-dev data. A GCP
    backup or the presence of a backup script does not prove this. Record the
    restore result and recovery procedure in `infrastructure#246`.
@@ -102,6 +107,13 @@ If a producer failed, inspect and rerun its failed jobs. Its successful image
 receipts may span native attempts; the collector retains the latest valid receipt
 for each image within that same saved source/run. A newer invalid receipt blocks
 fallback to an older receipt.
+
+The coordinator inspects all producer state before its four named dispatch
+steps. Native step history distinguishes an untouched producer from a submission
+that may already have started. An unresolved earlier submission is never repeated
+just because its run is not visible yet. Final image collection cannot dispatch
+builds. If the aggregate artifact is missing after its save step may have run,
+recovery stops rather than collecting replacement image references.
 
 If the recipient failed, wait for its child tests to become terminal and resolve
 the reported cause. Rerun all recipient jobs to establish fresh readiness for all

@@ -35,6 +35,7 @@ class GitHub:
         self.accept_dispatch = True
         self.after_dispatch = None
         self.bad_read = None
+        self.jobs, self.job_total = {}, None
 
     def own_run(self):
         return dict(id=int(self.cfg["run"]), run_attempt=self.cfg["attempt"], head_sha=self.cfg["sha"],
@@ -126,6 +127,9 @@ class GitHub:
         if tail.endswith("/artifacts"):
             values = self.artifact_list.get((repo, int(parts[-2])), [])
             key = "artifacts"
+        elif tail.endswith("/jobs"):
+            assert own and repo == ".github"
+            values, key = self.jobs[int(parts[-2])], "jobs"
         elif tail == "actions/workflows/nightly.yml/runs":
             values = list(self.run_list[repo])
             for query, field in (("branch", "head_branch"), ("head_sha", "head_sha"), ("event", "event")):
@@ -140,7 +144,8 @@ class GitHub:
         else:
             raise AssertionError("Unexpected network request: " + path)
         page = int(args.get("page", ["1"])[0])
-        return {"total_count": len(values), key: copy.deepcopy(values[(page - 1) * 100:page * 100])}
+        total = self.job_total if key == "jobs" and self.job_total is not None else len(values)
+        return {"total_count": total, key: copy.deepcopy(values[(page - 1) * 100:page * 100])}
 
     @property
     def writes(self):
@@ -162,6 +167,7 @@ class CandidateTests(unittest.TestCase):
         self.enterContext(patch.object(candidate.time, "monotonic", side_effect=lambda: self.clock))
         self.enterContext(patch.object(candidate.time, "sleep", side_effect=self.sleep))
         self.plan_path, self.images_path = self.root / "plan.json", self.root / "images.json"
+        self.current_dispatches = dict.fromkeys(candidate.IMAGES, "false")
 
     def sleep(self, seconds):
         self.assertLessEqual(seconds, 30)
@@ -176,7 +182,33 @@ class CandidateTests(unittest.TestCase):
         return {r: self.remote.successful(r) for r in candidate.IMAGES}
 
     def collect(self, **kwargs):
-        return candidate.images(self.cfg, self.plan_path, self.images_path, **kwargs)
+        with patch.dict(os.environ, {"CURRENT_DISPATCHES": json.dumps(self.current_dispatches)}):
+            return candidate.images(self.cfg, self.plan_path, self.images_path, **kwargs)
+
+    def images_job(self, **kwargs):
+        required = candidate.inspect_images(self.cfg, self.plan_path)
+        if not self.cfg["dry"]:
+            for repo, needed in required.items():
+                if needed:
+                    out = self.root / "producer-output"
+                    out.write_text("")
+                    with patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)}):
+                        candidate.dispatch(self.cfg, self.plan_path, repo)
+                    self.current_dispatches[repo] = [s.split("=", 1)[1] for s in out.read_text().splitlines()
+                                                     if s.startswith("require_own=")][-1]
+        return self.collect(**kwargs)
+
+    def prior_image_job(self, attempt=1, *, submitted=(), saved=False):
+        names = [*candidate.DISPATCH_STEPS.values(), candidate.SAVE_IMAGES_STEP]
+        started = {candidate.DISPATCH_STEPS[r] for r in submitted}
+        if saved:
+            started.add(candidate.SAVE_IMAGES_STEP)
+        steps = [dict(number=i + 1, name=name, status="completed",
+                      conclusion="success" if name in started else "skipped",
+                      started_at="2026-09-09T01:00:00Z" if name in started else None)
+                 for i, name in enumerate(names)]
+        return dict(id=900 + attempt, run_id=int(self.cfg["run"]), run_attempt=attempt,
+                    head_sha=self.cfg["sha"], name="images", status="completed", conclusion="failure", steps=steps)
 
     def test_prepare_captures_all_heads_before_ci_and_has_exact_schema(self):
         plan = candidate.prepare(self.cfg, self.plan_path)
@@ -387,7 +419,7 @@ class CandidateTests(unittest.TestCase):
         self.cfg["dry"] = False
         self.remote.heads["wildcat-dashboard-ui"] = "f" * 40
         with self.assertRaisesRegex(candidate.CandidateError, "master moved"):
-            self.collect()
+            self.images_job()
         self.assertFalse(self.remote.writes)
 
     def test_dispatch_after_all_artifact_reads_and_lost_response_readback(self):
@@ -397,13 +429,13 @@ class CandidateTests(unittest.TestCase):
                 self.remote.successful(repo)
         self.remote.lost = "Clowder"
         self.cfg["dry"] = False
-        value = self.collect()
+        value = self.images_job()
         self.assertEqual(len(value["images"]), 12)
         self.assertEqual(len(self.remote.writes), 1)
         first_write = next(i for i, c in enumerate(self.remote.calls) if c[0] == "POST")
         for repo in ("Wildcat", "Wildcat-Auxiliary", "wildcat-dashboard-ui"):
             self.assertTrue(any(f"/{repo}/actions/artifacts/" in c[1] for c in self.remote.calls[:first_write]))
-        self.collect()
+        self.images_job()
         self.assertEqual(len(self.remote.writes), 1)
 
     def test_unknown_dispatch_is_not_repeated_or_replaced_by_another_build(self):
@@ -418,7 +450,7 @@ class CandidateTests(unittest.TestCase):
             self.remote.successful("Clowder")
         candidate.time.sleep.side_effect = later_unrelated
         with self.assertRaisesRegex(candidate.CandidateError, "Timed out"):
-            self.collect(timeout=40)
+            self.images_job(timeout=40)
         self.assertEqual(len(self.remote.writes), 1)
         self.assertFalse(self.images_path.exists())
 
@@ -445,7 +477,7 @@ class CandidateTests(unittest.TestCase):
         self.cfg["dry"] = False
         self.remote.after_dispatch = lambda repo, run: run.update(head_sha="f" * 40)
         with self.assertRaisesRegex(candidate.CandidateError, "does not match"):
-            self.collect()
+            self.images_job()
         self.assertEqual(len(self.remote.writes), 1)
 
     def test_artifact_read_failure_prevents_other_dispatches(self):
@@ -454,7 +486,151 @@ class CandidateTests(unittest.TestCase):
         self.cfg["dry"] = False
         self.remote.bad_read = "/wildcat-dashboard-ui/actions/artifacts/"
         with self.assertRaises(candidate.CandidateError):
+            self.images_job()
+        self.assertFalse(self.remote.writes)
+
+    def test_deleted_aggregate_never_regenerates_after_a_possible_save(self):
+        self.prepared()
+        self.complete_builds()
+        value = self.collect()
+        artifact = self.remote.artifact(".github", self.remote.own_run(), candidate.IMAGES_ARTIFACT, value)
+        self.remote.artifact_list[".github", 123].remove(artifact)
+        self.cfg["attempt"] = 2
+        self.remote.jobs[1] = [self.prior_image_job(saved=True)]
+        self.complete_builds()
+        self.cfg["dry"] = False
+        for phase in (lambda: self.collect(), lambda: candidate.inspect_images(self.cfg, self.plan_path),
+                      lambda: candidate.dispatch(self.cfg, self.plan_path, "Clowder")):
+            with self.subTest(phase=phase):
+                self.remote.calls.clear()
+                (self.root / "outputs").write_text("")
+                with self.assertRaisesRegex(candidate.CandidateError, "may have been saved"):
+                    phase()
+                self.assertTrue(all("/ExampleOrg/.github/" in c[1] for c in self.remote.calls))
+                self.assertNotIn("created=true", (self.root / "outputs").read_text())
+        self.assertFalse(self.remote.writes)
+
+    def test_missing_aggregate_allows_only_proven_never_saved_collection(self):
+        self.prepared()
+        self.complete_builds()
+        self.cfg["attempt"] = 2
+        for jobs in ([], [self.prior_image_job()], [self.prior_image_job() | {"conclusion": "skipped", "steps": []}]):
+            with self.subTest(jobs=jobs):
+                self.remote.jobs[1] = jobs
+                self.assertEqual(len(self.collect()["images"]), 12)
+        self.assertFalse(self.remote.writes)
+
+    def test_missing_aggregate_rejects_unavailable_partial_or_malformed_history(self):
+        self.prepared()
+        self.complete_builds()
+        self.cfg["attempt"] = 2
+        job = self.prior_image_job()
+        for change in ({"head_sha": "f" * 40}, {"run_attempt": 3}, {"steps": []}):
+            with self.subTest(change=change):
+                self.remote.jobs[1] = [job | change]
+                with self.assertRaises(candidate.CandidateError):
+                    self.collect()
+        self.remote.jobs[1] = [job]
+        self.remote.job_total = 2
+        with self.assertRaisesRegex(candidate.CandidateError, "Incomplete"):
             self.collect()
+        self.remote.job_total = None
+        self.remote.bad_read = "/attempts/1/jobs"
+        with self.assertRaisesRegex(candidate.CandidateError, "API read"):
+            self.collect()
+        self.assertFalse(self.remote.writes)
+
+    def test_uncertain_producer_post_is_not_repeated_on_a_native_rerun(self):
+        self.prepared()
+        for repo in candidate.IMAGES:
+            if repo != "Clowder":
+                self.remote.successful(repo)
+        self.cfg["dry"] = False
+        self.remote.accept_dispatch = False
+        with self.assertRaisesRegex(candidate.CandidateError, "Timed out"):
+            self.images_job(timeout=40)
+        self.assertEqual(len(self.remote.writes), 1)
+        self.cfg["attempt"] = 2
+        self.remote.jobs[1] = [self.prior_image_job(submitted=("Clowder",))]
+        self.current_dispatches = dict.fromkeys(candidate.IMAGES, "false")
+        self.remote.successful("Clowder")  # An unrelated exact-SHA build cannot replace an uncertain dispatch.
+        self.assertFalse(candidate.inspect_images(self.cfg, self.plan_path)["Clowder"])
+        with self.assertRaisesRegex(candidate.CandidateError, "prior dispatch may have started"):
+            candidate.dispatch(self.cfg, self.plan_path, "Clowder")
+        with self.assertRaisesRegex(candidate.CandidateError, "Timed out"):
+            self.images_job(timeout=40)
+        self.assertEqual(len(self.remote.writes), 1)
+
+    def test_partial_attempt_keeps_existing_producer_and_dispatches_untouched_one(self):
+        self.prepared()
+        own = self.remote.successful("Wildcat", owner=self.cfg["run"])
+        for repo in ("Wildcat-Auxiliary", "wildcat-dashboard-ui"):
+            self.remote.successful(repo)
+        self.cfg.update(attempt=2, dry=False)
+        self.remote.jobs[1] = [self.prior_image_job(submitted=("Wildcat",))]
+        value = self.images_job()
+        self.assertEqual(len(value["images"]), 12)
+        self.assertEqual(len(self.remote.writes), 1)
+        self.assertIn("/Clowder/", self.remote.writes[0][1])
+        self.assertTrue(all(r["run_id"] == str(own["id"]) for r in value["images"] if r["repository"].endswith("/Wildcat")))
+
+    def test_unknown_producer_does_not_prevent_later_unattempted_producer(self):
+        self.prepared()
+        for repo in ("Wildcat-Auxiliary", "wildcat-dashboard-ui"):
+            self.remote.successful(repo)
+        self.cfg.update(attempt=2, dry=False)
+        self.remote.jobs[1] = [self.prior_image_job(submitted=("Wildcat",))]
+        with self.assertRaisesRegex(candidate.CandidateError, "Timed out"):
+            self.images_job(timeout=40)
+        self.assertEqual(len(self.remote.writes), 1)
+        self.assertIn("/Clowder/", self.remote.writes[0][1])
+
+    def test_every_prior_attempt_and_job_page_remains_authoritative(self):
+        self.prepared()
+        self.cfg.update(attempt=3, dry=False)
+        self.remote.jobs[1] = [self.prior_image_job(submitted=("Clowder",))]
+        self.remote.jobs[2] = [self.prior_image_job(attempt=2)]
+        with self.assertRaisesRegex(candidate.CandidateError, "prior dispatch may have started"):
+            candidate.dispatch(self.cfg, self.plan_path, "Clowder")
+        others = [self.prior_image_job() | {"id": 2000 + n, "name": f"other-{n}"} for n in range(100)]
+        self.remote.jobs[1] = [*others, self.prior_image_job(saved=True)]
+        self.remote.calls.clear()
+        with self.assertRaisesRegex(candidate.CandidateError, "may have been saved"):
+            self.collect()
+        self.assertEqual(len([c for c in self.remote.calls if "/attempts/1/jobs?" in c[1]]), 2)
+        self.assertFalse(self.remote.writes)
+
+    def test_complete_build_appearing_after_inspection_is_reused_without_post(self):
+        self.prepared()
+        self.cfg["dry"] = False
+        self.assertTrue(candidate.inspect_images(self.cfg, self.plan_path)["Clowder"])
+        runs = self.complete_builds()
+        (self.root / "outputs").write_text("")
+        self.assertEqual(candidate.dispatch(self.cfg, self.plan_path, "Clowder"), str(runs["Clowder"]["id"]))
+        self.assertEqual((self.root / "outputs").read_text().splitlines()[-1], "require_own=false")
+        self.assertEqual(len(self.collect()["images"]), 12)
+        self.assertFalse(self.remote.writes)
+
+    def test_collection_requires_complete_current_step_outcomes(self):
+        self.prepared()
+        self.complete_builds()
+        for value in (None, {}, {**self.current_dispatches, "Wildcat": True},
+                      {**self.current_dispatches, "other": "false"}):
+            with self.subTest(value=value), patch.dict(os.environ, {"CURRENT_DISPATCHES": json.dumps(value)}):
+                with self.assertRaisesRegex(candidate.CandidateError, "CURRENT_DISPATCHES"):
+                    candidate.images(self.cfg, self.plan_path, self.images_path)
+        self.assertFalse(self.remote.writes)
+
+    def test_inspection_and_final_collection_never_dispatch(self):
+        self.prepared()
+        self.cfg["dry"] = False
+        self.assertTrue(all(candidate.inspect_images(self.cfg, self.plan_path).values()))
+        with self.assertRaisesRegex(candidate.CandidateError, "Timed out"):
+            self.collect(timeout=20)
+        self.assertFalse(self.remote.writes)
+        self.cfg["dry"] = True
+        with self.assertRaises(candidate.CandidateError):
+            candidate.dispatch(self.cfg, self.plan_path, "Wildcat")
         self.assertFalse(self.remote.writes)
 
     def test_plan_previous_identity_and_schema_are_validated(self):
@@ -475,6 +651,11 @@ class TransportTests(unittest.TestCase):
 
     def test_dry_run_denies_dispatch_before_invoking_gh(self):
         with patch.object(subprocess, "run") as command:
+            with self.assertRaises(candidate.CandidateError):
+                candidate.api(self.cfg, "repos/ExampleOrg/Clowder/actions/workflows/nightly.yml/dispatches", "POST",
+                              {"ref": "master", "inputs": {"expected_sha": "a" * 40, "candidate_run_id": "123"}})
+            command.assert_not_called()
+            self.cfg.update(dry=False, read_only=True)
             with self.assertRaises(candidate.CandidateError):
                 candidate.api(self.cfg, "repos/ExampleOrg/Clowder/actions/workflows/nightly.yml/dispatches", "POST",
                               {"ref": "master", "inputs": {"expected_sha": "a" * 40, "candidate_run_id": "123"}})

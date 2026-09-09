@@ -126,8 +126,14 @@ jobs:
             wildcat-dashboard-ui
           permission-actions: read
           permission-contents: read
+      - name: Inspect saved images and producer state before dispatch
+        id: inspect
+        env:
+          GH_READ_TOKEN: ${{ steps.read.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-candidate.py inspect candidate.json
       - name: Scope build dispatches to the four producers
-        if: env.DRY_RUN == 'false'
+        if: env.DRY_RUN == 'false' && steps.inspect.outputs.dispatch_needed == 'true'
         id: write
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -141,12 +147,48 @@ jobs:
             wildcat-dashboard-ui
           permission-actions: write
           permission-contents: read
-      - name: Restore images or collect the complete source-specific build results
-        id: images
+      - name: Dispatch Wildcat nightly candidate
+        id: dispatch_wildcat
+        if: env.DRY_RUN == 'false' && steps.inspect.outputs.dispatch_wildcat == 'true'
         env:
           GH_READ_TOKEN: ${{ steps.read.outputs.token }}
           GH_WRITE_TOKEN: ${{ steps.write.outputs.token }}
           GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-candidate.py dispatch candidate.json Wildcat
+      - name: Dispatch Clowder nightly candidate
+        id: dispatch_clowder
+        if: env.DRY_RUN == 'false' && steps.inspect.outputs.dispatch_clowder == 'true'
+        env:
+          GH_READ_TOKEN: ${{ steps.read.outputs.token }}
+          GH_WRITE_TOKEN: ${{ steps.write.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-candidate.py dispatch candidate.json Clowder
+      - name: Dispatch Wildcat-Auxiliary nightly candidate
+        id: dispatch_auxiliary
+        if: env.DRY_RUN == 'false' && steps.inspect.outputs.dispatch_auxiliary == 'true'
+        env:
+          GH_READ_TOKEN: ${{ steps.read.outputs.token }}
+          GH_WRITE_TOKEN: ${{ steps.write.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-candidate.py dispatch candidate.json Wildcat-Auxiliary
+      - name: Dispatch wildcat-dashboard-ui nightly candidate
+        id: dispatch_dashboard
+        if: env.DRY_RUN == 'false' && steps.inspect.outputs.dispatch_dashboard == 'true'
+        env:
+          GH_READ_TOKEN: ${{ steps.read.outputs.token }}
+          GH_WRITE_TOKEN: ${{ steps.write.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-candidate.py dispatch candidate.json wildcat-dashboard-ui
+      - name: Restore images or collect the complete source-specific build results
+        id: images
+        env:
+          GH_READ_TOKEN: ${{ steps.read.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CURRENT_DISPATCHES: >-
+            {"Wildcat":"${{ steps.dispatch_wildcat.outputs.require_own || 'false' }}",
+             "Clowder":"${{ steps.dispatch_clowder.outputs.require_own || 'false' }}",
+             "Wildcat-Auxiliary":"${{ steps.dispatch_auxiliary.outputs.require_own || 'false' }}",
+             "wildcat-dashboard-ui":"${{ steps.dispatch_dashboard.outputs.require_own || 'false' }}"}
         run: python3 .github/scripts/nightly-candidate.py images candidate.json images.json
       - name: Preserve images before deployment
         if: steps.images.outputs.complete == 'true' && steps.images.outputs.created == 'true'
