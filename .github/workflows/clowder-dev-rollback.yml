@@ -1,0 +1,130 @@
+name: Restore an accepted Clowder development candidate
+run-name: Clowder dev rollback ${{ inputs.accepted_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      accepted_run_id:
+        description: Original accepted clowder-dev candidate run ID
+        type: string
+        required: true
+      data_compatible:
+        description: Confirm that the saved application/configuration is compatible with current data
+        type: boolean
+        default: false
+      dry_run:
+        description: Validate and preserve the request without dispatching a rollback
+        type: boolean
+        default: true
+
+permissions: {}
+concurrency:
+  group: clowder-dev-rollback
+  cancel-in-progress: false
+env:
+  ORG: ${{ github.repository_owner }}
+  DRY_RUN: ${{ inputs.dry_run != false && 'true' || 'false' }}
+  DATA_COMPATIBLE: ${{ inputs.data_compatible }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          python3 .github/scripts/test_nightly_candidate.py
+          python3 .github/scripts/test_nightly_operations.py
+
+  request:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Require master before operational writes
+        if: env.DRY_RUN == 'false'
+        run: test "$GITHUB_REF" = refs/heads/master
+      - name: Read deployment evidence
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Wildcat-deployment
+          permission-actions: read
+          permission-contents: read
+      - name: Restore the accepted digests and validate compatibility confirmation
+        id: request
+        env:
+          GH_READ_TOKEN: ${{ steps.token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ACCEPTED_RUN_ID: ${{ inputs.accepted_run_id }}
+        run: python3 .github/scripts/nightly-operations.py rollback-request "$ACCEPTED_RUN_ID" rollback-request.json
+      - name: Preserve the immutable request before any deployment
+        if: steps.request.outputs.created == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clowder-rollback-request
+          path: rollback-request.json
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: false
+
+  restore:
+    if: inputs.dry_run == false
+    needs: request
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: clowder-rollback-request
+      - name: Scope execution to the existing deployment workflow
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.WILDCAT_DEPLOYMENT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WILDCAT_DEPLOYMENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Wildcat-deployment
+          permission-actions: write
+          permission-contents: read
+      - name: Preserve the first submission attempt
+        id: intent
+        env:
+          GH_READ_TOKEN: ${{ steps.token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-operations.py rollback-intent rollback-request.json dispatch-intent.json
+      - name: Save dispatch intent before submitting the recipient
+        if: steps.intent.outputs.created == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clowder-dispatch-intent
+          path: dispatch-intent.json
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: false
+      - name: Restore saved digests under the shared environment lock
+        env:
+          GH_READ_TOKEN: ${{ steps.token.outputs.token }}
+          GH_WRITE_TOKEN: ${{ steps.token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-operations.py rollback rollback-request.json result.json
+      - name: Preserve the verified restoration result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clowder-rollback-result-${{ github.run_attempt }}
+          path: result.json
+          retention-days: 90
+          if-no-files-found: error

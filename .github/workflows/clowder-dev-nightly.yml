@@ -1,0 +1,224 @@
+name: Clowder development nightly
+run-name: Clowder dev candidate ${{ github.run_id }}
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/nightly-*.py'
+      - '.github/scripts/test_nightly_*.py'
+      - '.github/scripts/release-train.py'
+      - '.github/workflows/clowder-dev-*.yml'
+  schedule:
+    - cron: '0 23 * * 0-4'
+      timezone: Europe/Vienna
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Save and verify the candidate without build or deployment dispatches
+        type: boolean
+        default: true
+
+permissions: {}
+concurrency:
+  group: clowder-dev-candidate
+  cancel-in-progress: false
+env:
+  ORG: ${{ github.repository_owner }}
+  DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (inputs.dry_run != false && 'true' || 'false') }}
+
+jobs:
+  test:
+    if: github.event_name != 'schedule' || vars.CLOWDER_NIGHTLY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          python3 .github/scripts/test_nightly_candidate.py
+          python3 .github/scripts/test_nightly_operations.py
+
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.CLOWDER_NIGHTLY_ENABLED == 'true')
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Require master before operational writes
+        if: env.DRY_RUN == 'false'
+        run: test "$GITHUB_REF" = refs/heads/master
+      - name: Read saved candidates and participant commits
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            Wildcat
+            Clowder
+            Wildcat-Auxiliary
+            Wildcat-deployment
+            wildcat-dashboard-ui
+            E-Bill-frontend
+            wallet
+          permission-actions: read
+          permission-checks: read
+          permission-contents: read
+      - name: Locate the previous accepted candidate
+        id: previous
+        env:
+          GH_READ_TOKEN: ${{ steps.token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-operations.py previous
+      - name: Require an accepted baseline before scheduling
+        if: github.event_name == 'schedule'
+        env:
+          PREVIOUS: ${{ steps.previous.outputs.previous_accepted_run_id }}
+        run: test -n "$PREVIOUS"
+      - name: Prepare or restore the original source plan
+        id: plan
+        env:
+          GH_READ_TOKEN: ${{ steps.token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PREVIOUS_ACCEPTED_RUN_ID: ${{ steps.previous.outputs.previous_accepted_run_id }}
+        run: python3 .github/scripts/nightly-candidate.py prepare candidate.json
+      - name: Preserve the plan before build dispatches
+        if: steps.plan.outputs.created == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clowder-nightly-plan
+          path: candidate.json
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: false
+
+  images:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      complete: ${{ steps.images.outputs.complete }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: clowder-nightly-plan
+      - name: Read producer evidence
+        id: read
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            Wildcat
+            Clowder
+            Wildcat-Auxiliary
+            wildcat-dashboard-ui
+          permission-actions: read
+          permission-contents: read
+      - name: Scope build dispatches to the four producers
+        if: env.DRY_RUN == 'false'
+        id: write
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.WILDCAT_DEPLOYMENT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WILDCAT_DEPLOYMENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            Wildcat
+            Clowder
+            Wildcat-Auxiliary
+            wildcat-dashboard-ui
+          permission-actions: write
+          permission-contents: read
+      - name: Restore images or collect the complete source-specific build results
+        id: images
+        env:
+          GH_READ_TOKEN: ${{ steps.read.outputs.token }}
+          GH_WRITE_TOKEN: ${{ steps.write.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-candidate.py images candidate.json images.json
+      - name: Preserve images before deployment
+        if: steps.images.outputs.complete == 'true' && steps.images.outputs.created == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clowder-nightly-images
+          path: images.json
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: false
+      - name: Record the preparation outcome
+        if: always()
+        env:
+          COMPLETE: ${{ steps.images.outputs.complete }}
+        run: |
+          {
+            echo '## Clowder candidate preparation'
+            echo "Dry run: $DRY_RUN. Complete image set: ${COMPLETE:-false}."
+            echo 'Missing image evidence is not deployment readiness. A dry run never dispatches builds or deployment.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    if: needs.images.outputs.complete == 'true' && (github.event_name == 'schedule' || inputs.dry_run == false)
+    needs: images
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: clowder-nightly-plan
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: clowder-nightly-images
+      - name: Scope execution access to deployment
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.WILDCAT_DEPLOYMENT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.WILDCAT_DEPLOYMENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Wildcat-deployment
+          permission-actions: write
+          permission-contents: read
+      - name: Preserve the first submission attempt
+        id: intent
+        env:
+          GH_READ_TOKEN: ${{ steps.token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-operations.py deploy-intent candidate.json images.json dispatch-intent.json
+      - name: Save dispatch intent before submitting the recipient
+        if: steps.intent.outputs.created == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clowder-dispatch-intent
+          path: dispatch-intent.json
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: false
+      - name: Reconcile the locked deployment and functional-test operation
+        env:
+          GH_READ_TOKEN: ${{ steps.token.outputs.token }}
+          GH_WRITE_TOKEN: ${{ steps.token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/nightly-operations.py deploy candidate.json images.json result.json
+      - name: Save acceptance only after verified deployment and tests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: clowder-nightly-result-${{ github.run_attempt }}
+          path: result.json
+          retention-days: 90
+          if-no-files-found: error
