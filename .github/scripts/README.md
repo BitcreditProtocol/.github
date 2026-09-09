@@ -50,10 +50,12 @@ repository whose `pull_request` workflow declares no `permissions` block.
 level, where the repository copy silently wins · a workflow referencing an
 organisation secret the repository was not granted · and a secret or variable
 that no workflow on the default branch reads any more, reported with one of five
-verdicts: safe to delete, safe because only branches dead for 90 days hold it,
-not safe because a live branch still needs it, not safe because something outside
-`.github/workflows` reads it, or **unknown** because a read failed. The last one
-matters most: a failed read must never render as *safe to delete*.
+verdicts: no reference found in the inspected workflow/configuration scope;
+references only on branches with commit dates older than 90 days, requiring
+manual confirmation before deletion; a live branch still needs it; something
+outside `.github/workflows` reads it; or **unknown** because a read failed.
+A commit date is not the date of the last branch push. Neither an old commit nor
+a failed read proves that a credential is safe to delete.
 
 **Its environments** — one holding secrets with no protection rule · one listing
 a reviewer who is not an organisation member.
