@@ -4,6 +4,7 @@ Scheduled workflows maintain organisation settings and watch cross-repository de
 
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
+| `propose-wallet-minimum.yml` | `propose-wallet-minimum.py` | a proposal branch and PR in static-assets | explicit wallet minimum and release provenance |
 | `watch-dependency-graph.yml` | `watch-dependency-graph.py` | dependency issues, after explicit activation | exact pins, ranges, revisions, overrides and incomplete reads |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
 | `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | configuration findings, coverage metrics and a list of what it could not read — see below |
@@ -142,6 +143,33 @@ Only marked issues authored by the current automation App are managed; a marker 
 Scheduled runs stay read-only until the repository variable DEPENDENCY_WATCH_ENABLED is exactly true. After this PR merges, dispatch watch-dependency-graph.yml with dry_run=true, inspect its native summary, then enable that variable when notifications are wanted. Manual runs also default to dry_run=true.
 
 The App token requests only Contents/Metadata read and Issues read for a dry run, or Issues write for an enabled run. PRs execute python3 .github/scripts/test_dependency_watch.py without App credentials; the operational job cannot run on pull_request.
+
+## Wallet minimum-version proposals
+
+Manually dispatch `propose-wallet-minimum.yml` with `target_env` (`dev`, `staging`
+or `prod`), `source_release_tag` and `proposed_min_version`. The minimum is an
+explicit `MAJOR.MINOR.PATCH` value. It is never inferred from `pubspec.yaml` or
+free-form release notes. Start with the default `dry_run=true`.
+
+The workflow reads the chosen published wallet release and tag commit, then
+proposes only `static/wallet/min-version/<environment>/min-supported-version.json`
+in static-assets. It reconciles one proposal PR per environment. Repeating an
+identical request does nothing; unrelated edits to a proposal branch stop the
+operation. A reviewer merges the PR. The default branch is never pushed directly.
+The write token has Contents and Pull requests access to static-assets only;
+the public PR does not copy the private wallet changelog.
+
+For production, confirm that a suitable version is publicly available through
+both Google Play and the App Store before approving the floor PR. A GitHub
+Release, candidate upload or TestFlight availability does not establish this.
+Record the store evidence in the PR; workflow validation alone is insufficient.
+
+After merging a proposal, verify the exact JSON at
+`https://static.bit.cr/wallet/min-version/<environment>/min-supported-version.json`
+and test a client below, at and above the floor. An inspection tool's blocked
+request does not establish a hosting failure. Do not weaken Cloudflare controls
+to bypass a tool restriction. The obsolete direct-push publisher on wallet `dev`
+must be removed before that branch is merged into `master`.
 
 ## Setup
 
