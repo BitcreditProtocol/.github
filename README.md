@@ -34,7 +34,7 @@ They record the *expected value* rather than a list of repositories to skip, so 
 
 Most of it happens on its own. A new repository is picked up by the next scheduled run because the scheduled workflows list repositories from the API rather than from a file.
 
-**Arrives by itself** — labels, organisation topics, merge settings, branch and tag rules (every ruleset targets `~ALL`), `GITHUB_TOKEN` permissions, the issue and pull request templates above, and the baseline security configuration, which is the default for new repositories.
+**Arrives by itself** — labels, organisation topics, merge settings, branch and tag rules within their configured repository scope, `GITHUB_TOKEN` permissions, the issue and pull request templates above, and the baseline security configuration, which is the default for new repositories.
 
 **Shows up in the weekly report** — no description, no `LICENSE`, the wrong copyright holder, no `dependabot.yml` for detected package ecosystems or external GitHub Actions references, no entry in `dependabot-assignees.yml`, an empty public wiki, or a security configuration other than the baseline.
 
