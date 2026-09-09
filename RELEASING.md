@@ -267,8 +267,10 @@ For a train, dispatch `release-train.yml` with the original `resume_run_id` whil
 its 90-day candidate artifact remains available. This is a new dispatch restoring
 saved state, so it does not rely on the native rerun window.
 
-For WASM and UI, use **Re-run failed jobs** or **Re-run all jobs** on the original
-run to restore saved archives. For wallet, if both mobile jobs succeeded, rerun
+For WASM and UI, rerun only the failed publication job on the original run to
+restore saved archives. Do not use **Re-run all jobs**: a full rerun removes
+previous artifacts despite their retention period. Preserve successful package
+preparation. For wallet, if both mobile jobs succeeded, rerun
 only the failed GitHub asset job; it reuses the original APK/IPA files and build
 number. A stable candidate manifest and checksums protect those identities.
 `promote-release.yml` continues to promote existing store builds without rebuilding.
