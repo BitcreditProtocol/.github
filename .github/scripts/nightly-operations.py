@@ -342,23 +342,23 @@ def prove_no_prior_submission(cfg, root, operation):
                     and job.get("status") == "completed"
                     and isinstance(job.get("conclusion"), str) and job["conclusion"]
                     and isinstance(job.get("steps"), list) for job in jobs),
-                "Missing intent: prior job history is incomplete or belongs to another attempt")
+                "Dispatch recovery: prior job history is incomplete or belongs to another attempt")
         matched = [job for job in jobs if job["name"] == job_name]
-        require(len(matched) <= 1, "Missing intent: the prior submission job is ambiguous")
+        require(len(matched) <= 1, "Dispatch recovery: the prior submission job is ambiguous")
         if not matched or matched[0]["conclusion"] == "skipped" and not matched[0]["steps"]:
             continue
         steps = matched[0]["steps"]
         require(all(isinstance(step, dict) and isinstance(step.get("name"), str) and step["name"]
                     and candidate.positive(step.get("number")) for step in steps)
                 and len({step["number"] for step in steps}) == len(steps),
-                "Missing intent: prior step history is incomplete or ambiguous")
+                "Dispatch recovery: prior step history is incomplete or ambiguous")
         selected = [step for step in steps if step["name"] == step_name]
-        require(len(selected) == 1, "Missing intent: the prior submission step is unmeasured")
+        require(len(selected) == 1, "Dispatch recovery: the prior submission step is unmeasured")
         step = selected[0]
         require((step.get("status") == "completed" and step.get("conclusion") == "skipped")
                 or (step.get("status") == "queued" and "conclusion" in step and step["conclusion"] is None
                     and "started_at" in step and step["started_at"] is None),
-                "Missing intent: prior submission may have started; refusing a replacement intent or POST")
+                "Dispatch recovery: prior submission may have started; refusing a replacement intent or POST")
 
 
 def prepare_intent(cfg, inputs, path):
@@ -444,8 +444,8 @@ def reconcile(cfg, inputs, destination, *, timeout=WAIT_SECONDS):
                 candidate.progress(f"Verified {payload['operation']} recipient {recipient_id}, attempt {run['run_attempt']}, result artifact {artifact['id']}")
                 return value
         elif not submitted:
-            require(intent["first_submission_attempt"] == cfg["attempt"],
-                    "Submission outcome unknown: an older dispatch intent has no recipient. Inspect the saved payload and dispatch history; do not create a fresh candidate")
+            if intent["first_submission_attempt"] != cfg["attempt"]:
+                prove_no_prior_submission(cfg, root, payload["operation"])
             require(candidate.head_of(cfg, DEPLOYMENT) == sha, "Deployment master moved after capture; saved sources will not be replaced")
             submitted = True  # A missing/invalid response is never permission for another POST.
             try:

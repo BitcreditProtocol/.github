@@ -12,8 +12,8 @@ are complete. The older deployment `nightly.yml` remains disabled: it targets
 
 ## Before a real candidate
 
-1. Merge and verify the PostgreSQL restoration in `Wildcat-deployment#154`,
-   readiness changes in `#156`, and their dependent nightly integration.
+1. Verify the merged PostgreSQL restoration in `Wildcat-deployment#154`, then
+   merge and verify readiness changes in `#156` and their dependent nightly integration.
 2. Merge the four producer interfaces, frontend correlation, wallet receipt,
    and central coordinator changes linked from `infrastructure#246`. Run their
    ordinary checks on the merged commits.
@@ -92,18 +92,23 @@ run before choosing recovery; there is no automatic data restore or rollback.
 
 ## Recover the saved candidate
 
-Use GitHub's rerun of the original coordinator. It restores the original plan and
-image artifact. Missing, expired, corrupt or conflicting saved evidence stops
-recovery; it does not capture new `master` heads.
+Use **Re-run failed jobs** or rerun the relevant individual job in the original
+coordinator. Keep its saved plan, image and dispatch-intent artifacts. Do not use
+**Re-run all jobs**: the native full rerun removes previous artifacts, even within
+their retention period. Missing, expired, corrupt or conflicting saved evidence
+stops recovery; it does not capture new `master` heads or re-upload a local copy.
 
-If a producer failed, inspect and rerun that producer run. Its successful image
+If a producer failed, inspect and rerun its failed jobs. Its successful image
 receipts may span native attempts; the collector retains the latest valid receipt
 for each image within that same saved source/run. A newer invalid receipt blocks
 fallback to an older receipt.
 
 If the recipient failed, wait for its child tests to become terminal and resolve
 the reported cause. Rerun all recipient jobs to establish fresh readiness for all
-five targets and fresh test evidence, then rerun the original coordinator. A
+five targets and fresh test evidence, then rerun only the coordinator's waiting
+or failed execution job. The recipient's full rerun replaces that recipient's
+attempt diagnostics; it does not rerun the central artifact-owning workflow.
+Preserve any failed-attempt diagnostics needed for investigation first. A
 45-minute observation window can end before the recipient; this does not cancel
 its work or establish failure of the child. Read the actual recipient state.
 
@@ -144,7 +149,8 @@ All metadata artifacts use native immutable Actions storage with 90-day retentio
 | Deployment | each target's image lock and manifest, frontend/functional result, `clowder-deployment-result-<attempt>` |
 | Frontend / wallet | attempt-specific context, reports and wallet receipt; credentials are excluded |
 
-Artifact retention does not extend GitHub's native rerun window. Keep the recorded
+Artifact retention does not protect against deletion by a full rerun and does
+not extend GitHub's native rerun window. Keep the recorded
 run and artifact links in the issue; do not store database backups or secrets in
 these artifacts. Existing mint token transfer stays within the test handoff and
 is not copied into central plans or acceptance records.

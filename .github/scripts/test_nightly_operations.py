@@ -274,13 +274,36 @@ class OperationsTests(unittest.TestCase):
             self.deploy()
         self.assertFalse(self.github.posts)
 
-    def test_first_attempt_metadata_is_restored_on_rerun(self):
+    def test_preserved_intent_allows_first_post_after_proven_pre_submission_failure(self):
         self.intent()
+        artifact = next(a for a in self.github.artifacts[".github", 123] if a["name"] == operations.INTENT)
+        original = copy.deepcopy(artifact), self.github.archives[artifact["id"]]
         self.cfg["attempt"] = self.github.roots[123]["run_attempt"] = 2
+        self.github.jobs[123, 1] = [self.prior_job()]
         value = operations.prepare_intent(self.cfg, self.inputs(), self.intent_path)
         self.assertEqual(value["first_submission_attempt"], 1)
-        with self.assertRaisesRegex(operations.Error, "Submission outcome unknown"):
-            self.deploy()
+        result = self.deploy()
+        self.assertTrue(result["result"]["accepted"])
+        self.assertEqual(result["first_submission_attempt"], 1)
+        self.assertEqual(result["intent_artifact_id"], artifact["id"])
+        self.assertEqual((artifact, self.github.archives[artifact["id"]]), original)
+        self.assertEqual(len(self.github.posts), 1)
+
+    def test_preserved_intent_cannot_repeat_an_executed_or_uncertain_prior_step(self):
+        self.intent()
+        artifact = next(a for a in self.github.artifacts[".github", 123] if a["name"] == operations.INTENT)
+        original = copy.deepcopy(artifact), self.github.archives[artifact["id"]]
+        self.cfg["attempt"] = self.github.roots[123]["run_attempt"] = 3
+        self.github.jobs[123, 2] = []
+        for conclusion in ("success", "failure", "cancelled", None):
+            with self.subTest(conclusion=conclusion):
+                job = self.prior_job()
+                job["steps"][0].update(status="in_progress" if conclusion is None else "completed",
+                                       conclusion=conclusion, started_at="2026-09-09T02:00:00Z")
+                self.github.jobs[123, 1] = [job]
+                with self.assertRaisesRegex(operations.Error, "submission may have started"):
+                    self.deploy()
+                self.assertEqual((artifact, self.github.archives[artifact["id"]]), original)
         self.assertFalse(self.github.posts)
 
     def test_rerun_that_never_reached_intent_can_prepare_it(self):
@@ -392,7 +415,10 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(len(self.github.posts), 1)
         self.assertFalse(self.result_path.exists())
         self.cfg["attempt"] = self.github.roots[123]["run_attempt"] = 2
-        with self.assertRaisesRegex(operations.Error, "Submission outcome unknown"):
+        job = self.prior_job()
+        job["steps"][0].update(conclusion="failure", started_at="2026-09-09T02:00:00Z")
+        self.github.jobs[123, 1] = [job]
+        with self.assertRaisesRegex(operations.Error, "submission may have started"):
             self.deploy()
         self.assertEqual(len(self.github.posts), 1)
 
