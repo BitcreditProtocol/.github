@@ -15,8 +15,8 @@ to refresh that issue.
 
 `audit-repo-settings` mirrors its findings into a single issue titled
 **Repository settings drift** in this repository. The issue is updated in place
-on every run and closed automatically once nothing is left to report, so the
-weekly schedule does not pile up duplicates. A summary that only exists inside a
+on writing runs and closed only after a complete audit finds nothing left to
+report, so the weekly schedule does not pile up duplicates. A summary that only exists inside a
 workflow log is a report nobody reads.
 
 ## What the audit reports
@@ -96,8 +96,9 @@ was the first is a false all-clear — an audit that says *no unprotected
 environments* because it could not list environments is worse than one that says
 nothing. The same rule governs the credential verdict above.
 
-It also means the report is the App's own permission probe: whatever it lists is
-exactly what the App is missing.
+The gaps identify unavailable measurements. Check the recorded API failure
+before changing a permission: access errors, rate limits, server failures and
+invalid responses need different remedies.
 
 ## What they will not do
 
@@ -139,14 +140,15 @@ A manual closure suppresses that target version only. A later release can notify
 
 Only marked issues authored by the current automation App are managed; a marker in somebody else's issue does not grant ownership. All issue pages are read before any issue mutation. API failures and malformed/truncated inputs appear in the run summary; they do not mean every exact pin is current. Unknown write outcomes are read back before a subsequent run can create anything again.
 
-Scheduled runs stay read-only until the repository variable DEPENDENCY_WATCH_ENABLED is exactly true. After this PR merges, dispatch watch-dependency-graph.yml with dry_run=true, inspect its native summary, then enable that variable when notifications are wanted. Manual runs also default to dry_run=true.
+Scheduled runs stay read-only until the repository variable DEPENDENCY_WATCH_ENABLED is exactly true. Dispatch watch-dependency-graph.yml with dry_run=true and inspect its native summary before separately enabling notifications. Manual runs also default to dry_run=true.
 
 The App token requests only Contents/Metadata read and Issues read for a dry run, or Issues write for an enabled run. PRs execute python3 .github/scripts/test_dependency_watch.py without App credentials; the operational job cannot run on pull_request.
 
 ## Setup
 
-Both need an organisation-scoped token. `GITHUB_TOKEN` cannot be used
-— it is scoped to this repository alone and cannot touch the others.
+Cross-repository operations require an organisation-scoped App token.
+`GITHUB_TOKEN` remains scoped to this repository and is used for its own Actions
+artifacts, including saved release-train candidates.
 
 - organisation **variable** `AUTOMATION_APP_ID` — the App's numeric ID
 - organisation **secret** `AUTOMATION_APP_PRIVATE_KEY` — the App's private key
@@ -161,9 +163,11 @@ rather than the App when confirming a grant.
 | Permission | Level | Needed for |
 | --- | --- | --- |
 | Metadata | read | listing repositories |
-| Issues | **write** | creating and updating labels, and the drift issue |
-| Administration | **write** | setting topics |
-| Contents | read | `LICENSE`, `dependabot.yml`, workflow bodies, branch trees |
+| Issues | **write** | labels, drift reports, dependency notifications and release diagnostics |
+| Administration | **write** | topics and merge settings |
+| Contents | **write** | source reads, annotated train tags and releases |
+| Checks | read | CI results for the saved release-train commits |
+| Actions | read | release-train image-build runs |
 | Dependabot alerts | read | the open-alert summary |
 | Pages | read | public Pages sites |
 | Members | read, organisation | environment reviewers |
@@ -172,14 +176,15 @@ rather than the App when confirming a grant.
 | Variables | read, repository | orphaned variables |
 | Environments | read | protection rules and environment secrets |
 
-It also holds `contents: write`, `pull_requests: write` and repository
-`packages: write`, granted for work outside these two scripts. Neither of the
-two writes a file or opens a pull request.
+The installation also holds `pull_requests: write`, repository `packages: write`
+and organisation Projects read for other work. These workflows do not create
+pull requests or prune package versions. The release-train and watcher jobs
+request narrower tokens for their specific read or write operations.
 
 ### What it was missing, and what happened to the list
 
 Eight of the nine permissions this file used to list were granted on 2026-09-02,
-so the audit now runs every check it used to skip. Read the installation rather
+and Actions read was added for the release train. Read the installation rather
 than this paragraph — `orgs/{org}/installations` is the source of truth, and
 `Variables` appears there under its API name `actions_variables`.
 
@@ -265,7 +270,7 @@ nothing next to an update that does not run.
 | --- | --- | --- | --- |
 | `release-train.yml` | `release-train.py` | annotated tags and releases in the five members; dashboard snapshot issue | exact candidate, master checks, shared-crate revisions, migrations and image-build starts |
 
-See [the release contract](https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md), introduced by PR #36. Merge PR #39 and inspect a native dry-run dispatch from `master` before cutting a real train.
+See [the release contract](https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md). Prepare each candidate with a native dry-run dispatch from `master` and inspect its saved composition before cutting a real train.
 
 A new dispatch takes `product`; recovery takes the original `resume_run_id` and leaves `product` blank. `dry_run` defaults to true. Preparation records all five full SHAs and the UTC tag in the immutable `release-train-plan` Actions artifact before any tags are written. Its retention is 90 days; an expired or missing plan stops recovery instead of recapturing current heads. Rerunning an attempt restores that run's original candidate. A new dispatch can resume the original dry-run to cut exactly what was inspected.
 

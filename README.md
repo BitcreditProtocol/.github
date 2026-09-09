@@ -38,7 +38,7 @@ Most of it happens on its own. A new repository is picked up by the next schedul
 
 **Shows up in the weekly report** — no description, no `LICENSE`, the wrong copyright holder, no `dependabot.yml` for detected package ecosystems or external GitHub Actions references, no entry in `dependabot-assignees.yml`, an empty public wiki, or a security configuration other than the baseline.
 
-**Nobody checks** — which project board the repository belongs to, its environments, whether discussions are on, and whether its default branch is `master` or `main`. These are decisions rather than drift, so no automation touches them.
+**Operator decisions** — project boards, environment purpose, discussions and the choice of default branch. The audit reports environment protection and reviewer findings; it does not decide which environments should exist or change their settings.
 
 ## Removing a repository
 
