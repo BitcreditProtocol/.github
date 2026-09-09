@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Run the actual audit with a fake gh executable; no network or write access."""
+import base64
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -12,14 +14,20 @@ FAKE_GH = r'''#!/usr/bin/env python3
 import base64, json, os, subprocess, sys
 args = sys.argv[1:]
 if '-X' in args or '--method' in args:
-    sys.exit('unexpected write in dry-run audit')
+    if os.environ['DRY_RUN'] == 'true':
+        sys.exit('unexpected write in dry-run audit')
+    with open(os.environ['AUDIT_WRITES'], 'a') as out:
+        out.write(json.dumps(args)+'\n')
+    print('{"number":123}')
+    sys.exit(0)
 path = args[1]
 route = path.split('?')[0]
 faults = json.loads(os.environ['AUDIT_FAULTS'])
 meta = dict(name='demo', archived=False, default_branch='master', fork=False,
             description='Fixture', visibility='private', has_issues=True,
             has_wiki=False, allow_merge_commit=True, allow_squash_merge=True,
-            allow_rebase_merge=True, delete_branch_on_merge=True)
+            allow_rebase_merge=True, delete_branch_on_merge=True,
+            allow_update_branch=True)
 raw = any('application/vnd.github.raw' in arg for arg in args)
 status = 200
 if route in faults:
@@ -31,14 +39,14 @@ elif route.endswith('/properties/values'):
 elif route.endswith('/members'):
     data = [dict(login='owner')]
 elif route.endswith('/actions/secrets/ORG_ONLY/repositories'):
-    data = dict(repositories=[])
+    data = dict(total_count=0, repositories=[])
 elif route.endswith('/actions/secrets'):
     data = dict(total_count=1 if '/demo/' in route else 0,
                 secrets=[dict(name='KEEP_ME')] if '/demo/' in route else [])
 elif route.endswith('/actions/variables'):
     data = dict(total_count=0, variables=[])
 elif route.endswith('/environments'):
-    data = dict(environments=[])
+    data = dict(total_count=0, environments=[])
 elif route.endswith('/pages'):
     status, data = 404, dict(message='Not Found', status='404')
 elif route == 'repos/Fixture/demo':
@@ -80,7 +88,9 @@ if status != 200:
 if raw:
     print(data, end='')
 else:
-    if '--slurp' in args: data = [data]
+    if isinstance(data, dict) and '__pages__' in data:
+        data = data['__pages__'] if '--paginate' in args and '--slurp' in args else data['__pages__'][0]
+    elif '--slurp' in args: data = [data]
     if '--jq' in args:
         r = subprocess.run(['jq','-r',args[args.index('--jq')+1]],input=json.dumps(data),text=True)
         sys.exit(r.returncode)
@@ -89,7 +99,7 @@ else:
 
 
 class AuditTests(unittest.TestCase):
-    def run_audit(self, faults=None, disable_corpus_guards=False, files=None):
+    def run_audit(self, faults=None, disable_corpus_guards=False, files=None, dry_run=True, assignees=None):
         responses = {}
         if files is not None:
             responses['repos/Fixture/demo/git/trees/master'] = [200, {
@@ -102,12 +112,13 @@ class AuditTests(unittest.TestCase):
             gh.write_text(FAKE_GH)
             gh.chmod(0o755)
             (root / 'license.json').write_text('{"holder":"Fixture"}')
-            (root / 'assignees.json').write_text('{"assignees":{}}')
+            (root / 'assignees.json').write_text(json.dumps({'assignees': assignees or {}}))
             env = dict(os.environ, PATH=str(root)+os.pathsep+os.environ['PATH'],
-                       GH_TOKEN='offline-fixture', ORG='Fixture', DRY_RUN='true',
+                       GH_TOKEN='offline-fixture', ORG='Fixture', DRY_RUN=str(dry_run).lower(),
                        BASELINE_CONFIG='Bitcredit baseline', GITHUB_REPOSITORY='Fixture/.github',
                        LICENSE_JSON=str(root/'license.json'), ASSIGNEES_JSON=str(root/'assignees.json'),
-                       GITHUB_STEP_SUMMARY=str(root/'summary'), AUDIT_FAULTS=json.dumps(responses))
+                       GITHUB_STEP_SUMMARY=str(root/'summary'), AUDIT_FAULTS=json.dumps(responses),
+                       AUDIT_WRITES=str(root/'writes'))
             script = Path(__file__).with_name('audit-repo-settings.sh')
             if disable_corpus_guards:
                 control = root/'audit-repo-settings.sh'
@@ -117,7 +128,9 @@ class AuditTests(unittest.TestCase):
                                     env=env, text=True, capture_output=True, timeout=45)
             self.assertEqual(result.returncode, 0, result.stdout+'\n'+result.stderr)
             self.assertNotIn('unhandled fixture', result.stderr)
-            return (root/'summary').read_text()
+            summary = (root/'summary').read_text()
+            writes = [json.loads(line) for line in (root/'writes').read_text().splitlines()] if (root/'writes').exists() else []
+            return summary if dry_run else (summary, writes)
 
     def test_success_and_confirmed_absence(self):
         summary = self.run_audit()
@@ -269,6 +282,230 @@ jobs:
                 summary = self.run_audit({route:data})
                 self.assertIn('Not measured on this run', summary)
                 self.assertNotIn('archived, but still holds', summary)
+
+    def test_failed_community_reads_cannot_close_the_existing_issue(self):
+        files = {'.github/workflows/check.yml': 'on: push\njobs: {}\n# secrets.KEEP_ME\n',
+                 'CONTRIBUTING.md': 'Contribution guide.\n'}
+        faults = {'repos/Fixture/.github/contents/CONTRIBUTING.md': [200, files['CONTRIBUTING.md']],
+                  'repos/Fixture/.github/issues': [200, [{'number': 123, 'title': 'Repository settings drift'}]]}
+        self.assertIn('byte-identical', self.run_audit(faults, files=files))
+        for route, status in (('repos/Fixture/.github/contents/CONTRIBUTING.md', 503),
+                              ('repos/Fixture/demo/contents/CONTRIBUTING.md', 503),
+                              ('repos/Fixture/demo/contents/CONTRIBUTING.md', 404)):
+            with self.subTest(route=route, status=status):
+                summary, writes = self.run_audit({**faults, route: [status, {}]}, files=files, dry_run=False)
+                self.assertIn('coverage is incomplete', summary)
+                self.assertNotIn('byte-identical', summary)
+                self.assertEqual(writes, [])
+        # Confirmed absence is still a complete read, so valid issue closure works.
+        summary, writes = self.run_audit({**faults, 'repos/Fixture/.github/contents/CONTRIBUTING.md': [404, {}]},
+                                        files=files, dry_run=False)
+        self.assertIn('No drift found.', summary)
+        self.assertTrue(any('state=closed' in call for call in writes))
+
+    def test_failed_configuration_reads_are_not_absence_findings(self):
+        files = {'.github/workflows/check.yml': 'on: push\njobs: {}\n# secrets.KEEP_ME\n',
+                 'package.json': '{}'}
+        for route, false_finding in (('license', 'no LICENSE'),
+                                    ('contents/.github/dependabot.yml', 'no .github/dependabot.yml'),
+                                    ('code-security-configuration', 'security configuration is')):
+            for status in (403, 503):
+                with self.subTest(route=route, status=status):
+                    summary = self.run_audit({'repos/Fixture/demo/'+route: [status, {}]}, files=files)
+                    self.assertIn('Not measured on this run', summary)
+                    self.assertNotIn(false_finding, summary)
+        summary = self.run_audit({'repos/Fixture/demo/license': [404, {}],
+                                 'repos/Fixture/demo/code-security-configuration': [404, {}]}, files=files)
+        self.assertIn('no LICENSE', summary)
+        self.assertIn('no .github/dependabot.yml', summary)
+        self.assertIn("security configuration is 'none'", summary)
+
+    def test_shared_blob_keeps_each_live_branch_reference(self):
+        sha = 'b'*40
+        tree = {'truncated': False, 'tree': [{'path': '.github/workflows/use.yml', 'type': 'blob', 'sha': sha}]}
+        faults = {'repos/Fixture/demo/git/trees/dead': [200, tree],
+                  'repos/Fixture/demo/git/trees/live': [200, tree],
+                  'repos/Fixture/demo/git/blobs/'+sha: [200, {'content': base64.b64encode(b'# secrets.KEEP_ME\n').decode()}],
+                  'repos/Fixture/demo/branches/dead': [200, {'commit': {'commit': {'committer': {'date': '2020-01-01T00:00:00Z'}}}}],
+                  'repos/Fixture/demo/branches/live': [200, {'commit': {'commit': {'committer': {'date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}}}}]}
+        for branches in (['master', 'dead', 'live'], ['master', 'live', 'dead']):
+            faults['repos/Fixture/demo/branches'] = [200, [{'name': b} for b in branches]]
+            summary = self.run_audit(faults, files={'.github/workflows/check.yml': 'on: push\njobs: {}\n'})
+            self.assertIn('still referenced on: live', summary)
+            self.assertNotIn('— safe to delete', summary)
+        faults['repos/Fixture/demo/branches'] = [200, [{'name': 'master'}, {'name': 'dead'}]]
+        summary = self.run_audit(faults, files={'.github/workflows/check.yml': 'on: push\njobs: {}\n'})
+        self.assertIn('recorded commit is over 90 days old', summary)
+        self.assertIn('confirm those branches are unused before deletion', summary)
+        self.assertNotIn('— safe to delete', summary)
+
+    def test_truncated_other_branch_cannot_prove_credential_absence(self):
+        faults = {'repos/Fixture/demo/branches': [200, [{'name': 'master'}, {'name': 'feature'}]],
+                  'repos/Fixture/demo/git/trees/feature': [200, {'truncated': True, 'tree': []}]}
+        summary = self.run_audit(faults, files={'.github/workflows/check.yml': 'on: push\njobs: {}\n'})
+        self.assertIn('UNKNOWN', summary)
+        self.assertNotIn('— safe to delete', summary)
+
+    def test_environment_pages_are_complete_before_reporting_or_closing(self):
+        first = [{'name': 'env'+str(i), 'protection_rules': []} for i in range(100)]
+        pages = [{'total_count': 101, 'environments': first},
+                 {'total_count': 101, 'environments': [{'name': 'last', 'protection_rules': []}]}]
+        faults = {'repos/Fixture/demo/environments': [200, {'__pages__': pages}],
+                  **{'repos/Fixture/demo/environments/'+e['name']+'/secrets': [200, {'total_count': 0}] for e in first},
+                  'repos/Fixture/demo/environments/last/secrets': [200, {'total_count': 1}]}
+        summary = self.run_audit(faults)
+        self.assertIn("environment 'last' holds 1 secret(s)", summary)
+        self.assertIn('plus 1 environment-level', summary)
+        faults['repos/Fixture/demo/environments'] = [200, pages[0]]
+        faults['repos/Fixture/.github/issues'] = [200, [{'number': 123, 'title': 'Repository settings drift'}]]
+        summary, writes = self.run_audit(faults, dry_run=False)
+        self.assertIn('coverage is incomplete', summary)
+        self.assertIn('Not measured on this run', summary)
+        self.assertEqual(writes, [])
+
+    def test_incomplete_credential_lists_do_not_judge_usage_or_grants(self):
+        faults = {'orgs/Fixture/actions/secrets': [200, {'total_count': 1, 'secrets': [{'name': 'ORG_ONLY'}]}],
+                  'repos/Fixture/demo/actions/secrets': [200, {'total_count': 1, 'secrets': [{'name': 'ORG_ONLY'}]}],
+                  'repos/Fixture/demo/contents/.github/workflows/one.yml': [200, 'on: push\njobs: {}\n# secrets.ORG_ONLY\n']}
+        for route in ('repos/Fixture/.github/actions/secrets', 'repos/Fixture/demo/actions/secrets',
+                      'repos/Fixture/demo/actions/variables'):
+            with self.subTest(route=route):
+                summary = self.run_audit({**faults, route: [503, {}]})
+                self.assertIn('Not measured on this run', summary)
+                self.assertNotIn('— safe to delete', summary)
+                self.assertNotIn('references organisation secret(s)', summary)
+
+    def test_unreadable_labels_are_not_missing_labels(self):
+        config = {'version': 2, 'updates': [{'package-ecosystem': 'github-actions', 'directory': '/',
+                  'schedule': {'interval': 'weekly'}, 'assignees': ['owner'], 'labels': ['dependencies']}]}
+        faults = {'repos/Fixture/demo/contents/.github/dependabot.yml': [200, {
+                  'content': base64.b64encode(json.dumps(config).encode()).decode()}],
+                  'repos/Fixture/demo/labels': [200, []]}
+        self.assertIn('asks for labels', self.run_audit(faults, assignees={'demo': 'owner'}))
+        summary = self.run_audit({**faults, 'repos/Fixture/demo/labels': [503, {}]}, assignees={'demo': 'owner'})
+        self.assertIn('Not measured on this run', summary)
+        self.assertNotIn('asks for labels', summary)
+        for payload in ({}, [{}], [{'name': ''}]):
+            summary = self.run_audit({**faults, 'repos/Fixture/demo/labels': [200, payload]}, assignees={'demo': 'owner'})
+            self.assertIn('Not measured on this run', summary)
+            self.assertNotIn('asks for labels', summary)
+        summary = self.run_audit({**faults, 'repos/Fixture/demo/labels': [200, [{'name': 'dependencies'}]]},
+                                 assignees={'demo': 'owner'})
+        self.assertNotIn('Not measured on this run', summary)
+        self.assertNotIn('asks for labels', summary)
+
+    def test_malformed_name_envelopes_do_not_judge_credentials(self):
+        faults = {'orgs/Fixture/actions/secrets': [200, {'total_count': 1, 'secrets': [{'name': 'ORG_ONLY'}]}],
+                  'repos/Fixture/demo/actions/secrets': [200, {'total_count': 1, 'secrets': [{'name': 'ORG_ONLY'}]}],
+                  'repos/Fixture/demo/contents/.github/workflows/one.yml': [200, 'on: push\njobs: {}\n# secrets.ORG_ONLY\n']}
+        cases = [('repos/Fixture/demo/actions/secrets', {'total_count': 1}),
+                 ('repos/Fixture/demo/actions/secrets', {'total_count': 1, 'secrets': [{}]}),
+                 ('repos/Fixture/demo/actions/secrets', {'total_count': 2, 'secrets': [{'name': 'ORG_ONLY'}]}),
+                 ('repos/Fixture/demo/actions/variables', {'total_count': 1, 'variables': [{}]}),
+                 ('orgs/Fixture/actions/secrets', {'total_count': 1}),
+                 ('orgs/Fixture/actions/secrets/ORG_ONLY/repositories', {'total_count': 1})]
+        for route, payload in cases:
+            with self.subTest(route=route, payload=payload):
+                summary = self.run_audit({**faults, route: [200, payload]})
+                self.assertIn('Not measured on this run', summary)
+                self.assertNotIn('— safe to delete', summary)
+                self.assertNotIn('references organisation secret(s)', summary)
+        # Both genuine empty lists and valid names remain measured.
+        summary = self.run_audit({'repos/Fixture/demo/actions/secrets': [200, {'total_count': 0, 'secrets': []}]})
+        self.assertNotIn('Not measured on this run', summary)
+        summary = self.run_audit(faults)
+        self.assertNotIn('Not measured on this run', summary)
+        self.assertNotIn('references organisation secret(s)', summary)
+
+    def test_blob_decoding_keeps_unknown_and_empty_distinct(self):
+        workflow = 'on: push\njobs: {}\n'
+        for location in ('branch', 'config'):
+            files = {'.github/workflows/check.yml': workflow}
+            faults = {}
+            sha = 'a'*40
+            if location == 'branch':
+                sha = 'b'*40
+                faults = {'repos/Fixture/demo/branches': [200, [{'name': 'master'}, {'name': 'feature'}]],
+                          'repos/Fixture/demo/git/trees/feature': [200, {'truncated': False, 'tree': [
+                              {'path': '.github/workflows/use.yml', 'type': 'blob', 'sha': sha}]}],
+                          'repos/Fixture/demo/branches/feature': [200, {'commit': {'commit': {'committer': {
+                              'date': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}}}}]}
+            else:
+                files['settings.json'] = '{}'
+            for content in (None, '%%%'):
+                with self.subTest(location=location, content=content):
+                    summary = self.run_audit({**faults, 'repos/Fixture/demo/git/blobs/'+sha: [200, {'content': content}]}, files=files)
+                    self.assertIn('UNKNOWN', summary)
+                    self.assertNotIn('— safe to delete', summary)
+            summary = self.run_audit({**faults, 'repos/Fixture/demo/git/blobs/'+sha: [200, {'content': ''}]}, files=files)
+            self.assertNotIn('UNKNOWN', summary)
+            self.assertIn('— safe to delete', summary)
+            content = base64.b64encode(b'# secrets.KEEP_ME\n').decode()
+            summary = self.run_audit({**faults, 'repos/Fixture/demo/git/blobs/'+sha: [200, {'content': content}]}, files=files)
+            self.assertNotIn('UNKNOWN', summary)
+            self.assertNotIn('— safe to delete', summary)
+
+    def test_empty_configuration_name_cannot_close_the_issue(self):
+        faults = {'repos/Fixture/demo/code-security-configuration': [200, {'configuration': {'name': ''}}],
+                  'repos/Fixture/.github/issues': [200, [{'number': 123, 'title': 'Repository settings drift'}]]}
+        summary, writes = self.run_audit(faults, dry_run=False)
+        self.assertIn('coverage is incomplete', summary)
+        self.assertEqual(writes, [])
+
+    def test_malformed_protection_rules_are_not_fabricated_gates(self):
+        faults = {'repos/Fixture/demo/environments/release/secrets': [200, {'total_count': 1}],
+                  'repos/Fixture/.github/issues': [200, [{'number': 123, 'title': 'Repository settings drift'}]]}
+        malformed = [[None], [{'type': 'required_reviewers'}],
+                     [{'type': 'required_reviewers', 'reviewers': []}],
+                     [{'type': 'required_reviewers', 'reviewers': [None]}],
+                     [{'type': 'required_reviewers', 'reviewers': [{'type': 'User', 'reviewer': {}}]}],
+                     [{'type': 'wait_timer', 'wait_timer': '5'}], [{'type': 'unknown_future_rule'}]]
+        for rules in malformed:
+            with self.subTest(rules=rules):
+                response = {'total_count': 1, 'environments': [{'name': 'release', 'protection_rules': rules}]}
+                summary, writes = self.run_audit({**faults, 'repos/Fixture/demo/environments': [200, response]}, dry_run=False)
+                self.assertIn('coverage is incomplete', summary)
+                self.assertNotIn('behind an approval gate:', summary)
+                self.assertEqual(writes, [])
+        for rules in ([], [{'type': 'branch_policy'}], [{'type': 'wait_timer', 'wait_timer': 5}],
+                      [{'type': 'required_reviewers', 'reviewers': [{'type': 'User', 'reviewer': {'login': 'owner'}}]}]):
+            response = {'total_count': 1, 'environments': [{'name': 'release', 'protection_rules': rules}]}
+            summary = self.run_audit({**faults, 'repos/Fixture/demo/environments': [200, response]})
+            self.assertNotIn('Not measured on this run', summary)
+            self.assertIn('behind an approval gate: **'+('1' if rules else '0')+'**', summary)
+
+    def test_topics_are_validated_before_any_additive_write(self):
+        faults = {'repos/Fixture/.github/issues': [200, [{'number': 123, 'title': 'Repository settings drift'}]]}
+        for payload in ({}, {'names': None}, {'names': {}}, {'names': ['custom', None]},
+                        {'names': ['']}, {'names': ['custom\nother']}):
+            with self.subTest(payload=payload):
+                summary, writes = self.run_audit({**faults, 'repos/Fixture/demo/topics': [200, payload]}, dry_run=False)
+                self.assertIn('coverage is incomplete', summary)
+                self.assertEqual(writes, [])
+        for names in ([], ['custom']):
+            summary, writes = self.run_audit({**faults, 'repos/Fixture/demo/topics': [200, {'names': names}]}, dry_run=False)
+            self.assertNotIn('Not measured on this run', summary)
+            self.assertTrue(any('PUT' in call and 'repos/Fixture/demo/topics' in call for call in writes))
+            self.assertIn('topics corrected: **1**', summary)
+
+    def test_merge_settings_require_booleans_before_enabling(self):
+        flags = ['allow_merge_commit', 'allow_squash_merge', 'allow_rebase_merge',
+                 'delete_branch_on_merge', 'allow_update_branch']
+        meta = dict(name='demo', default_branch='master', fork=False, description='Fixture',
+                    visibility='private', has_issues=True, has_wiki=False, **dict.fromkeys(flags, True))
+        faults = {'repos/Fixture/.github/issues': [200, [{'number': 123, 'title': 'Repository settings drift'}]]}
+        malformed = [{key: value for key, value in meta.items() if key != missing} for missing in flags]
+        malformed += [{**meta, 'allow_merge_commit': value} for value in (None, 'false', 0)]
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                summary, writes = self.run_audit({**faults, 'repos/Fixture/demo': [200, payload]}, dry_run=False)
+                self.assertIn('coverage is incomplete', summary)
+                self.assertEqual(writes, [])
+        summary, writes = self.run_audit({**faults, 'repos/Fixture/demo': [200, {**meta, **dict.fromkeys(flags, False)}]}, dry_run=False)
+        self.assertNotIn('Not measured on this run', summary)
+        self.assertTrue(any('PATCH' in call and 'repos/Fixture/demo' in call and
+                            all(flag+'=true' in call for flag in flags) for call in writes))
+        self.assertIn('merge settings corrected: **1**', summary)
 
 
 if __name__ == '__main__':
