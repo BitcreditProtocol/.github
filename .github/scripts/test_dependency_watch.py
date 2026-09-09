@@ -149,6 +149,85 @@ renamed_local = { package = "ambiguous", path = "crates/ambiguous", version = "=
                                  {("Cargo.toml", "ambiguous"): None, ("Cargo.toml", "shadowed"): "Producer"})
         self.assertEqual(edges, [self.edge(dep="external", pin="v1.0.0")])
 
+    def explicit_workspace_manifests(self):
+        texts = {
+            "Cargo.toml": '[workspace]\nmembers = ["member"]\n',
+            "member/Cargo.toml": '''[package]
+name = "member"
+version = "0.1.0"
+workspace = "../selected"
+[dependencies]
+library = { package = "actual-library", git = "https://github.com/ExampleOrg/Producer.git", tag = "v1.0.0" }
+''',
+            "selected/Cargo.toml": '''[workspace]
+members = ["../member"]
+[patch."https://github.com/ExampleOrg/Producer"]
+replacement = { package = "actual-library", path = "../local-library" }
+''',
+        }
+        return {path: watch.parse_manifest(path, text) for path, text in texts.items()}
+
+    def test_explicit_workspace_selects_sibling_patch_source_and_package_alias(self):
+        for selection in ("../selected", "../selected/../selected", ".././selected/"):
+            for source, expected in (("https://github.com/ExampleOrg/Producer", "patched"), ("crates-io", "exact")):
+                with self.subTest(selection=selection, source=source):
+                    docs = self.explicit_workspace_manifests()
+                    docs["member/Cargo.toml"]["package"]["workspace"] = selection
+                    patches = docs["selected/Cargo.toml"]["patch"]
+                    docs["selected/Cargo.toml"]["patch"] = {source: next(iter(patches.values()))}
+                    edges = watch.edges_from("Consumer", "dev", "member/Cargo.toml", docs, {})
+                    self.assertEqual(edges, [self.edge(branch="dev", path="member/Cargo.toml", pin="v1.0.0", kind=expected)])
+
+    def test_explicit_workspace_does_not_inherit_unrelated_ancestor_or_member_patches(self):
+        docs = self.explicit_workspace_manifests()
+        patches = docs["selected/Cargo.toml"].pop("patch")
+        docs["Cargo.toml"]["patch"] = patches
+        docs["member/Cargo.toml"]["patch"] = patches
+        edges = watch.edges_from("Consumer", "main", "member/Cargo.toml", docs, {})
+        self.assertEqual(edges, [self.edge(path="member/Cargo.toml", pin="v1.0.0")])
+
+    def test_invalid_explicit_workspace_cannot_close_an_issue_or_block_other_manifests(self):
+        cases = []
+        for selection in ("../missing", "../../outside", "/absolute", "C:/workspace", "..\\selected",
+                          "", "../selected\0", [], {}, True, 12):
+            cases.append((repr(selection), lambda docs, value=selection:
+                          docs["member/Cargo.toml"]["package"].update(workspace=value)))
+        cases.extend([
+            ("member declares both workspace forms", lambda docs: docs["member/Cargo.toml"].update(workspace={})),
+            ("selected manifest is not a root", lambda docs: docs["selected/Cargo.toml"].pop("workspace")),
+            ("selected workspace is not a table", lambda docs: docs["selected/Cargo.toml"].update(workspace=[])),
+            ("selected root points elsewhere", lambda docs: docs["selected/Cargo.toml"].update(package={"workspace": ".."})),
+        ])
+        for name, change in cases:
+            with self.subTest(case=name):
+                docs = self.explicit_workspace_manifests()
+                docs["member/Cargo.toml"]["dependencies"]["library"]["tag"] = "v2.0.0"
+                change(docs)
+                edges = watch.edges_from("Consumer", "main", "member/Cargo.toml", docs, {})
+                self.assertEqual(edges, [self.edge(path="member/Cargo.toml", pin="v2.0.0", kind="unmeasured")])
+                self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+                gaps, errors, incomplete = [], [], set()
+                actions = watch.plan_actions(edges + [self.edge(dep="unaffected", path="other/Cargo.toml")],
+                                             {"Consumer": [self.issue()]}, gaps, incomplete, errors)
+                self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
+                self.assertTrue(any("library" in gap for gap in gaps))
+                self.assertEqual((errors, incomplete), ([], set()))
+
+    def test_unavailable_explicit_workspace_inheritance_blocks_false_closure_across_branches(self):
+        docs = self.explicit_workspace_manifests()
+        member = docs["member/Cargo.toml"]
+        member["package"]["workspace"] = "../missing"
+        member["dependencies"]["library"] = {"workspace": True}
+        edges = watch.edges_from("Consumer", "main", "member/Cargo.toml", docs, {})
+        self.assertEqual(edges, [self.edge(path="member/Cargo.toml", producer="", pin="workspace", kind="unmeasured")])
+        self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+        gaps, errors, incomplete = [], [], set()
+        actions = watch.plan_actions(edges + [self.edge(branch="dev", pin="v2.0.0"), self.edge(dep="unaffected")],
+                                     {"Consumer": [self.issue()]}, gaps, incomplete, errors)
+        self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
+        self.assertTrue(any("library" in gap for gap in gaps))
+        self.assertEqual((errors, incomplete), ([], set()))
+
     def test_cargo_patch_source_must_match_the_git_dependency_including_aliases(self):
         for source, replacement, expected in (
             ("crates-io", 'library = { path = "local/library" }', "exact"),
@@ -177,7 +256,7 @@ library = { path = "local/library" }
 ''')
         edges = watch.edges_from("Consumer", "main", "Cargo.toml", {"Cargo.toml": doc}, {})
         self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
-        actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, [], set())
+        actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, [], set(), [])
         self.assertEqual([(a["kind"], a["payload"]["state"]) for a in actions], [("update", "open")])
 
     def test_matching_git_patch_blocks_its_group_without_blocking_other_dependencies(self):
@@ -192,7 +271,7 @@ replacement = { package = "library", path = "local/library" }
             with self.subTest(existing=[i["state"] for i in existing]):
                 self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
                 gaps, incomplete = [], set()
-                actions = watch.plan_actions(edges, {"Consumer": existing}, gaps, incomplete)
+                actions = watch.plan_actions(edges, {"Consumer": existing}, gaps, incomplete, gaps)
                 self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
                 self.assertTrue(any("library" in gap for gap in gaps))
                 self.assertNotIn("Consumer", incomplete)
@@ -221,7 +300,7 @@ replacement = { package = "library", path = "local/library" }
                     self.assertIn(kinds["library"], {"patched", "unmeasured"})
                 self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
                 gaps, incomplete = [], set()
-                actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, gaps, incomplete)
+                actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, gaps, incomplete, gaps)
                 self.assertEqual([a["dep"] for a in actions], ["library", "unaffected"] if location == "other directory" else ["unaffected"])
                 self.assertNotIn("Consumer", incomplete)
 
@@ -242,7 +321,7 @@ replacement = { package = "library", path = "local/library" }
                     self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
                     gaps, incomplete = [], set()
                     actions = watch.plan_actions(edges + [self.edge(branch="dev", path=path, pin=pin)],
-                                                 {"Consumer": existing}, gaps, incomplete)
+                                                 {"Consumer": existing}, gaps, incomplete, gaps)
                     self.assertEqual([(a["dep"], a["kind"]) for a in actions], [("unaffected", "open")])
                     self.assertTrue(any("library" in gap for gap in gaps))
                     self.assertNotIn("Consumer", incomplete)
@@ -295,7 +374,7 @@ dev_dependencies:
                 self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
                 gaps, incomplete = [], set()
                 actions = watch.plan_actions(edges + [self.edge(branch="dev"), self.edge(dep="unaffected")],
-                                             {"Consumer": [self.issue()]}, gaps, incomplete)
+                                             {"Consumer": [self.issue()]}, gaps, incomplete, gaps)
                 self.assertEqual([a["dep"] for a in actions], ["unaffected"])
                 self.assertNotIn("Consumer", incomplete)
 
@@ -397,7 +476,7 @@ dev_dependencies:
                           self.edge(path="range/Cargo.toml", kind="range")]
         self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
         gaps, incomplete = [], set()
-        actions = watch.plan_actions(edges, {"Consumer": []}, gaps, incomplete)
+        actions = watch.plan_actions(edges, {"Consumer": []}, gaps, incomplete, gaps)
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0]["kind"], "open")
         body = actions[0]["payload"]["body"]
@@ -413,7 +492,7 @@ dev_dependencies:
             with self.subTest(target=target):
                 self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release(target)]})
                 gaps = []
-                actions = watch.plan_actions([self.edge()], {"Consumer": [closed]}, gaps, set())
+                actions = watch.plan_actions([self.edge()], {"Consumer": [closed]}, gaps, set(), gaps)
                 self.assertEqual(len(actions), expected)
                 self.assertEqual(gaps, [])
                 if actions:
@@ -424,7 +503,7 @@ dev_dependencies:
             with self.subTest(kind=edge.kind):
                 self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]} if edge.kind == "exact" else {})
                 edges = [edge]
-                actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, [], set())
+                actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, [], set(), [])
                 self.assertEqual(len(actions), 1)
                 self.assertEqual(actions[0]["kind"], "close")
                 self.assertEqual(actions[0]["payload"]["state"], "closed")
@@ -437,20 +516,20 @@ dev_dependencies:
         doc = watch.parse_manifest(path, '[dependencies]\nlibrary = "=1.0.0"\n')
         edges = watch.edges_from("Consumer", "main", path, {path: doc}, {})
         gaps, incomplete = [], set()
-        self.assertEqual(watch.plan_actions(edges, {"Consumer": [self.issue()]}, gaps, incomplete), [])
+        self.assertEqual(watch.plan_actions(edges, {"Consumer": [self.issue()]}, gaps, incomplete, gaps), [])
         self.assertIn("previous dependency is no longer mapped; issue unchanged", gaps[0])
         self.assertEqual(incomplete, {"Consumer"})
         self.api.assert_not_called()
 
     def test_incomplete_scan_prevents_closure_and_discards_earlier_planned_actions(self):
         issues = {"Consumer": [self.issue()]}
-        self.assertEqual(watch.plan_actions([], issues, [], {"Consumer"}), [])
+        self.assertEqual(watch.plan_actions([], issues, [], {"Consumer"}, []), [])
         self.api.assert_not_called()
         self.replies({("GET", "repos/ExampleOrg/Broken/releases/latest"): [watch.APIError("HTTP 403")]})
         gaps, incomplete = [], set()
         # The mapped range would close before the later dependency read fails.
         edges = [self.edge(kind="range", pin="^2.0.0"), self.edge(dep="zzz", producer="Broken")]
-        actions = watch.plan_actions(edges, issues, gaps, incomplete)
+        actions = watch.plan_actions(edges, issues, gaps, incomplete, gaps)
         self.assertEqual(actions, [])
         self.assertEqual(incomplete, {"Consumer"})
         self.assertIn("HTTP 403", gaps[0])
@@ -474,7 +553,7 @@ dev_dependencies:
         _, edges = watch.collect_graph(gaps, incomplete)
         self.assertIn("Producer", incomplete)
         self.assertTrue(gaps)
-        actions = watch.plan_actions(edges, {"Consumer": [self.issue()], "Producer": []}, gaps, incomplete)
+        actions = watch.plan_actions(edges, {"Consumer": [self.issue()], "Producer": []}, gaps, incomplete, gaps)
         self.assertEqual(actions, [], "a failed producer read is not proof that the consumer removed its pin")
 
     def test_automatically_closed_issue_reopens_after_regression(self):
@@ -484,7 +563,7 @@ dev_dependencies:
             with self.subTest(metadata=metadata):
                 self.assertFalse(watch.issue_state(dict(closed, **metadata))["resolved"])
         self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
-        actions = watch.plan_actions([self.edge()], {"Consumer": [closed]}, [], set())
+        actions = watch.plan_actions([self.edge()], {"Consumer": [closed]}, [], set(), [])
         self.assertEqual(len(actions), 1)
         action = actions[0]
         self.assertEqual((action["kind"], action["existing"]["number"], action["payload"]["state"]), ("update", 7, "open"))
@@ -523,7 +602,7 @@ dev_dependencies:
                 closed.pop(field)
                 self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
                 gaps, incomplete = [], set()
-                self.assertEqual(watch.plan_actions([self.edge()], {"Consumer": [closed]}, gaps, incomplete), [])
+                self.assertEqual(watch.plan_actions([self.edge()], {"Consumer": [closed]}, gaps, incomplete, gaps), [])
                 self.assertIn("last closure could not be attributed", gaps[0])
                 self.assertEqual(incomplete, {"Consumer"})
 
@@ -554,7 +633,7 @@ dev_dependencies:
     def test_identical_open_issue_is_not_updated_again(self):
         edges = [self.edge(), self.edge(branch="dev", path="nested/Cargo.toml")]
         self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
-        self.assertEqual(watch.plan_actions(edges, {"Consumer": [self.issue(edges=edges)]}, [], set()), [])
+        self.assertEqual(watch.plan_actions(edges, {"Consumer": [self.issue(edges=edges)]}, [], set(), []), [])
 
     def test_uncertain_creation_rereads_without_a_second_post(self):
         payload = watch.issue_payload("library", "Producer", "v2.0.0", [self.edge()])
@@ -633,8 +712,81 @@ dev_dependencies:
                 REAL_API("mock/path", method, {})
         self.command.assert_not_called()
 
+    def test_expected_unmeasured_comparisons_do_not_fail_or_change_their_issue(self):
+        for kind in ("patched", "unmeasured"):
+            with self.subTest(kind=kind):
+                edges = [self.edge(kind=kind), self.edge(dep="other")]
+                with patch.object(watch, "collect_graph", return_value=([{"name": "Consumer"}], edges)):
+                    self.api.reset_mock()
+                    self.stream().write.reset_mock()
+                    pending = self.replies({
+                        ("GET", "repos/ExampleOrg/Consumer/issues?state=all&per_page=100&page=1"):
+                            [[self.issue()]],
+                        ("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()],
+                    })
+                    watch.DRY_RUN = True
+                    self.assertEqual(watch.main(), 0)
+                    self.consumed(pending)
+                    summary = "".join(c.args[0] for c in self.stream().write.call_args_list)
+                    self.assertIn("### Not measured", summary)
+                    self.assertNotIn("### Execution errors", summary)
+                    self.assertIn("Consumer/other: would open", summary)
+                    self.assertNotIn("Consumer/library: would", summary)
+                    self.assertTrue(all(len(c.args) == 1 for c in self.api.call_args_list))
+
+    def test_ambiguous_registry_ownership_is_unmeasured_without_blocking_other_dependencies(self):
+        owners = {("Cargo.toml", "library"): None, ("Cargo.toml", "other"): "Producer"}
+        docs = {"Cargo.toml": {"dependencies": {"library": "=1.0.0", "other": "=1.0.0"}}}
+        edges = watch.edges_from("Consumer", "master", "Cargo.toml", docs, owners)
+        self.assertEqual({e.dependency: e.kind for e in edges},
+                         {"library": "unmeasured", "other": "exact"})
+        self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+        gaps, errors, incomplete = [], [], set()
+        actions = watch.plan_actions(edges, {"Consumer": [self.issue()]}, gaps, incomplete, errors)
+        self.assertEqual([a["dep"] for a in actions], ["other"])
+        self.assertEqual(errors, [])
+        self.assertTrue(gaps)
+        self.assertEqual(incomplete, set())
+
+    def test_execution_errors_fail_even_with_an_expected_unmeasured_dependency(self):
+        for failure in (watch.APIError("HTTP 403"), watch.APIError("HTTP 429"),
+                        watch.APIError("HTTP 503"), {"tag_name": 23}):
+            with self.subTest(failure=failure):
+                edges = [self.edge(kind="patched"), self.edge(dep="other")]
+                with patch.object(watch, "collect_graph", return_value=([{"name": "Consumer"}], edges)):
+                    self.api.reset_mock()
+                    self.stream().write.reset_mock()
+                    pending = self.replies({
+                        ("GET", "repos/ExampleOrg/Consumer/issues?state=all&per_page=100&page=1"): [[]],
+                        ("GET", "repos/ExampleOrg/Producer/releases/latest"): [failure],
+                    })
+                    self.assertEqual(watch.main(), 1)
+                    self.consumed(pending)
+                    summary = "".join(c.args[0] for c in self.stream().write.call_args_list)
+                    self.assertIn("### Not measured", summary)
+                    self.assertIn("### Execution errors", summary)
+                    self.assertTrue(all(len(c.args) == 1 for c in self.api.call_args_list))
+
+    def test_collected_read_failure_and_unverified_write_fail_execution(self):
+        def incomplete_graph(errors, incomplete):
+            errors.append("Producer: incomplete tree")
+            incomplete.add("Producer")
+            return [], []
+        with patch.object(watch, "collect_graph", side_effect=incomplete_graph):
+            self.assertEqual(watch.main(), 1)
+        with patch.object(watch, "collect_graph", return_value=([{"name": "Consumer"}], [self.edge()])):
+            pending = self.replies({
+                ("GET", "repos/ExampleOrg/Consumer/issues?state=all&per_page=100&page=1"): [[]],
+                ("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()],
+            })
+            with patch.object(watch, "apply_action", side_effect=watch.APIError("write not verified")):
+                self.assertEqual(watch.main(), 1)
+            self.consumed(pending)
+
     def test_workflow_limits_pr_tokens_and_keeps_scheduler_writes_opt_in(self):
         workflow = watch.parse_manifest("workflow.yaml", WORKFLOW)
+        self.assertEqual(workflow["on"]["schedule"], [{"cron": "*/15 * * * *"}])
+        self.assertNotIn("continue-on-error", WORKFLOW)
         self.assertEqual(workflow["permissions"], {})
         test_job, watch_job = workflow["jobs"]["test"], workflow["jobs"]["watch"]
         self.assertEqual(test_job["permissions"], {"contents": "read"})
