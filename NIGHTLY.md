@@ -22,16 +22,23 @@ are complete. The older deployment `nightly.yml` remains disabled: it targets
    E-Bill-frontend and wallet. Preserve other existing grants. Do not add Governance.
 4. Make `WILDCAT_DEPLOYMENT_APP_CLIENT_ID` and
    `WILDCAT_DEPLOYMENT_APP_PRIVATE_KEY` available to the central repository,
-   Wildcat-deployment, E-Bill-frontend and wallet. These references use the existing
-   App. The child preflights request Actions read on the parent deployment only;
-   the coordinator requests dispatch access only for the current stage's targets.
-   Confirm token issuance and repository scope before deployment. Do not copy
-   private keys into plans, issues, logs or artifacts.
-   Review the signing-key trust boundary before provisioning those child keys:
-   product jobs and the App-token Action's post step still share a runner. Early
-   token creation and scoped-token reuse do not isolate the signing key from
-   compromised code. Regression jobs do not receive App keys. Do not treat the
-   current ordering as proof of credential isolation or waive this activation review.
+   and Wildcat-deployment. The coordinator requests dispatch access only for the
+   current stage's targets. Frontend and wallet parent checks use the existing
+   `private-repo-access-for-ci` App instead, requesting only Actions read for
+   `Wildcat-deployment` through `PRIVATE_REPO_ACCESS_APP_ID` and
+   `PRIVATE_REPO_ACCESS_APP_PRIVATE_KEY`.
+   Merge the explicit Contents-read limits for all 19 Git-token creation sites
+   before adding Actions read to this CI App. Preserve its nine selected
+   repositories; they already include the parent deployment and exclude Governance.
+   Add only E-Bill-frontend to the existing organisation ID/key recipients,
+   preserving all seven current recipients and the existing key value. Read back
+   the permissions and grants, then verify parent-run access with GET requests
+   from frontend and wallet without dispatching tests or deployment.
+   The CI App remains read-only, but a holder of its key can request Actions read
+   across its installed repositories. Product jobs and the App-token Action's
+   post step still share a runner; this is not signing-key isolation. Preserve
+   immediate parent checks and native token revocation. Regression jobs do not
+   receive App keys. Never copy keys into plans, issues, logs or artifacts.
 5. Demonstrate backup and restore for the self-hosted clowder-dev data. A GCP
    backup or the presence of a backup script does not prove this. Record the
    restore result and recovery procedure in `infrastructure#246`.
@@ -39,6 +46,11 @@ are complete. The older deployment `nightly.yml` remains disabled: it targets
 These are prerequisites. They are not established by offline regression tests or
 by a successful candidate preparation. This change does not provision credentials
 or claim that backup/restore has already been demonstrated.
+
+If the new CI App access must be rolled back, remove only its added Actions-read
+permission and the newly added frontend ID/key grants. Keep the Git-token limits
+and the nightly schedule disabled; do not restore a deployment-writing key to
+product test jobs. Existing wallet dispatch credentials and routes stay unchanged.
 
 ## Prepare and execute
 
