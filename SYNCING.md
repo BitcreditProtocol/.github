@@ -22,7 +22,7 @@ jobs:
   sync:
     uses: BitcreditProtocol/.github/.github/workflows/sync-master-to-dev.yml@FULL_COMMIT_SHA
     secrets:
-      AUTOMATION_APP_ID: ${{ vars.AUTOMATION_APP_ID }}
+      AUTOMATION_APP_CLIENT_ID: ${{ vars.AUTOMATION_APP_CLIENT_ID }}
       AUTOMATION_APP_PRIVATE_KEY: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
 ```
 
@@ -30,9 +30,9 @@ The reusable workflow uses `workflow_call`; it is called as a whole job rather
 than as a step. It owns checkout, the runner, timeout, concurrency, ancestry
 checks, branch creation, and PR creation. The `github` context and checkout refer
 to the **calling repository**, so a call from `E-Bill-frontend` creates its branch
-and PR there. The caller passes the organization variable `AUTOMATION_APP_ID`
+and PR there. The caller passes the organization variable `AUTOMATION_APP_CLIENT_ID`
 and secret `AUTOMATION_APP_PRIVATE_KEY` through the two declared workflow secrets.
-The App ID remains a variable in the caller; it is passed through the reusable
+The Client ID remains a variable in the caller; it is passed through the reusable
 workflow's secret interface. Use this explicit mapping instead of `secrets: inherit`.
 
 The shared workflow mints a `bitcredit-automation` installation token scoped to
@@ -45,6 +45,12 @@ automatically install it elsewhere. Each repository needs the small caller.
 Pinning a full commit SHA keeps updates reviewable: change a caller's pin to
 adopt a newer version. See [GitHub's reusable workflow documentation](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 
+When upgrading a caller that passes `AUTOMATION_APP_ID`, change both the shared
+workflow SHA and the secret mapping to `AUTOMATION_APP_CLIENT_ID` in the same
+commit. Set the organization variable to the App's Client ID from its settings.
+The existing `AUTOMATION_APP_PRIVATE_KEY` continues to work. Keep the older
+`AUTOMATION_APP_ID` variable while other workflows still use it.
+
 ## Setup and first run
 
 - Both `master` and `dev` must exist in the calling repository.
@@ -53,9 +59,9 @@ adopt a newer version. See [GitHub's reusable workflow documentation](https://do
 - The `bitcredit-automation` App installation must have access to the calling
   repository and grant `contents: write` and `pull_requests: write`. See the
   [automation App setup](.github/scripts/README.md#setup).
-- Once the caller is ready, ask an organization owner to grant that repository
-  access to the organization variable `AUTOMATION_APP_ID` and secret
-  `AUTOMATION_APP_PRIVATE_KEY`; their access is currently limited to `.github`.
+- Ensure the calling repository has access to the organization variable
+  `AUTOMATION_APP_CLIENT_ID` and secret `AUTOMATION_APP_PRIVATE_KEY`. Ask an
+  organization owner to grant access if needed.
   Passing secrets to a reusable workflow does not grant access to credentials
   stored in the shared workflow's repository.
 - The organization disables **Allow GitHub Actions to create and approve pull
