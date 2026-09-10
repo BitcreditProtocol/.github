@@ -1,0 +1,119 @@
+name: Sync master into dev
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Serialize dispatches across all refs so they cannot create duplicate sync PRs.
+concurrency:
+  group: sync-master-to-dev
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # github context and checkout both refer to the calling repository.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out master with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Create or find the sync PR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin \
+            +refs/heads/master:refs/remotes/origin/master \
+            +refs/heads/dev:refs/remotes/origin/dev
+          master_sha=$(git rev-parse refs/remotes/origin/master)
+          dev_sha=$(git rev-parse refs/remotes/origin/dev)
+
+          if git merge-base --is-ancestor "$master_sha" "$dev_sha"; then
+            echo 'dev already contains master; no sync is needed.' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              echo '::error::Could not determine whether dev contains master.'
+              exit "$status"
+            fi
+          fi
+
+          # Check every page, and only match branches in this repository.
+          # An existing direct master -> dev PR also covers this sync.
+          existing_pr_urls=$(gh api --method GET --paginate "repos/$GH_REPO/pulls" \
+            -f state=open -f base=dev -f per_page=100 \
+            --jq '.[] | select(.head.repo.full_name == .base.repo.full_name) | select(.head.ref == "master" or (.head.ref | startswith("sync/master-to-dev-"))) | .html_url')
+          if [ -n "$existing_pr_urls" ]; then
+            printf 'A sync PR is already open; review it before dispatching again:\n%s\n' \
+              "$existing_pr_urls" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          branch="sync/master-to-dev-${GITHUB_RUN_ID}"
+          existing_ref=$(git ls-remote --heads origin "refs/heads/$branch")
+          if [ -n "$existing_ref" ]; then
+            # A rerun can recover after a failed PR creation, but must never
+            # overwrite an older snapshot or a maintainer's conflict resolution.
+            branch_sha=${existing_ref%%[[:space:]]*}
+            if [ "$branch_sha" != "$master_sha" ]; then
+              echo "::error::Branch $branch already exists at a different commit. Start a new dispatch for the latest master snapshot."
+              exit 1
+            fi
+          else
+            git push origin "$master_sha:refs/heads/$branch"
+          fi
+
+          printf 'Sync branch: [%s](%s/%s/tree/%s)\n\nMaster snapshot: %s\n' \
+            "$branch" "$GITHUB_SERVER_URL" "$GH_REPO" "$branch" "$master_sha" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+          body_file="$RUNNER_TEMP/master-to-dev-sync-pr.md"
+          {
+            printf 'Sync the master snapshot [%s](%s/%s/commit/%s) into dev.\n\n' \
+              "$master_sha" "$GITHUB_SERVER_URL" "$GH_REPO" "$master_sha"
+            cat <<'EOF'
+          **Merge this PR using Create a merge commit.** This preserves ancestry
+          between `master` and `dev`. Do not squash or rebase this sync PR.
+
+          | Direction | Merge method |
+          | --- | --- |
+          | Feature branch → `dev` | Squash |
+          | `dev` → `master` for releases | Merge commit |
+          | Temporary branch from `master` → `dev` | Merge commit |
+
+          - Review the changes and complete the required checks before merging.
+          - With `GITHUB_TOKEN`, a user with write access must select **Approve
+            workflows to run** on this PR to start its CI workflows. See
+            [GitHub token behavior](https://docs.github.com/en/actions/concepts/security/github_token).
+          - **Update branch** brings `dev` into this temporary branch; it does
+            not modify `master`. Resolve any conflicts on this temporary branch.
+          - After merging with a merge commit, delete the temporary branch.
+          - This is a snapshot. Commits added to `master` after the fetch require
+            another dispatch after this PR is merged.
+
+          “Aligned” means `dev` contains all changes from `master`. Their tips and
+          files can still differ because `dev` contains unreleased work.
+
+          [Why merge commits preserve ancestry](https://docs.github.com/en/pull-requests/reference/pull-request-merges)
+          EOF
+          } > "$body_file"
+
+          if ! pr_url=$(gh pr create --base dev --head "$branch" \
+            --title 'chore: sync master into dev' --body-file "$body_file"); then
+            echo '::error::PR creation failed. Check Actions PR permissions and rerun; the sync branch has been retained.'
+            exit 1
+          fi
+
+          printf 'Created sync PR: %s\n\nReview and merge using **Create a merge commit**, then delete the temporary branch.\n' \
+            "$pr_url" | tee -a "$GITHUB_STEP_SUMMARY"

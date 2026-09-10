@@ -1,0 +1,25 @@
+name: Test shared master-to-dev sync
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/sync-master-to-dev.yml'
+      - '.github/workflows/test-sync-master-to-dev.yml'
+      - '.github/scripts/test_sync_master_to_dev.py'
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/sync-master-to-dev.yml'
+      - '.github/workflows/test-sync-master-to-dev.yml'
+      - '.github/scripts/test_sync_master_to_dev.py'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_sync_master_to_dev.py
