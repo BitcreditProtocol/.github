@@ -30,6 +30,15 @@ They record the *expected value* rather than a list of repositories to skip, so 
 
 `.github/scripts/README.md` covers how the workflows use them, what they refuse to do, and the GitHub App they need.
 
+## Shared master-to-dev sync
+
+Repositories with `master` and `dev` can opt into the reusable
+[`sync-master-to-dev.yml`](.github/workflows/sync-master-to-dev.yml) workflow.
+Each repository adds a small manual caller pinned to a reviewed commit here.
+The shared code creates a temporary branch and sync PR in the calling repository;
+a maintainer reviews and merges it. Setup, merge policy, and testing are in
+[SYNCING.md](SYNCING.md). This workflow is not inherited automatically.
+
 ## Adding a repository
 
 Most of it happens on its own. A new repository is picked up by the next scheduled run because both workflows list repositories from the API rather than from a file.

@@ -8,9 +8,9 @@ change a ruleset or a repository setting, change this file with it.
 
 # Contributing
 
-Thanks for working on Bitcredit. This describes how contributions actually move
-through this organisation — the rules below are enforced by organisation
-rulesets, not aspirations.
+Thanks for working on Bitcredit. This describes how contributions move through
+this organisation, including enforced rules and the merge policy maintainers
+follow.
 
 ## Before you start
 
@@ -96,8 +96,9 @@ On the **default branch** of every repository:
 - **One approving review** is required before merge.
 - **Copilot code review** is requested automatically on every branch.
 - The branch cannot be **deleted** or **force-pushed**.
-- All three merge methods — merge, squash, rebase — are available. Pick whatever
-  suits the change; nothing enforces one.
+- All three merge methods — merge, squash, rebase — are available. For repositories
+  with `master` and `dev`, follow the merge policy below; the settings do not
+  enforce the method for each direction.
 
 Two things that are deliberately *not* enforced, and are worth knowing:
 
@@ -113,6 +114,22 @@ Two things that are deliberately *not* enforced, and are worth knowing:
 On `dev`, the ruleset protects against deletion only. Review there is the
 repository's own convention rather than something enforced — follow whatever the
 repository already does.
+
+## Merge policy for master and dev
+
+For repositories that develop on `dev` and release through `master`, use:
+
+| Direction | Merge method |
+| --- | --- |
+| `dev` → `master` for releases | Merge commit |
+| Temporary branch from `master` → `dev` | Merge commit |
+
+Use **Create a merge commit** for release and sync PRs to preserve ancestry.
+Squashing long-lived branches can cause already merged commits to reappear in
+later PRs. This is a maintainer policy, not an enforced merge-method restriction.
+The [shared sync workflow][syncing] creates a temporary branch from `master` and
+opens a PR into `dev` for review. Resolve conflicts on that temporary branch
+and merge with a merge commit.
 
 ## Make your commits attributable
 
@@ -185,3 +202,4 @@ does not duplicate them.
 [coc]: https://github.com/BitcreditProtocol/.github/blob/master/CODE_OF_CONDUCT.md
 [labels]: https://github.com/BitcreditProtocol/.github/blob/master/labels.yml
 [releasing]: https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md
+[syncing]: https://github.com/BitcreditProtocol/.github/blob/master/SYNCING.md
