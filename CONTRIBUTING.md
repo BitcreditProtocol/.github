@@ -121,7 +121,6 @@ For repositories that develop on `dev` and release through `master`, use:
 
 | Direction | Merge method |
 | --- | --- |
-| Feature branch → `dev` | Squash |
 | `dev` → `master` for releases | Merge commit |
 | Temporary branch from `master` → `dev` | Merge commit |
 
@@ -129,8 +128,8 @@ Use **Create a merge commit** for release and sync PRs to preserve ancestry.
 Squashing long-lived branches can cause already merged commits to reappear in
 later PRs. This is a maintainer policy, not an enforced merge-method restriction.
 The [shared sync workflow][syncing] creates a temporary branch from `master` and
-opens a PR into `dev` for review. Resolve conflicts on that temporary branch,
-merge with a merge commit, and delete the temporary branch afterward.
+opens a PR into `dev` for review. Resolve conflicts on that temporary branch
+and merge with a merge commit.
 
 ## Make your commits attributable
 

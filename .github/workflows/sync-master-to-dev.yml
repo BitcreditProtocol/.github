@@ -2,32 +2,49 @@ name: Sync master into dev
 
 on:
   workflow_call:
+    secrets:
+      AUTOMATION_APP_ID:
+        description: ID of the bitcredit-automation GitHub App
+        required: true
+      AUTOMATION_APP_PRIVATE_KEY:
+        description: Private key of the bitcredit-automation GitHub App
+        required: true
 
-permissions:
-  contents: write
-  pull-requests: write
-
-# Serialize dispatches across all refs so they cannot create duplicate sync PRs.
-concurrency:
-  group: sync-master-to-dev
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Serialize dispatches across all refs so they cannot create duplicate sync PRs.
+    concurrency:
+      group: sync-master-to-dev
+      cancel-in-progress: false
     # github context and checkout both refer to the calling repository.
     env:
-      GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - name: Create an automation App token for the calling repository
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.repository }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Check out master with full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          token: ${{ steps.app-token.outputs.token }}
           ref: master
           fetch-depth: 0
 
       - name: Create or find the sync PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -88,17 +105,12 @@ jobs:
 
           | Direction | Merge method |
           | --- | --- |
-          | Feature branch → `dev` | Squash |
           | `dev` → `master` for releases | Merge commit |
           | Temporary branch from `master` → `dev` | Merge commit |
 
           - Review the changes and complete the required checks before merging.
-          - With `GITHUB_TOKEN`, a user with write access must select **Approve
-            workflows to run** on this PR to start its CI workflows. See
-            [GitHub token behavior](https://docs.github.com/en/actions/concepts/security/github_token).
           - **Update branch** brings `dev` into this temporary branch; it does
             not modify `master`. Resolve any conflicts on this temporary branch.
-          - After merging with a merge commit, delete the temporary branch.
           - This is a snapshot. Commits added to `master` after the fetch require
             another dispatch after this PR is merged.
 
@@ -111,9 +123,9 @@ jobs:
 
           if ! pr_url=$(gh pr create --base dev --head "$branch" \
             --title 'chore: sync master into dev' --body-file "$body_file"); then
-            echo '::error::PR creation failed. Check Actions PR permissions and rerun; the sync branch has been retained.'
+            echo '::error::PR creation failed. Check the automation App repository access and pull-request write permission, then rerun; the sync branch has been retained.'
             exit 1
           fi
 
-          printf 'Created sync PR: %s\n\nReview and merge using **Create a merge commit**, then delete the temporary branch.\n' \
+          printf 'Created sync PR: %s\n\nReview and merge using **Create a merge commit**.\n' \
             "$pr_url" | tee -a "$GITHUB_STEP_SUMMARY"

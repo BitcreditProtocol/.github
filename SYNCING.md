@@ -16,21 +16,29 @@ name: Sync master into dev
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   sync:
     uses: BitcreditProtocol/.github/.github/workflows/sync-master-to-dev.yml@FULL_COMMIT_SHA
+    secrets:
+      AUTOMATION_APP_ID: ${{ vars.AUTOMATION_APP_ID }}
+      AUTOMATION_APP_PRIVATE_KEY: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
 ```
 
 The reusable workflow uses `workflow_call`; it is called as a whole job rather
 than as a step. It owns checkout, the runner, timeout, concurrency, ancestry
 checks, branch creation, and PR creation. The `github` context and checkout refer
 to the **calling repository**, so a call from `E-Bill-frontend` creates its branch
-and PR there. No repository name input or organization-wide token is needed.
-`github.token` is available automatically; do not add `secrets: inherit`.
+and PR there. The caller passes the organization variable `AUTOMATION_APP_ID`
+and secret `AUTOMATION_APP_PRIVATE_KEY` through the two declared workflow secrets.
+The App ID remains a variable in the caller; it is passed through the reusable
+workflow's secret interface. Use this explicit mapping instead of `secrets: inherit`.
+
+The shared workflow mints a `bitcredit-automation` installation token scoped to
+the calling repository with `contents: write` and `pull_requests: write`. Checkout,
+Git pushes, and GitHub CLI requests all use that token. The caller's `GITHUB_TOKEN`
+needs no permissions. The token action revokes the App token when the job finishes.
 
 Keeping this file in the organization's `.github` repository does not
 automatically install it elsewhere. Each repository needs the small caller.
@@ -42,10 +50,17 @@ adopt a newer version. See [GitHub's reusable workflow documentation](https://do
 - Both `master` and `dev` must exist in the calling repository.
 - Allow merge commits, and ensure `dev` does not require linear history.
 - Allow the caller to use this public reusable workflow in its Actions settings.
-- The caller grants `contents: write` and `pull-requests: write`. Enable
-  **Settings → Actions → General → Workflow permissions → Allow GitHub Actions
-  to create and approve pull requests**, subject to organization/enterprise
-  policy. The shared workflow cannot elevate the caller's token permissions.
+- The `bitcredit-automation` App installation must have access to the calling
+  repository and grant `contents: write` and `pull_requests: write`. See the
+  [automation App setup](.github/scripts/README.md#setup).
+- Once the caller is ready, ask an organization owner to grant that repository
+  access to the organization variable `AUTOMATION_APP_ID` and secret
+  `AUTOMATION_APP_PRIVATE_KEY`; their access is currently limited to `.github`.
+  Passing secrets to a reusable workflow does not grant access to credentials
+  stored in the shared workflow's repository.
+- The organization disables **Allow GitHub Actions to create and approve pull
+  requests** for `GITHUB_TOKEN`; a repository cannot override that policy.
+  This workflow uses the App token and needs no change to that setting.
 - The caller's `workflow_dispatch` file must reach the caller's default branch
   before its manual dispatch is available. The shared workflow only needs to
   exist at the referenced commit. Publishing it here alone does not register
@@ -68,11 +83,10 @@ and [reusable workflow access and permissions](https://docs.github.com/en/action
    **`chore: sync master into dev`** with base **`dev`**.
 4. Review the changes and complete CI. **Update branch** brings `dev` into the
    temporary branch; resolve conflicts there. It does not modify `master`.
-5. Merge using **Create a merge commit**, then delete the temporary branch.
+5. Merge using **Create a merge commit**.
 
 | Direction | Merge method |
 | --- | --- |
-| Feature branch → `dev` | Squash |
 | `dev` → `master` for releases | Merge commit |
 | Temporary branch from `master` → `dev` | Merge commit |
 
@@ -91,11 +105,11 @@ repository runs independently. If PR creation fails, the branch remains. A
 rerun reuses it only if it still matches the fetched `master`; otherwise start a
 new dispatch. Existing branches are never force-pushed.
 
-The workflow uses the caller's `GITHUB_TOKEN`. GitHub documents that PR workflows
-it triggers require a user with write access to select **Approve workflows to
-run** on the PR. Automatic CI using a custom GitHub App token would require
-extending the reusable workflow's authentication; this version does not accept
-custom tokens. See [GitHub token behavior](https://docs.github.com/en/actions/concepts/security/github_token).
+PRs opened with the App token trigger eligible CI workflows automatically,
+without the `GITHUB_TOKEN` **Approve workflows to run** step. Workflow event,
+branch, and path filters still apply. See
+[triggering workflows with an App token](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
+and [App token scoping and revocation](https://github.com/actions/create-github-app-token/tree/bcd2ba49218906704ab6c1aa796996da409d3eb1).
 
 ## Test the shared implementation
 
@@ -105,7 +119,8 @@ disposable local repositories and a mocked GitHub CLI; they do not write to
 GitHub. A separate test workflow runs them on relevant PRs and master pushes.
 
 For an end-to-end Actions test, create a separate test repository with only a
-manual caller, `master`, and `dev`. Pin the caller to the published shared
+manual caller, `master`, and `dev`. Grant the test repository access to the App
+and the caller credentials described above. Pin the caller to the published shared
 commit under test. Exercise an aligned history, a divergent history, an existing
 open sync PR, and a merge followed by another dispatch. Do not point this test
 at a production repository unless its real branch and PR writes are intended.

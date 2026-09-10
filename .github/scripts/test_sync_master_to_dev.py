@@ -7,8 +7,19 @@ import unittest
 import textwrap
 
 WORKFLOW = Path(__file__).resolve().parents[1] / 'workflows/sync-master-to-dev.yml'
-# Read this workflow's one literal shell block, without a YAML dependency.
-SCRIPT = textwrap.dedent(WORKFLOW.read_text().split('        run: |\n', 1)[1])
+
+def extract_sync_script(workflow):
+    # Read the sync step's literal shell block without consuming later YAML.
+    step = workflow.split('      - name: Create or find the sync PR\n', 1)[1]
+    block = step.split('        run: |\n', 1)[1]
+    lines = []
+    for line in block.splitlines(keepends=True):
+        if line.strip() and not line.startswith('          '):
+            break
+        lines.append(line)
+    return textwrap.dedent(''.join(lines))
+
+SCRIPT = extract_sync_script(WORKFLOW.read_text())
 
 MOCK_GH = '''#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
@@ -39,6 +50,30 @@ elif args[:2] == ['pr', 'create']:
 else:
     raise AssertionError(args)
 '''
+
+class ScriptExtractionTests(unittest.TestCase):
+    def test_selects_sync_script_and_stops_before_later_yaml(self):
+        workflow = '''jobs:
+  sync:
+    steps:
+      - run: |
+          echo setup
+      - name: Create or find the sync PR
+        shell: bash
+        run: |
+          cat <<'EOF'
+          sync body
+          EOF
+'''
+        for following in [
+            '      - name: Cleanup\n        run: echo cleanup\n',
+            '      - uses: actions/checkout@v7\n',
+            '        timeout-minutes: 1\n',
+            '  another-job:\n    runs-on: ubuntu-latest\n',
+        ]:
+            with self.subTest(following=following):
+                self.assertEqual(extract_sync_script(workflow + following),
+                                 "cat <<'EOF'\nsync body\nEOF\n")
 
 class SyncTests(unittest.TestCase):
     def setUp(self):
@@ -110,7 +145,6 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(pr['--title'], 'chore: sync master into dev')
         self.assertIn(sha, pr['body'])
         self.assertIn('**Merge this PR using Create a merge commit.**', pr['body'])
-        self.assertIn('Approve\n  workflows to run', pr['body'])
         self.assertIn('https://github.com/example/repo/pull/42', self.summary())
 
     def test_uses_the_calling_repository_in_api_requests_and_links(self):
