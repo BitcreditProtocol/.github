@@ -3,6 +3,10 @@
 This is the organisation-wide release contract. Update this file when the
 contract changes.
 
+The clowder-dev nightly deployment and its manual rollback are described in
+[NIGHTLY.md](NIGHTLY.md). They use saved candidates and digest locks; they do not
+publish a release train, a package, or a production deployment.
+
 ## The two kinds
 
 **A train** is one coordinated cut across the five repositories that ship together:
