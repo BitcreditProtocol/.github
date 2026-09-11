@@ -35,6 +35,7 @@ assignees:
   infrastructure: cleot
   nostr-postgres-db: cleot
   ui: JulianVIE
+  ui-flutter: JulianVIE
   wallet: JulianVIE
   Wallet-Core: zupzup
   Wildcat: codingpeanut157
