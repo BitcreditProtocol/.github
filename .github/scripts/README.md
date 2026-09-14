@@ -1,5 +1,9 @@
 # Organisation automation
 
+For the disabled-by-default clowder-dev coordinator and manual rollback, see
+[NIGHTLY.md](../../NIGHTLY.md). Activation requires the recorded operational
+prerequisites; a successful dry run does not establish deployment readiness.
+
 Scheduled workflows maintain organisation settings and watch cross-repository dependencies. They discover repositories from the API, so creating or archiving a repository needs no configuration edit.
 
 | Workflow | Script | Writes | Reports |
