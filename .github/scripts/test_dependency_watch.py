@@ -808,7 +808,7 @@ dev_dependencies:
 
     def test_workflow_limits_pr_tokens_and_keeps_scheduler_writes_opt_in(self):
         workflow = watch.parse_manifest("workflow.yaml", WORKFLOW)
-        self.assertEqual(workflow["on"]["schedule"], [{"cron": "*/15 * * * *"}])
+        self.assertEqual(workflow["on"]["schedule"], [{"cron": "25 6 * * 1-5"}])
         self.assertNotIn("continue-on-error", WORKFLOW)
         self.assertEqual(workflow["permissions"], {})
         test_job, watch_job = workflow["jobs"]["test"], workflow["jobs"]["watch"]
