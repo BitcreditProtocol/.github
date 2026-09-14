@@ -1,0 +1,96 @@
+name: Propose a wallet minimum version
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/propose-wallet-minimum.py'
+      - '.github/scripts/test_wallet_minimum.py'
+      - '.github/workflows/propose-wallet-minimum.yml'
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: Environment whose minimum should be proposed
+        type: choice
+        required: true
+        options: [dev, staging, prod]
+      source_release_tag:
+        description: Published wallet release supporting the proposal
+        type: string
+        required: true
+      proposed_min_version:
+        description: Explicit minimum in MAJOR.MINOR.PATCH format
+        type: string
+        required: true
+      dry_run:
+        description: Validate and report without creating a branch or PR
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_wallet_minimum.py
+
+  propose:
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: wallet-minimum-${{ inputs.target_env }}
+      cancel-in-progress: false
+    env:
+      DRY_RUN: ${{ inputs.dry_run != false && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read release and proposal state
+        id: read
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            wallet
+            static-assets
+          permission-contents: read
+          permission-metadata: read
+          permission-pull-requests: read
+      - name: Scope proposal writes to static-assets
+        id: write
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: static-assets
+          permission-metadata: read
+          permission-contents: ${{ env.DRY_RUN == 'true' && 'read' || 'write' }}
+          permission-pull-requests: ${{ env.DRY_RUN == 'true' && 'read' || 'write' }}
+      - name: Propose the selected minimum
+        shell: bash
+        env:
+          READ_TOKEN: ${{ steps.read.outputs.token }}
+          WRITE_TOKEN: ${{ steps.write.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          AUTOMATION_BOT: ${{ steps.write.outputs.app-slug }}[bot]
+          TARGET_ENV: ${{ inputs.target_env }}
+          SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
+          PROPOSED_MIN_VERSION: ${{ inputs.proposed_min_version }}
+        run: |
+          python3 .github/scripts/propose-wallet-minimum.py > "$RUNNER_TEMP/wallet-minimum-result.json"
+          cat "$RUNNER_TEMP/wallet-minimum-result.json"
+          {
+            echo '## Wallet minimum proposal'
+            echo
+            echo '```json'
+            cat "$RUNNER_TEMP/wallet-minimum-result.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
