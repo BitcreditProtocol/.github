@@ -159,8 +159,11 @@ or unreadable evidence leaves the issue unchanged and is reported as unmeasured.
 The generator and generated frontend code are unchanged.
 
 Before merging, run the candidate with `dry_run=true` and inspect the recorded
-SHAs, run and artifact IDs, hashes and planned actions. The synchronized baseline
-must produce zero issue writes. PRs run only offline tests, without App secrets.
+SHAs, run and artifact IDs, hashes and planned actions. After merging, repeat the
+dry-run on `master`. Scheduled runs remain read-only until an owner sets
+`OPENAPI_WATCH_ENABLED=true`; an absent or different value keeps writes disabled.
+Manual runs also default to `dry_run=true`. The synchronized baseline must produce
+zero issue writes. PRs run only offline tests, without App secrets.
 Read tokens cover Wildcat and the dashboard; write tokens cover dashboard issues
 only. No artifact or private-key credential is copied into an issue.
 

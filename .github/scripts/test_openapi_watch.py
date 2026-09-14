@@ -442,7 +442,10 @@ class OpenAPIWatchTests(unittest.TestCase):
         self.assertEqual(job["if"], "github.event_name != 'pull_request'")
         self.assertEqual(job["needs"], "test")
         self.assertIs(job["concurrency"]["cancel-in-progress"], False)
-        self.assertIn("inputs.dry_run != false", job["env"]["DRY_RUN"])
+        self.assertEqual(job["env"]["DRY_RUN"],
+                         "${{ ((github.event_name == 'workflow_dispatch' && inputs.dry_run == false) || "
+                         "(github.event_name == 'schedule' && vars.OPENAPI_WATCH_ENABLED == 'true')) "
+                         "&& 'false' || 'true' }}")
         steps = {step.get("id"): step for step in job["steps"]}
         read, write = steps["read"]["with"], steps["write"]["with"]
         self.assertEqual(set(read["repositories"].split()), {"Wildcat", "wildcat-dashboard-ui"})
