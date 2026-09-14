@@ -26,6 +26,7 @@ assignees:
   bit.cr: JulianVIE
   bitcr-chat-widget: cleot
   bitcr.org: JulianVIE
+  bitcredit-tools: cleot
   Bitcredit-Core: zupzup
   Clowder: stefanbitcr
   docker-external: cleot
@@ -35,6 +36,7 @@ assignees:
   infrastructure: cleot
   nostr-postgres-db: cleot
   ui: JulianVIE
+  ui-flutter: JulianVIE
   wallet: JulianVIE
   Wallet-Core: zupzup
   Wildcat: codingpeanut157

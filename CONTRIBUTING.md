@@ -8,8 +8,9 @@ change a ruleset or a repository setting, change this file with it.
 
 # Contributing
 
-Thanks for working on Bitcredit. This describes how contributions actually move
-through this organisation. Repository rules show the effective protections,
+Thanks for working on Bitcredit. This describes how contributions move through
+this organisation, including enforced rules and the merge policy maintainers
+follow. Repository rules show the effective protections,
 including any exceptions to the organisation baseline. Governance retains its
 separate contribution and decision process.
 
@@ -49,10 +50,8 @@ repository already has them and are never added to a repository that does not,
 because which workflow labels a team wants is that team's business. So a
 repository having no `blocked` label does not mean nothing there is blocked.
 
-The first two are also **applied sparingly** — at the time of writing only a
-couple of open issues carry either, out of several hundred. Their absence is not
-a signal that an issue is unavailable. If an issue interests you and nothing
-marks it as taken, ask in a comment.
+The absence of these labels does not mean an issue is unavailable. If an issue
+interests you and nothing marks it as taken, ask in a comment.
 
 Before you start, read the issue's comments. If someone has said they are on it
 and there has been activity in the last week or so, pick something else.
@@ -99,8 +98,9 @@ Check the repository's **Rules** page for its effective scope and exceptions:
 - **One approving review** is required before merge.
 - **Copilot code review** is requested automatically on every branch.
 - The branch cannot be **deleted** or **force-pushed**.
-- All three merge methods — merge, squash, rebase — are available. Pick whatever
-  suits the change; nothing enforces one.
+- All three merge methods — merge, squash, rebase — are available. For repositories
+  with `master` and `dev`, follow the merge policy below; the settings do not
+  enforce the method for each direction.
 
 Two things that are deliberately *not* enforced, and are worth knowing:
 
@@ -116,6 +116,22 @@ Two things that are deliberately *not* enforced, and are worth knowing:
 On `dev`, the ruleset protects against deletion only. Review there is the
 repository's own convention rather than something enforced — follow whatever the
 repository already does.
+
+## Merge policy for master and dev
+
+For repositories that develop on `dev` and release through `master`, use:
+
+| Direction | Merge method |
+| --- | --- |
+| `dev` → `master` for releases | Merge commit |
+| Temporary branch from `master` → `dev` | Merge commit |
+
+Use **Create a merge commit** for release and sync PRs to preserve ancestry.
+Squashing long-lived branches can cause already merged commits to reappear in
+later PRs. This is a maintainer policy, not an enforced merge-method restriction.
+The [shared sync workflow][syncing] creates a temporary branch from `master` and
+opens a PR into `dev` for review. Resolve conflicts on that temporary branch
+and merge with a merge commit.
 
 ## Make your commits attributable
 
@@ -189,3 +205,4 @@ does not duplicate them.
 [coc]: https://github.com/BitcreditProtocol/.github/blob/master/CODE_OF_CONDUCT.md
 [labels]: https://github.com/BitcreditProtocol/.github/blob/master/labels.yml
 [releasing]: https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md
+[syncing]: https://github.com/BitcreditProtocol/.github/blob/master/SYNCING.md
