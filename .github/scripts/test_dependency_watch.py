@@ -518,8 +518,31 @@ dev_dependencies:
         gaps, incomplete = [], set()
         self.assertEqual(watch.plan_actions(edges, {"Consumer": [self.issue()]}, gaps, incomplete, gaps), [])
         self.assertIn("previous dependency is no longer mapped; issue unchanged", gaps[0])
-        self.assertEqual(incomplete, {"Consumer"})
+        self.assertEqual(incomplete, set())
         self.api.assert_not_called()
+
+    def test_expected_group_gaps_keep_other_notifications_without_closing_their_issue(self):
+        for gap in ("different producers", "no release", "unmapped"):
+            for affected, healthy in (("aaa_affected", "zzz_healthy"), ("zzz_affected", "aaa_healthy")):
+                with self.subTest(gap=gap, affected=affected):
+                    edges = [self.edge(dep=healthy)]
+                    responses = {("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]}
+                    if gap == "different producers":
+                        edges += [self.edge(dep=affected, producer="One"),
+                                  self.edge(dep=affected, producer="Two", branch="dev")]
+                    elif gap == "no release":
+                        edges.append(self.edge(dep=affected, producer="NoRelease"))
+                        responses[("GET", "repos/ExampleOrg/NoRelease/releases/latest")] = [None]
+                    pending = self.replies(responses)
+                    existing = self.issue(dep=affected)
+                    original = copy.deepcopy(existing)
+                    gaps, errors, incomplete = [], [], set()
+                    actions = watch.plan_actions(edges, {"Consumer": [existing]}, gaps, incomplete, errors)
+                    self.assertEqual([(a["dep"], a["kind"]) for a in actions], [(healthy, "open")])
+                    self.assertEqual(existing, original, "Unmeasured evidence cannot close or update its issue")
+                    self.assertEqual((errors, incomplete), ([], set()))
+                    self.assertEqual(len(gaps), 1)
+                    self.consumed(pending)
 
     def test_incomplete_scan_prevents_closure_and_discards_earlier_planned_actions(self):
         issues = {"Consumer": [self.issue()]}

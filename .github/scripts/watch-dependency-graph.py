@@ -457,7 +457,6 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete, errors):
             producers = {e.producer for e in locations}
             if len(producers) > 1:
                 gaps.append(f"{repo}/{dep}: manifests refer to different producers; issue unchanged")
-                incomplete.add(repo)
                 continue
             producer = next(iter(producers), None)
             exact = [e for e in locations if e.kind == "exact"]
@@ -466,7 +465,6 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete, errors):
                 target = latest_release(producer, latest)
                 if target is None:
                     gaps.append(f"{producer}: no published full release; exact pins not compared")
-                    incomplete.add(repo)
                     continue
                 for edge in exact:
                     pin = semver(edge.pin)
@@ -497,7 +495,6 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete, errors):
                     # Missing ownership evidence is not proof the pin was removed.
                     # Keep the issue for manual review instead of silently closing it.
                     gaps.append(f"{repo}/{dep}: previous dependency is no longer mapped; issue unchanged")
-                    incomplete.add(repo)
                     continue
                 state = issue_state(existing)
                 if state is None:
