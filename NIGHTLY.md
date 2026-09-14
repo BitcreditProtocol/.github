@@ -25,10 +25,15 @@ are complete. The older deployment `nightly.yml` remains disabled: it targets
    and Wildcat-deployment. The coordinator requests dispatch access only for the
    current stage's targets. Frontend and wallet parent checks use the existing
    `private-repo-access-for-ci` App instead, requesting only Actions read for
-   `Wildcat-deployment` through `PRIVATE_REPO_ACCESS_APP_ID` and
-   `PRIVATE_REPO_ACCESS_APP_PRIVATE_KEY`.
+   `Wildcat-deployment`. The frontend candidate uses
+   `PRIVATE_REPO_ACCESS_APP_ID`; wallet's `dev` candidate in `wallet#1115` uses
+   `PRIVATE_REPO_ACCESS_CLIENT_ID`. Both use the existing
+   `PRIVATE_REPO_ACCESS_APP_PRIVATE_KEY`; preserve these identifier names.
    Merge the explicit Contents-read limits for all 19 Git-token creation sites
-   before adding Actions read to this CI App. Preserve its nine selected
+   before adding Actions read to this CI App. For wallet, the default-branch
+   dispatch handler must receive the `dev` changes through normal branch
+   integration. A merge into `dev` alone does not activate that handler.
+   Preserve the approved nine selected
    repositories; they already include the parent deployment and exclude Governance.
    Add only E-Bill-frontend to the existing organisation ID/key recipients,
    preserving all seven current recipients and the existing key value. Read back
@@ -51,6 +56,84 @@ If the new CI App access must be rolled back, remove only its added Actions-read
 permission and the newly added frontend ID/key grants. Keep the Git-token limits
 and the nightly schedule disabled; do not restore a deployment-writing key to
 product test jobs. Existing wallet dispatch credentials and routes stay unchanged.
+
+## Read-only operator inventory
+
+Use this checklist to answer the
+[existing operator questions in #246](https://github.com/BitcreditProtocol/infrastructure/issues/246#issuecomment-5617208957).
+Record a separate result for each of `clowder-dev-0` through `clowder-dev-4`.
+They share `clowder-dev/docker-compose.yml` and its inherited services, with
+`.env-github` and the corresponding `clowder-dev/env-0` through `env-4`.
+The source inventory in that issue is a starting point, not proof of live paths
+or backup coverage. Do not substitute the Ansible default for the actual mounts.
+
+An authorized operator runs the following on the intended host. First match the
+hostname and Docker daemon to the target's GitHub runner; do not assume the
+current Docker context is local. These commands list metadata only:
+
+```sh
+date -u '+%Y-%m-%dT%H:%M:%SZ'
+hostname
+docker info --format '{{.Name}}'
+docker ps --all --filter label=com.docker.compose.project \
+  --format 'table {{.ID}}\t{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.Status}}'
+```
+
+Copy the observed project name into `NIGHTLY_PROJECT` below. Inspect every
+container in that project, including stopped init containers and replicas:
+
+```sh
+set -eu
+: "${NIGHTLY_PROJECT:?Set the observed Compose project for this target}"
+nightly_ids="$(docker ps --all --quiet --filter "label=com.docker.compose.project=$NIGHTLY_PROJECT")"
+test -n "$nightly_ids" || { echo 'No containers found; inventory is incomplete' >&2; exit 1; }
+for nightly_id in $nightly_ids; do
+  docker inspect --type container --format 'id={{.Id}} service={{index .Config.Labels "com.docker.compose.service"}} state={{.State.Status}} exit={{.State.ExitCode}} image={{.Config.Image}} image_id={{.Image}} config_files={{index .Config.Labels "com.docker.compose.project.config_files"}}' "$nightly_id"
+  docker inspect --type container --format '{{range .Mounts}}type={{.Type}} name={{if .Name}}{{.Name}}{{else}}-{{end}} source={{.Source}} destination={{.Destination}} writable={{.RW}}{{println}}{{end}}' "$nightly_id"
+  nightly_image_id="$(docker inspect --type container --format '{{.Image}}' "$nightly_id")"
+  docker image inspect --format '{{json .RepoDigests}}' "$nightly_image_id"
+done
+```
+
+An empty digest list is **unmeasured**, not the requested tag. A failed read,
+missing label, missing expected service or unexplained replica is an inventory
+gap. Compare the observed services and Compose file labels with the last
+deployment's configuration SHA and manifest, following all `extends` files.
+Do not count an old stopped container as a current healthy service. If no prior
+manifest or configuration revision is available, record that absence.
+Do not print `Config.Env`, full `docker inspect`, expanded Compose configuration,
+environment files, database contents or credentials. See Docker's
+[filtered container listing](https://docs.docker.com/reference/cli/docker/container/ls/)
+and [formatted inspection](https://docs.docker.com/reference/cli/docker/inspect/).
+
+Match each target's observed mounts to these storage responsibilities:
+
+| Source scope | Recovery coverage to establish |
+| --- | --- |
+| `DATA_PATH/postgres` | The complete cluster and actual database list, including relay, Clowder and Wildcat database families; not the relay database alone. |
+| `DATA_PATH/surrealdb` | All configured namespaces/databases used by core, quote, aggregator, treasury, ebill, eic and ens. |
+| `DATA_PATH/treasury-service` | Treasury file state, together with its database state in the stores above. |
+| `DATA_PATH/clowder-node` | Clowder file state and its PostgreSQL database; identify protected recovery sources for the signatory configuration separately. |
+| Inherited Keycloak | The source uses `dev-file` and mounts a realm import, without a declared runtime-database bind. Establish the live database location and retained user/realm state, or an owner-approved reconstruction procedure. |
+| Inherited ebill-service | The source sets `data_dir = "./"` and mounts its config only. Establish the actual file-state location and its SurrealDB coverage, or an owner-approved reconstruction procedure. |
+
+Include additional live mounts and the proxy/certificate configuration if found;
+absence of a child Compose mount does not prove absence of inherited state.
+For each store, record the actual host path or volume, covered databases/files,
+existing backup procedure and destination reference, latest usable recovery
+point in UTC, retention and consistency method, and a linked restore receipt.
+Keep backup contents and credential values in their existing protected stores.
+A GCP backup script does not establish coverage of these self-hosted targets.
+
+Use the same #246 record for the owners' recovery and compatibility decisions:
+the intended baseline SHA/digests, database/schema versions, which old application
+can read the restored/current data, explicit conditions that block rollback,
+and the separately approved operator and window. Record acceptable data loss
+and downtime as owner decisions, not defaults. A restore receipt must identify
+the source recovery point and isolated destination, prove the required stores
+were restored, and link readiness plus the agreed functional checks. An archive
+listing or healthy container alone is insufficient. This inventory runs no
+backup, restore, service restart or rehearsal and does not enable the schedule.
 
 ## Prepare and execute
 
