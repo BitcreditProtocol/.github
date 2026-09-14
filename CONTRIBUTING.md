@@ -1,7 +1,7 @@
 <!--
 Organisation-wide default. A repository can override it with its own
-CONTRIBUTING.md, and three do — bit.cr, bitcr.org, and the crowdin-sdk fork, whose
-copy is upstream's. The remaining 25 active repositories inherit this file.
+CONTRIBUTING.md. Repository-specific contribution and governance instructions
+take precedence over this guide.
 Everything below describes what is actually configured and enforced. If you
 change a ruleset or a repository setting, change this file with it.
 -->
@@ -10,14 +10,16 @@ change a ruleset or a repository setting, change this file with it.
 
 Thanks for working on Bitcredit. This describes how contributions move through
 this organisation, including enforced rules and the merge policy maintainers
-follow.
+follow. Repository rules show the effective protections,
+including any exceptions to the organisation baseline. Governance retains its
+separate contribution and decision process.
 
 ## Before you start
 
 - **Two-factor authentication is required** to be a member of this organisation,
   and the requirement is set at the enterprise level as well.
-- Every repository here is **MIT licensed**. By opening a pull request you are
-  contributing under that licence.
+- Read the repository's **LICENSE** before contributing; this shared guide does
+  not replace the licence carried by that repository.
 - **Never report a security problem in a public issue or pull request.** Use the
   repository's **Security** tab, or the private routes in
   [the organisation security policy][security] — a GitHub security advisory, or
@@ -48,10 +50,8 @@ repository already has them and are never added to a repository that does not,
 because which workflow labels a team wants is that team's business. So a
 repository having no `blocked` label does not mean nothing there is blocked.
 
-The first two are also **applied sparingly** — at the time of writing only a
-couple of open issues carry either, out of several hundred. Their absence is not
-a signal that an issue is unavailable. If an issue interests you and nothing
-marks it as taken, ask in a comment.
+The absence of these labels does not mean an issue is unavailable. If an issue
+interests you and nothing marks it as taken, ask in a comment.
 
 Before you start, read the issue's comments. If someone has said they are on it
 and there has been activity in the last week or so, pick something else.
@@ -65,8 +65,8 @@ discovering the disagreement in review.
 ## Work out which branch to target first
 
 **The default branch is not always the one to open your pull request against.**
-Four repositories develop on `dev` and merge to their default branch only for
-releases:
+These product repositories normally develop on `dev` and promote changes to
+their default branch for releases:
 
 | Repository | Open pull requests against |
 |---|---|
@@ -75,8 +75,9 @@ releases:
 | `wallet` | `dev` |
 | `wildcat-dashboard-ui` | `dev` |
 
-Everywhere else, target the default branch — which is `master` in 23
-repositories and `main` in 6, so check rather than assume.
+For other repositories and changes to CI or release management, confirm the
+intended base with the repository's instructions or the agreed issue/PR scope.
+Check the actual default branch rather than assuming `master` or `main`.
 
 If you are unsure, ask the repository what it does:
 
@@ -91,7 +92,8 @@ files other people are changing.
 
 ## What the rules enforce
 
-On the **default branch** of every repository:
+The organisation baseline for the **default branch** provides these rules.
+Check the repository's **Rules** page for its effective scope and exceptions:
 
 - **One approving review** is required before merge.
 - **Copilot code review** is requested automatically on every branch.
@@ -133,16 +135,16 @@ and merge with a merge commit.
 
 ## Make your commits attributable
 
-**A commit whose author email is not linked to a GitHub account makes your pull
-request need a second approval.** This is enforced, not advisory. Before you
-start:
+The organisation baseline requires an additional approval for **a commit whose
+author email is not linked to a GitHub account**. Repository-specific exceptions
+are shown on the Rules page. Before you start:
 
 ```bash
 git config user.email   # must be an email on your GitHub account
 ```
 
-Signing commits is not required — about 80% of commits here are signed, and it
-is welcome but voluntary. Attribution is the part that costs a reviewer.
+The organisation baseline does not require signed commits. Signing is welcome;
+correct author attribution is still required for the approval rule above.
 
 ## Opening the pull request
 
@@ -167,8 +169,9 @@ that something is wrong.
 
 ## After it merges
 
-Your branch is **deleted automatically** on merge, in every repository. Nothing
-auto-merges anywhere, so a pull request sits until a person merges it.
+The repository's merge settings control automatic branch deletion and available
+merge methods. Passing PR checks or a PR approval do not establish successful
+publication or deployment; follow the repository's merge and release process.
 
 ## How your change ships
 
@@ -184,8 +187,8 @@ not expected to agree.
 
 ## Dependencies
 
-Dependabot is configured in 24 of the 29 active repositories, with grouped
-updates, a cooldown before a release is offered, and an assignee per ecosystem.
+Where Dependabot is configured, each repository's `.github/dependabot.yml`
+defines its ecosystems, groups, schedule, cooldown and assignees.
 **Do not hand-bump a dependency it already offers** — you will conflict with an
 open pull request, and the bump will be raised again anyway. If an update needs
 code changes, do that work on the Dependabot branch or in its own pull request

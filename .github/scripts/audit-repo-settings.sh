@@ -44,9 +44,9 @@ DRY_RUN="${DRY_RUN:-false}"
 REQUIRED_TOPICS="bitcoin bitcredit"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 
-# How recently a branch must have been pushed for a reference on it to count as
-# live. Used by the orphaned-credential check: a dead branch must not block a
-# deletion, and an active one must. GNU date on the runner, BSD date locally.
+# Commit-date cutoff for recent branch references. An old commit does not prove
+# that a branch is unused or has had no recent push; deletion needs manual
+# confirmation in that case. GNU date on the runner, BSD date locally.
 CUTOFF="$(date -u -d '90 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
           || date -u -v-90d '+%Y-%m-%dT%H:%M:%SZ')"
 
@@ -102,6 +102,21 @@ read_api() {
   return 1
 }
 
+# Validate every row before projecting paths or workflow blobs. These consumers
+# use line/TSV records, so paths with control characters cannot be measured.
+valid_tree() {
+  jq -e '
+    type == "object" and .truncated == false and (.tree | type == "array")
+    and all(.tree[];
+      type == "object" and (.path | type == "string") and (.path | length > 0)
+      and (.path | test("[[:cntrl:]]") | not)
+      and (.path | split("/") | all(. != "" and . != "." and . != ".."))
+      and (.type == "blob" or .type == "tree" or .type == "commit")
+      and (.sha | type == "string") and (.sha | test("^[0-9a-f]{40}$")))
+    and ((.tree | length) == (.tree | unique_by(.path) | length))
+    ' "$1" >/dev/null 2>&1
+}
+
 read_count() {
   local endpoint=$1
   if read_api "$endpoint" "$WORK/count.json"; then
@@ -111,6 +126,40 @@ read_count() {
     gap "$endpoint — invalid count response"
   else
     [ "$?" != 44 ] || gap "$endpoint — HTTP 404, count unknown"
+  fi
+  return 1
+}
+
+# Validate complete name lists before projecting fields: a missing collection
+# or name is unknown data, not an empty list or a credential named "null".
+read_names() {
+  local endpoint=$1 output=$2 collection=$3
+  : > "$output"
+  if read_api "$endpoint" "$WORK/name-pages.json" --paginate --slurp; then
+    if jq -e --arg collection "$collection" '
+      if type != "array" or length == 0 then error("invalid pages") else . end
+      | if $collection == "" then
+          if all(.[]; type == "array") then add else error("invalid list pages") end
+        else
+          if all(.[]; type == "object" and (.[$collection] | type) == "array"
+                     and (.total_count | type) == "number"
+                     and .total_count >= 0 and .total_count == (.total_count | floor))
+          then .[0].total_count as $n
+            | if any(.[]; .total_count != $n) then error("changed count") else . end
+            | [.[] | .[$collection][]]
+            | if length == $n then . else error("incomplete name list") end
+          else error("invalid collection pages") end
+        end
+      | if all(.[]; type == "object" and (.name | type) == "string" and (.name | length) > 0)
+           and length == (unique_by(.name) | length)
+        then map(.name) else error("invalid name rows") end
+      ' "$WORK/name-pages.json" > "$WORK/name-list.json" 2>/dev/null; then
+      jq -r '.[]' "$WORK/name-list.json" > "$output"
+      return 0
+    fi
+    gap "$endpoint — invalid or incomplete name list"
+  else
+    [ "$?" != 44 ] || gap "$endpoint — HTTP 404, names unknown"
   fi
   return 1
 }
@@ -146,12 +195,12 @@ fi
 # once: five secrets, so five extra requests rather than five per repository.
 have_orgsecrets=""
 : > "$WORK/orggrants"
-if gh api "orgs/$ORG/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' > "$WORK/orgsecrets.raw" 2>/dev/null; then
+if read_names "orgs/$ORG/actions/secrets?per_page=100" "$WORK/orgsecrets.raw" secrets; then
   sort "$WORK/orgsecrets.raw" > "$WORK/orgsecrets"
   have_orgsecrets=1
   while IFS= read -r s; do
     [ -z "$s" ] && continue
-    if gh api "orgs/$ORG/actions/secrets/$s/repositories" --paginate --jq '.repositories[]?.name' > "$WORK/grant.raw" 2>/dev/null; then
+    if read_names "orgs/$ORG/actions/secrets/$s/repositories?per_page=100" "$WORK/grant.raw" repositories; then
       sed "s|^|$s |" "$WORK/grant.raw" >> "$WORK/orggrants"
     else
       # One unreadable grant list would make every reference to that secret look
@@ -192,21 +241,6 @@ else
   gap "environments — needs \`Environments: read\`; the unprotected-environment check, the non-member-reviewer check and the environment half of the secret surface are skipped"
 fi
 
-# Pages needs its own probe shape, because here a failure is ambiguous in a way
-# the others are not: 403 is "no permission" and 404 is "this repository has no
-# site", and a repository with no site is the normal case. Other failures are
-# unknown, never evidence that the endpoint is readable.
-have_pages=""
-if read_api "repos/$ORG/.github/pages" "$WORK/pageprobe"; then
-  if jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pageprobe" >/dev/null 2>&1; then
-    have_pages=1
-  else
-    gap "Pages permission probe — invalid response"
-  fi
-else
-  [ "$?" != 44 ] || have_pages=1
-fi
-
 # Counters for the metrics that are deliberately not findings.
 n_untimed=0; n_agentfiles=0; n_agentrepos=0; n_wiki=0
 : > "$WORK/untimedrepos"
@@ -224,8 +258,8 @@ n_topics=0; n_merge=0
 # newline, which is exactly how long a duplicate stays identical.
 mkdir -p "$WORK/org"
 for f in CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md; do
-  gh api "repos/$ORG/.github/contents/$f" -H "Accept: application/vnd.github.raw" \
-    > "$WORK/org/$f" 2>/dev/null || : > "$WORK/org/$f"
+  read_api "repos/$ORG/.github/contents/$f" "$WORK/org/$f" \
+    -H "Accept: application/vnd.github.raw" || true
 done
 
 while IFS= read -r repo; do
@@ -233,11 +267,26 @@ while IFS= read -r repo; do
   meta=$(gh api "repos/$ORG/$repo")
 
   # --- enforce: organisation topics (additive, never removes anything)
-  gh api "repos/$ORG/$repo/topics" --jq '.names // [] | .[]' > "$WORK/topics"
+  topics_complete=""
+  : > "$WORK/topics"
+  if read_api "repos/$ORG/$repo/topics" "$WORK/topics-response.json"; then
+    if jq -e 'type == "object" and (.names | type) == "array"
+              and all(.names[]; type == "string" and length > 0 and (test("[\r\n]") | not))' \
+         "$WORK/topics-response.json" >/dev/null 2>&1; then
+      jq -r '.names[]' "$WORK/topics-response.json" > "$WORK/topics"
+      topics_complete=1
+    else
+      gap "$repo topics — invalid response; no topic update authorized"
+    fi
+  else
+    [ "$?" != 44 ] || gap "$repo topics — HTTP 404; no topic update authorized"
+  fi
   missing=""
-  for t in $REQUIRED_TOPICS; do
-    grep -Fxq "$t" "$WORK/topics" || missing="$missing $t"
-  done
+  if [ -n "$topics_complete" ]; then
+    for t in $REQUIRED_TOPICS; do
+      grep -Fxq "$t" "$WORK/topics" || missing="$missing $t"
+    done
+  fi
   if [ -n "$missing" ]; then
     echo "  $repo: adding topics$missing"
     { cat "$WORK/topics"; for t in $missing; do echo "$t"; done; } | sort -u \
@@ -248,10 +297,15 @@ while IFS= read -r repo; do
 
   # --- enforce: merge settings. Every flag here only enables something, so a
   # repository can gain a merge method or branch cleanup but never lose one.
-  drift=$(echo "$meta" | jq -r '
+  if ! drift=$(echo "$meta" | jq -er '
     {allow_merge_commit, allow_squash_merge, allow_rebase_merge,
      delete_branch_on_merge, allow_update_branch}
-    | to_entries | map(select(.value != true) | .key) | join(", ")')
+    | if all(.[]; type == "boolean")
+      then to_entries | map(select(.value == false) | .key) | join(", ")
+      else error("invalid merge settings") end' 2>/dev/null); then
+    drift=""
+    gap "$repo merge settings — invalid or missing boolean; no settings update authorized"
+  fi
   if [ -n "$drift" ]; then
     echo "  $repo: enabling $drift"
     [ "$DRY_RUN" = "true" ] || gh api -X PATCH "repos/$ORG/$repo" \
@@ -285,18 +339,22 @@ while IFS= read -r repo; do
   fi
 
   # LICENSE: present at all, and naming the holder we expect
-  if ! gh api "repos/$ORG/$repo/license" --jq '.content' 2>/dev/null | base64 -d > "$WORK/lic" 2>/dev/null \
-     || [ ! -s "$WORK/lic" ]; then
+  if read_api "repos/$ORG/$repo/license" "$WORK/license-response.json"; then
+    if jq -er '.content | select(type == "string" and length > 0)' "$WORK/license-response.json" > "$WORK/license.b64" &&
+       base64 -d < "$WORK/license.b64" > "$WORK/lic" 2>/dev/null && [ -s "$WORK/lic" ]; then
+      line=$(grep -i -m1 '^copyright' "$WORK/lic" || true)
+      expected=$(jq -r --arg r "$repo" '.third_party // [] | map(select(.repository == $r)) | .[0].holder // ""' "$WORK/license.json")
+      [ -n "$expected" ] || expected="$HOLDER"
+      case "$line" in
+        *"$expected"*) : ;;
+        "") echo "$repo|LICENSE has no copyright line" >> "$WORK/findings" ;;
+        *)  echo "$repo|LICENSE names '${line#*) }' — expected '$expected'" >> "$WORK/findings" ;;
+      esac
+    else
+      gap "$repo LICENSE — invalid content response"
+    fi
+  elif [ "$?" = 44 ]; then
     echo "$repo|no LICENSE ($(echo "$meta" | jq -r .visibility))" >> "$WORK/findings"
-  else
-    line=$(grep -i -m1 '^copyright' "$WORK/lic" || true)
-    expected=$(jq -r --arg r "$repo" '.third_party // [] | map(select(.repository == $r)) | .[0].holder // ""' "$WORK/license.json")
-    [ -n "$expected" ] || expected="$HOLDER"
-    case "$line" in
-      *"$expected"*) : ;;
-      "") echo "$repo|LICENSE has no copyright line" >> "$WORK/findings" ;;
-      *)  echo "$repo|LICENSE names '${line#*) }' — expected '$expected'" >> "$WORK/findings" ;;
-    esac
   fi
 
   # Reported only where there is something for Dependabot to update. Six
@@ -308,7 +366,7 @@ while IFS= read -r repo; do
   branch=$(echo "$meta" | jq -r '.default_branch')
   tree_complete=""
   if read_api "repos/$ORG/$repo/git/trees/$branch?recursive=1" "$WORK/tree.json"; then
-    if jq -e '.truncated == false and (.tree | type == "array")' "$WORK/tree.json" >/dev/null 2>&1; then
+    if valid_tree "$WORK/tree.json"; then
       jq -r '[.tree[] | select(.type == "blob") | .path] | join("\n")' "$WORK/tree.json" > "$WORK/tree.all"
       tree_complete=1
     else
@@ -340,23 +398,66 @@ while IFS= read -r repo; do
   grep -qiE '(^|/)Dockerfile(\.[A-Za-z0-9_-]+)?$|(^|/)docker-compose.*\.ya?ml$' \
     "$WORK/tree" && eco="$eco docker"
   grep -qiE '\.tf$'                                  "$WORK/tree" && eco="$eco terraform"
-  # workflows need no manifest: the github-actions ecosystem updates the
-  # action versions pinned inside them
-  grep -qE '^\.github/workflows/.*\.ya?ml$'          "$WORK/tree" && eco="$eco github-actions"
+  # Dependabot updates external GitHub repository references, not shell-only
+  # workflows, local uses or docker:// images. Read each manifest once and reuse
+  # its body and parsed YAML in the workflow checks below.
+  # .github/actions/build is source, even though build/ and target/ remain
+  # excluded from general package discovery.
+  workflows_complete="$tree_complete"
+  action_dependencies=""
+  while IFS= read -r manifest; do
+    [ -n "$manifest" ] || continue
+    cached="$WORK/$(printf '%s/%s' "$repo" "$manifest" | git hash-object --stdin)"
+    if ! read_api "repos/$ORG/$repo/contents/$manifest?ref=$branch" "$cached" -H "Accept: application/vnd.github.raw"; then
+      # read_api already reports transport failures; a listed file's absence is
+      # also incomplete evidence, unlike an absent optional configuration.
+      [ -s "$WORK/read-error" ] && grep -q '(HTTP 404)' "$WORK/read-error" &&
+        gap "$repo action manifest $manifest — disappeared after the tree was read"
+      case "$manifest" in .github/workflows/*) workflows_complete="" ;; esac
+      continue
+    fi
+    if yq -o=json '.' "$cached" > "$WORK/manifest.json" 2>/dev/null &&
+       external=$(jq -sr '
+         if length != 1 then error("expected one YAML document") else .[0] end
+         | if type != "object" or ((.jobs // {}) | type != "object")
+              or ((.runs // {}) | type != "object") then error("invalid action manifest")
+           else [(.jobs // {} | .[] | .uses, (.steps // [] | .[] | .uses)),
+                 (.runs.steps // [] | .[] | .uses)] | map(select(. != null)) end
+         | if all(.[]; type == "string") then
+             any(.[]; test("^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+(/[^[:space:]@]+)*@[^[:space:]@]+$"))
+           else error("uses must be a string") end' "$WORK/manifest.json" 2>/dev/null); then
+      cp "$WORK/manifest.json" "$cached.json"
+      [ "$external" != true ] || action_dependencies=1
+    else
+      gap "$repo action manifest $manifest — invalid YAML or dependency structure"
+      case "$manifest" in .github/workflows/*) workflows_complete="" ;; esac
+    fi
+  done < <({
+    grep -E '^\.github/workflows/.*\.ya?ml$|(^|/)action\.ya?ml$' "$WORK/tree" || true
+    grep -E '^\.github/actions/(.*/)?action\.ya?ml$' "$WORK/tree.all" || true
+  } | sort -u)
+  [ -z "$action_dependencies" ] || eco="$eco github-actions"
 
-  if ! gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" >/dev/null 2>&1; then
+  db_available=""
+  if read_api "repos/$ORG/$repo/contents/.github/dependabot.yml" "$WORK/dependabot-response.json"; then
+    if jq -er '.content | select(type == "string" and length > 0)' "$WORK/dependabot-response.json" > "$WORK/db.b64" &&
+       base64 -d < "$WORK/db.b64" > "$WORK/db.yml" 2>/dev/null; then
+      db_available=1
+    else
+      gap "$repo dependabot.yml — invalid content response"
+    fi
+  elif [ "$?" = 44 ]; then
     if [ -n "$eco" ]; then
       echo "$repo|no .github/dependabot.yml, but has$eco" >> "$WORK/findings"
     fi
+  fi
 
   # Dependabot assigns nobody by default, and the setting lives in each
   # repository's own file — so an unassigned configuration is invisible unless
   # something compares it against a list. That is how helm-charts stayed
   # unassigned, and how every cargo, npm and pub block in the organisation ended
   # up with no assignee while the github-actions blocks had one.
-  else
-    gh api "repos/$ORG/$repo/contents/.github/dependabot.yml" --jq '.content' 2>/dev/null \
-      | base64 -d > "$WORK/db.yml" 2>/dev/null || : > "$WORK/db.yml"
+  if [ -n "$db_available" ]; then
     want=$(jq -r --arg r "$repo" '.assignees[$r] // ""' "$WORK/assignees.json")
 
     # A fork's dependabot.yml belongs to the project we forked. crowdin-sdk
@@ -450,14 +551,19 @@ while IFS= read -r repo; do
       # rest. Fifteen of twenty-two configured repositories named a label they did
       # not have -- 31 pairs -- so pull requests arrived carrying fewer labels than
       # the file asked for, and seven arrived with none at all.
-      gh api "repos/$ORG/$repo/labels?per_page=100" --paginate --jq '.[].name' > "$WORK/labels" 2>/dev/null || : > "$WORK/labels"
+      labels_complete=""
+      if read_names "repos/$ORG/$repo/labels?per_page=100" "$WORK/labels" ""; then
+        labels_complete=1
+      else
+        [ "$?" != 44 ] || gap "$repo labels — HTTP 404"
+      fi
       # while read, not for-in: an unquoted command substitution word-splits, so a
       # multi-word label -- labels.yml defines five, including `good first issue`
       # -- would be reported as several missing labels that are all present. No
       # manifest asks for one today (67 label references across 24 manifests, all
       # single-word), which is exactly how a defect like this survives review.
       missing_labels=""
-      while IFS= read -r l; do
+      while [ -n "$labels_complete" ] && IFS= read -r l; do
         [ -z "$l" ] && continue
         grep -Fxq "$l" "$WORK/labels" || missing_labels="$missing_labels $l"
       done < <(jq -r '[.updates[]?.labels[]?] | unique | .[]' "$WORK/db.json")
@@ -481,26 +587,14 @@ while IFS= read -r repo; do
   # attestations: write and produced no attestation, while ten container images
   # shipped with no provenance at all.
   : > "$WORK/wfbody"
-  workflows_complete="$tree_complete"
   : > "$WORK/prt"
   : > "$WORK/floating"
   : > "$WORK/idtoken"
   : > "$WORK/noperm"
   while IFS= read -r wf; do
     [ -z "$wf" ] && continue
-    # Guard on the exit status, not the text. This script runs under set -eu, so a
-    # failed assignment here ended the whole run: one workflow that 404s -- the
-    # tree is read once and these fetches follow minutes later, so a rename inside
-    # that window does it -- and the weekly audit died with no report. And gh
-    # writes its error body to stdout, so [ -z ] could never have been the guard.
-    # [ -z ] stays for what it does cover: an empty file, empty with status 0.
-    if read_api "repos/$ORG/$repo/contents/$wf?ref=$branch" "$WORK/workflow.raw" -H "Accept: application/vnd.github.raw"; then
-      body=$(cat "$WORK/workflow.raw")
-    else
-      [ "$?" != 44 ] || gap "$repo workflow $wf — disappeared after the tree was read"
-      workflows_complete=""
-      continue
-    fi
+    cached="$WORK/$(printf '%s/%s' "$repo" "$wf" | git hash-object --stdin)"
+    body=$(cat "$cached")
     [ -z "$body" ] && continue
     # kept for the credential check below: these bodies are already paid for here
     printf '%s\n' "$body" >> "$WORK/wfbody"
@@ -567,11 +661,10 @@ while IFS= read -r repo; do
     # requests fix most of it. A job that calls a reusable workflow cannot take
     # timeout-minutes at all, so those are excluded -- the timeout for that work
     # belongs inside the called workflow.
-    printf '%s\n' "$body" > "$WORK/wf1.yml"
-    if yq -o=json '.' "$WORK/wf1.yml" > "$WORK/wfjson" 2>/dev/null; then
+    if [ -s "$cached.json" ]; then
       c=$(jq '[.jobs // {} | to_entries[] | select((.value|type)=="object")
                | select((.value|has("uses")) == false)
-               | select((.value|has("timeout-minutes")) == false)] | length' "$WORK/wfjson" 2>/dev/null || echo 0)
+               | select((.value|has("timeout-minutes")) == false)] | length' "$cached.json" 2>/dev/null || echo 0)
       n_untimed=$((n_untimed + c))
       [ "$c" -gt 0 ] && printf '%s\n' "$repo" >> "$WORK/untimedrepos"
     fi
@@ -623,17 +716,24 @@ while IFS= read -r repo; do
   # that it is, and an older precedent argues the same way from the other side:
   # bcr-common/add-clippy-ci referenced an organisation secret on a branch dead
   # since January, and granting the secret to satisfy it would have widened the
-  # blast radius for nothing. Live branches block a deletion; dead ones must not
-  # block it. Ninety days is where that line sits.
+  # blast radius for nothing. Recent commit references block a deletion; older
+  # ones need manual confirmation that the branch is unused. The cutoff is 90 days.
   if [ -n "$workflows_complete" ] && [ -s "$WORK/wfbody" ] && [ -n "$have_reposecrets" ]; then
-    { gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate \
-        --jq '.secrets[]?.name' 2>/dev/null
-      if [ -n "$have_repovars" ]; then
-        gh api "repos/$ORG/$repo/actions/variables?per_page=100" --paginate \
-          --jq '.variables[]?.name' 2>/dev/null
+    creds_complete=1
+    if ! read_names "repos/$ORG/$repo/actions/secrets?per_page=100" "$WORK/creds" secrets; then
+      creds_complete=""
+      gap "$repo credential names — repository secrets unavailable"
+    fi
+    if [ -n "$have_repovars" ]; then
+      if read_names "repos/$ORG/$repo/actions/variables?per_page=100" "$WORK/variables" variables; then
+        cat "$WORK/variables" >> "$WORK/creds"
+      else
+        creds_complete=""
+        gap "$repo credential names — repository variables unavailable"
       fi
-    } | sort -u > "$WORK/creds" || : > "$WORK/creds"
-    while IFS= read -r name; do
+    fi
+    sort -u "$WORK/creds" -o "$WORK/creds"
+    while [ -n "$creds_complete" ] && IFS= read -r name; do
       [ -z "$name" ] && continue
       # A reference, not a mention. E-Bill-frontend/notify-wallet-repo.yml
       # sets an env key literally named GH_TOKEN, fed from secrets.GITHUB_TOKEN --
@@ -650,7 +750,7 @@ while IFS= read -r repo; do
       # Every branch is scanned, not only recent ones, because a reference on an
       # old branch still has to be *found* before it can be judged. The date is
       # then fetched only for the branches that matched -- repos/{r}/branches
-      # returns just {sha, url} under .commit, so the push date is not in the
+      # returns just {sha, url} under .commit, so the commit date is not in the
       # listing and needs the per-branch endpoint. Blobs are deduplicated by SHA,
       # so a workflow unchanged across twenty branches is fetched once.
       # Any fetch that fails here makes the credential look unreferenced, and the
@@ -662,33 +762,36 @@ while IFS= read -r repo; do
       # unreadable answer is not an empty one, and only the second is safe to act
       # on. Process substitution hides the producer's exit status,
       # so each listing goes to a file whose status can be tested.
-      : > "$WORK/seen"
       : > "$WORK/matched"
       cred_unknown=""
-      if ! gh api "repos/$ORG/$repo/branches?per_page=100" --paginate \
-             --jq '.[].name' > "$WORK/brlist" 2>/dev/null; then
+      if ! read_names "repos/$ORG/$repo/branches?per_page=100" "$WORK/brlist" ""; then
         cred_unknown="the branch listing"
       else
         while IFS= read -r bname; do
           [ -z "$bname" ] && continue
           [ "$bname" = "$branch" ] && continue
-          if ! gh api "repos/$ORG/$repo/git/trees/$bname?recursive=1" \
-                 --jq '.tree[]? | select(.type == "blob")
-                       | select(.path | test("^\\.github/workflows/.*\\.ya?ml$"))
-                       | [.path, .sha] | @tsv' > "$WORK/btree" 2>/dev/null; then
-            cred_unknown="the tree of branch $bname"
+          if ! read_api "repos/$ORG/$repo/git/trees/$bname?recursive=1" "$WORK/branch-tree.json" ||
+             ! valid_tree "$WORK/branch-tree.json"; then
+            cred_unknown="the complete tree of branch $bname"
             break
           fi
+          jq -r '.tree[] | select(.type == "blob")
+                 | select(.path | test("^\\.github/workflows/.*\\.ya?ml$"))
+                 | [.path, .sha] | @tsv' "$WORK/branch-tree.json" > "$WORK/btree"
           while IFS="$(printf '\t')" read -r bpath bsha; do
             [ -z "$bsha" ] && continue
-            grep -qxF "$bsha" "$WORK/seen" && continue
-            echo "$bsha" >> "$WORK/seen"
-            if ! gh api "repos/$ORG/$repo/git/blobs/$bsha" --jq '.content' > "$WORK/blob.b64" 2>/dev/null; then
-              cred_unknown="a blob on branch $bname"
-              break
+            # Cache bytes, not branch membership: an identical blob may be on
+            # both a dead branch and a live one.
+            if [ ! -f "$WORK/blob-$bsha" ]; then
+              if ! read_api "repos/$ORG/$repo/git/blobs/$bsha" "$WORK/blob-response.json" ||
+                 ! jq -er '.content | select(type == "string")' "$WORK/blob-response.json" > "$WORK/blob.b64" 2>/dev/null ||
+                 ! base64 -d < "$WORK/blob.b64" > "$WORK/blob-$bsha" 2>/dev/null; then
+                rm -f "$WORK/blob-$bsha"
+                cred_unknown="a blob on branch $bname"
+                break
+              fi
             fi
-            if base64 -d < "$WORK/blob.b64" 2>/dev/null \
-               | grep -qE -- "(secrets|vars)\\.${name}([^A-Za-z0-9_]|$)"; then
+            if grep -qE -- "(secrets|vars)\\.${name}([^A-Za-z0-9_]|$)" "$WORK/blob-$bsha"; then
               grep -qxF "$bname" "$WORK/matched" || echo "$bname" >> "$WORK/matched"
             fi
           done < "$WORK/btree"
@@ -701,10 +804,10 @@ while IFS= read -r repo; do
       while IFS= read -r bname; do
         [ -z "$bname" ] && continue
         if ! bdate=$(gh api "repos/$ORG/$repo/branches/$bname" \
-                       --jq '.commit.commit.committer.date // .commit.commit.author.date // ""' 2>/dev/null); then
-          # An unreadable push date would count the branch as dead, which pushes
-          # the verdict toward deletion. Unknown instead.
-          cred_unknown="the push date of branch $bname"
+                       --jq '.commit.commit.committer.date // .commit.commit.author.date // ""' 2>/dev/null) ||
+           [ -z "$bdate" ]; then
+          # Without a recorded commit date, branch age is unknown.
+          cred_unknown="the commit date of branch $bname"
           break
         fi
         if [ -n "$bdate" ] && [ "$bdate" \> "$CUTOFF" ]; then
@@ -725,20 +828,25 @@ while IFS= read -r repo; do
       # otherwise reach a delete verdict pay for the extra tree walk.
       elsewhere=""
       if [ -z "$live" ] && [ -z "$cred_unknown" ]; then
-        if ! gh api "repos/$ORG/$repo/git/trees/$branch?recursive=1" \
-               --jq '.tree[]? | select(.type == "blob")
+        # Reuse the complete default-branch snapshot validated above.
+        if ! jq -r '.tree[] | select(.type == "blob")
                      | select(.path | test("^\\.github/workflows/") | not)
                      | select(.path | test("\\.(ya?ml|json|sh|toml)$") or test("\\.env"))
-                     | [.path, .sha] | @tsv' > "$WORK/ctree" 2>/dev/null; then
+                     | [.path, .sha] | @tsv' "$WORK/tree.json" > "$WORK/ctree" 2>/dev/null; then
           cred_unknown="the default-branch tree"
         else
           while IFS="$(printf '\t')" read -r cpath csha; do
             [ -z "$csha" ] && continue
-            if ! gh api "repos/$ORG/$repo/git/blobs/$csha" --jq '.content' > "$WORK/blob.b64" 2>/dev/null; then
-              cred_unknown="a config blob on $branch"
-              break
+            if [ ! -f "$WORK/blob-$csha" ]; then
+              if ! read_api "repos/$ORG/$repo/git/blobs/$csha" "$WORK/blob-response.json" ||
+                 ! jq -er '.content | select(type == "string")' "$WORK/blob-response.json" > "$WORK/blob.b64" 2>/dev/null ||
+                 ! base64 -d < "$WORK/blob.b64" > "$WORK/blob-$csha" 2>/dev/null; then
+                rm -f "$WORK/blob-$csha"
+                cred_unknown="a config blob on $branch"
+                break
+              fi
             fi
-            base64 -d < "$WORK/blob.b64" 2>/dev/null | grep -qF -- "$name" \
+            grep -qF -- "$name" "$WORK/blob-$csha" \
               && elsewhere="$elsewhere $cpath"
           done < "$WORK/ctree"
         fi
@@ -751,7 +859,7 @@ while IFS= read -r repo; do
       elif [ -n "$elsewhere" ]; then
         echo "$repo|$name is read by no workflow, but is referenced outside .github/workflows on $branch:$elsewhere — not safe to delete" >> "$WORK/findings"
       elif [ "$dead" -gt 0 ]; then
-        echo "$repo|$name is read by no workflow on $branch, and only by $dead branch(es) with no push in 90 days — safe to delete" >> "$WORK/findings"
+        echo "$repo|$name is read by no workflow on $branch, and only by $dead branch(es) whose recorded commit is over 90 days old — confirm those branches are unused before deletion" >> "$WORK/findings"
       else
         echo "$repo|$name is read by no workflow on any branch — safe to delete" >> "$WORK/findings"
       fi
@@ -768,10 +876,12 @@ while IFS= read -r repo; do
     [ "$repo" = ".github" ] && continue
     [ -s "$WORK/org/$f" ] || continue
     grep -qxF "$f" "$WORK/tree" || continue
-    gh api "repos/$ORG/$repo/contents/$f?ref=$branch" -H "Accept: application/vnd.github.raw" \
-      > "$WORK/own.tmp" 2>/dev/null || continue
-    if cmp -s "$WORK/org/$f" "$WORK/own.tmp"; then
-      echo "$repo|$f is byte-identical to the organisation version and could be inherited" >> "$WORK/findings"
+    if read_api "repos/$ORG/$repo/contents/$f?ref=$branch" "$WORK/own.tmp" -H "Accept: application/vnd.github.raw"; then
+      if cmp -s "$WORK/org/$f" "$WORK/own.tmp"; then
+        echo "$repo|$f is byte-identical to the organisation version and could be inherited" >> "$WORK/findings"
+      fi
+    else
+      [ "$?" != 44 ] || gap "$repo community file $f — disappeared after the tree was read"
     fi
   done
 
@@ -840,16 +950,16 @@ while IFS= read -r repo; do
   # repository is a documentation site and is meant to -- but an internal
   # repository serving a public site is an exposure nobody chose on purpose, so
   # the visibility of the repository is reported beside the URL.
-  if [ -n "$have_pages" ]; then
-    if read_api "repos/$ORG/$repo/pages" "$WORK/pages.json"; then
-      if ! jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pages.json" >/dev/null 2>&1; then
-        gap "$repo Pages site — invalid response"
-      elif [ "$(jq -r .public "$WORK/pages.json")" = true ]; then
-        pg_url=$(jq -r .html_url "$WORK/pages.json")
-        pg_src=$(jq -r '.source.branch // "?"' "$WORK/pages.json")
-        vis=$(echo "$meta" | jq -r '.visibility')
-        echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
-      fi
+  # Read each repository independently: one inaccessible site says nothing about
+  # another repository. read_api records failures and keeps confirmed 404 absence distinct.
+  if read_api "repos/$ORG/$repo/pages" "$WORK/pages.json"; then
+    if ! jq -e 'type == "object" and (.html_url | type == "string") and (.public | type == "boolean")' "$WORK/pages.json" >/dev/null 2>&1; then
+      gap "$repo Pages site — invalid response"
+    elif [ "$(jq -r .public "$WORK/pages.json")" = true ]; then
+      pg_url=$(jq -r .html_url "$WORK/pages.json")
+      pg_src=$(jq -r '.source.branch // "?"' "$WORK/pages.json")
+      vis=$(echo "$meta" | jq -r '.visibility')
+      echo "$repo|$vis repository publishes a public Pages site at $pg_url (source: $pg_src)" >> "$WORK/findings"
     fi
   fi
 
@@ -873,8 +983,14 @@ while IFS= read -r repo; do
       echo "$repo|wiki enabled but empty" >> "$WORK/findings"
   fi
 
-  attached=$(gh api "repos/$ORG/$repo/code-security-configuration" --jq '.configuration.name // "none"' 2>/dev/null || echo none)
-  [ "$attached" = "$BASELINE_CONFIG" ] ||
+  attached=""
+  if read_api "repos/$ORG/$repo/code-security-configuration" "$WORK/security-configuration.json"; then
+    attached=$(jq -er '.configuration.name | select(type == "string" and length > 0)' "$WORK/security-configuration.json") ||
+      gap "$repo security configuration — invalid response"
+  elif [ "$?" = 44 ]; then
+    attached=none
+  fi
+  [ -z "$attached" ] || [ "$attached" = "$BASELINE_CONFIG" ] ||
     echo "$repo|security configuration is '$attached', expected '$BASELINE_CONFIG'" >> "$WORK/findings"
 
   # A repository secret whose name also exists at organisation level. Which value
@@ -884,11 +1000,16 @@ while IFS= read -r repo; do
   # so an eleven-month-old cloud credential sits somewhere nobody is looking, and
   # narrowing the organisation secret did not touch it.
   : > "$WORK/reposecrets"
+  reposecrets_complete=""
   shadow=""
   if [ -n "$have_reposecrets" ] && [ -n "$have_orgsecrets" ]; then
-    gh api "repos/$ORG/$repo/actions/secrets?per_page=100" --paginate --jq '.secrets[]?.name' 2>/dev/null \
-      | sort > "$WORK/reposecrets" || : > "$WORK/reposecrets"
-    shadow=$(comm -12 "$WORK/reposecrets" "$WORK/orgsecrets" | tr '\n' ' ' | sed 's/ $//')
+    if read_names "repos/$ORG/$repo/actions/secrets?per_page=100" "$WORK/reposecrets.raw" secrets; then
+      sort "$WORK/reposecrets.raw" > "$WORK/reposecrets"
+      reposecrets_complete=1
+      shadow=$(comm -12 "$WORK/reposecrets" "$WORK/orgsecrets" | tr '\n' ' ' | sed 's/ $//')
+    else
+      [ "$?" != 44 ] || gap "$repo repository secrets — HTTP 404"
+    fi
   fi
   [ -n "$shadow" ] &&
     echo "$repo|repository secret shadows an organisation secret of the same name: $shadow" >> "$WORK/findings"
@@ -902,7 +1023,7 @@ while IFS= read -r repo; do
   # file makes granted secrets look ungranted, which fault injection caught
   # after the sibling check had already been gated and this one had not.
   notgranted=""
-  while [ -n "$have_orgsecrets" ] && [ -n "$workflows_complete" ] && IFS= read -r s; do
+  while [ -n "$reposecrets_complete" ] && [ -n "$have_orgsecrets" ] && [ -n "$workflows_complete" ] && IFS= read -r s; do
     [ -z "$s" ] && continue
     grep -qE "secrets\.$s([^A-Za-z0-9_]|\$)" "$WORK/wfbody" || continue
     grep -qxF "$s" "$WORK/reposecrets" && continue
@@ -912,6 +1033,50 @@ while IFS= read -r repo; do
   [ -n "$notgranted" ] &&
     echo "$repo|references organisation secret(s) it was not granted:$notgranted" >> "$WORK/findings"
 
+  # All environment checks share one complete paginated snapshot. A first page
+  # cannot establish that no other environment holds an ungated secret.
+  env_snapshot="$WORK/environments-$repo.json"
+  : > "$env_snapshot"
+  if [ -n "$have_envs" ]; then
+    if read_api "repos/$ORG/$repo/environments?per_page=100" "$WORK/environment-pages.json" --paginate --slurp; then
+      if ! jq -e '
+        def valid_reviewer:
+          type == "object" and (.reviewer | type) == "object"
+          and (if .type == "User" then
+                 (.reviewer.login | type) == "string" and (.reviewer.login | length) > 0
+               elif .type == "Team" then
+                 (.reviewer.name | type) == "string" and (.reviewer.name | length) > 0
+               else false end);
+        def valid_rule:
+          type == "object"
+          and (if .type == "required_reviewers" then
+                 (.reviewers | type) == "array" and (.reviewers | length) > 0
+                 and all(.reviewers[]; valid_reviewer)
+               elif .type == "wait_timer" then
+                 (.wait_timer | type) == "number" and .wait_timer >= 0
+                 and .wait_timer == (.wait_timer | floor)
+               elif .type == "branch_policy" then true
+               else false end);
+        if type != "array" or length == 0
+           or any(.[]; (.environments | type) != "array" or (.total_count | type) != "number")
+        then error("invalid environment pages") else
+          .[0].total_count as $n | [.[] | .environments[]] as $envs
+          | if $n < 0 or $n != ($n | floor) or any(.[]; .total_count != $n)
+               or ($envs | length) != $n or ($envs | unique_by(.name) | length) != $n
+               or any($envs[]; (.name | type) != "string" or (.name | length) == 0
+                      or (.protection_rules | type) != "array"
+                      or any(.protection_rules[]; valid_rule | not))
+            then error("incomplete environment pages")
+            else {total_count: $n, environments: $envs} end
+        end' "$WORK/environment-pages.json" > "$env_snapshot" 2>/dev/null; then
+        : > "$env_snapshot"
+        gap "$repo environments — incomplete or invalid paginated response"
+      fi
+    else
+      [ "$?" != 44 ] || gap "$repo environments — HTTP 404"
+    fi
+  fi
+
   # An environment holding secrets with no protection rule at all. Two are
   # accepted and named here rather than skipped silently: Wildcat-deployment's
   # wildcat-dev holds a test seed and stays open so dev iteration is fast, and
@@ -919,8 +1084,8 @@ while IFS= read -r repo; do
   # build-dev.yml come from feature branches -- restricting it would break the
   # process rather than close a hole. Delete a line here and the check reports it
   # again, which is the point of a list over a silent skip.
-  [ -n "$have_envs" ] &&
-  gh api "repos/$ORG/$repo/environments?per_page=100" --jq '.environments[]?|select((.protection_rules|length)==0)|.name' 2>/dev/null \
+  [ -s "$env_snapshot" ] &&
+  jq -r '.environments[]|select((.protection_rules|length)==0)|.name' "$env_snapshot" \
   | while IFS= read -r env; do
       [ -z "$env" ] && continue
       case "$repo/$env" in
@@ -945,9 +1110,8 @@ while IFS= read -r repo; do
   # A required reviewer who is not an organisation member. An approval request
   # cannot reach them, so the gate has fewer approvers than it appears to --
   # bcr-relay/prod listed four and had three until tompro was removed.
-  [ -n "$have_envs" ] && [ -n "$have_members" ] &&
-  gh api "repos/$ORG/$repo/environments?per_page=100" --jq \
-    '.environments[]?|.name as $e|.protection_rules[]?|select(.type=="required_reviewers")|.reviewers[]?|"\($e)|\(.reviewer.login // .reviewer.name // "?")"' 2>/dev/null \
+  [ -s "$env_snapshot" ] && [ -n "$have_members" ] &&
+  jq -r '.environments[]|.name as $e|.protection_rules[]?|select(.type=="required_reviewers")|.reviewers[]?|"\($e)|\(.reviewer.login // .reviewer.name // "?")"' "$env_snapshot" \
   | while IFS='|' read -r env who; do
       [ -z "$who" ] && continue
       grep -qxF "$who" "$WORK/members" ||
@@ -1152,12 +1316,7 @@ if [ -n "$have_reposecrets" ] && [ -n "$have_envs" ]; then have_surface=1; fi
 while [ -n "$have_surface" ] && read -r repo; do
   if ! n=$(read_count "repos/$ORG/$repo/actions/secrets"); then have_surface=""; break; fi
   repo_level=$((repo_level + n))
-  if ! read_api "repos/$ORG/$repo/environments?per_page=100" "$WORK/surface-envs.json"; then
-    gap "$repo secret surface — environments unavailable"
-    have_surface=""; break
-  fi
-  if ! jq -e '.environments | type == "array"' "$WORK/surface-envs.json" >/dev/null 2>&1; then
-    gap "$repo secret surface — invalid environments response"
+  if [ ! -s "$WORK/environments-$repo.json" ]; then
     have_surface=""; break
   fi
   g=0
@@ -1170,7 +1329,7 @@ while [ -n "$have_surface" ] && read -r repo; do
     if ! es=$(read_count "repos/$ORG/$repo/environments/$ename/secrets"); then have_surface=""; break; fi
     [ "$es" -eq 0 ] && continue
     if [ "$prot" = "0" ]; then u=$((u + es)); else g=$((g + es)); fi
-  done < <(jq -r '.environments[] | [.name, ((.protection_rules//[])|length)] | @tsv' "$WORK/surface-envs.json")
+  done < <(jq -r '.environments[] | [.name, ((.protection_rules//[])|length)] | @tsv' "$WORK/environments-$repo.json")
   gated=$((gated + g))
   ungated_env=$((ungated_env + u))
   if [ $((n + g + u)) -gt 0 ]; then
