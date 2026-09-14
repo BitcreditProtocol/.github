@@ -8,6 +8,7 @@ Scheduled workflows maintain organisation settings and watch cross-repository de
 
 | Workflow | Script | Writes | Reports |
 | --- | --- | --- | --- |
+| `watch-openapi.yml` | `watch-openapi.py` | one open dashboard issue | exact Wildcat/master artifact compared with dashboard/dev |
 | `propose-wallet-minimum.yml` | `propose-wallet-minimum.py` | a proposal branch and PR in static-assets | explicit wallet minimum and release provenance |
 | `watch-dependency-graph.yml` | `watch-dependency-graph.py` | dependency issues, after explicit activation | exact pins, ranges, revisions, overrides and incomplete reads |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
@@ -147,9 +148,34 @@ A manual closure suppresses that target version only. A later release can notify
 
 Only marked issues authored by the current automation App are managed; a marker in somebody else's issue does not grant ownership. All issue pages are read before any issue mutation. API failures and malformed/truncated inputs appear in the run summary; they do not mean every exact pin is current. Unknown write outcomes are read back before a subsequent run can create anything again.
 
+The watcher polls at 06:25 UTC, Monday through Friday; GitHub may delay scheduled runs. Expected source and override comparisons appear under **Not measured** without failing execution. API, response-schema, input parsing and write failures appear under **Execution errors** and fail the run. Neither category proves that an affected dependency is current.
+
 Scheduled runs stay read-only until the repository variable DEPENDENCY_WATCH_ENABLED is exactly true. Dispatch watch-dependency-graph.yml with dry_run=true and inspect its native summary before separately enabling notifications. Manual runs also default to dry_run=true.
 
 The App token requests only Contents/Metadata read and Issues read for a dry run, or Issues write for an enabled run. PRs execute python3 .github/scripts/test_dependency_watch.py without App credentials; the operational job cannot run on pull_request.
+
+## OpenAPI notifications
+
+`watch-openapi.yml` polls at 06:17 UTC, Monday through Friday. This schedule is
+not a delivery deadline. It reads the current Wildcat `master` SHA, selects a
+successful `openapi.yml` run for that exact commit, and compares its unexpired
+`openapi.json` artifact with `opt/wildcat/openapi.json` at the captured dashboard
+`dev` SHA. Canonical JSON ignores key order and formatting.
+
+Only the automation App's marked issue is managed. Identical hashes do not
+refresh it. A manual closure dismisses that source hash; a later hash can notify
+again. Confirmed synchronization closes an open issue. Missing, stale, corrupt
+or unreadable evidence leaves the issue unchanged and is reported as unmeasured.
+The generator and generated frontend code are unchanged.
+
+Before merging, run the candidate with `dry_run=true` and inspect the recorded
+SHAs, run and artifact IDs, hashes and planned actions. After merging, repeat the
+dry-run on `master`. Scheduled runs remain read-only until an owner sets
+`OPENAPI_WATCH_ENABLED=true`; an absent or different value keeps writes disabled.
+Manual runs also default to `dry_run=true`. The synchronized baseline must produce
+zero issue writes. PRs run only offline tests, without App secrets.
+Read tokens cover Wildcat and the dashboard; write tokens cover dashboard issues
+only. No artifact or private-key credential is copied into an issue.
 
 ## Wallet minimum-version proposals
 
@@ -211,9 +237,9 @@ rather than the App when confirming a grant.
 | Environments | read | protection rules and environment secrets |
 
 The installation also holds `pull_requests: write`, repository `packages: write`
-and organisation Projects read for other work. These workflows do not create
-pull requests or prune package versions. The release-train and watcher jobs
-request narrower tokens for their specific read or write operations.
+and organisation Projects read. The wallet minimum workflow scopes its proposal
+writes to static-assets. No workflow here prunes package versions. Release-train
+and watcher jobs request narrower tokens for their specific operations.
 
 ### What it was missing, and what happened to the list
 
