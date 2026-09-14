@@ -7,7 +7,7 @@ on:
       - '.github/scripts/test_openapi_watch.py'
       - '.github/workflows/watch-openapi.yml'
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '17 6 * * 1-5'
   workflow_dispatch:
     inputs:
       dry_run:

@@ -150,7 +150,7 @@ The App token requests only Contents/Metadata read and Issues read for a dry run
 
 ## OpenAPI notifications
 
-`watch-openapi.yml` polls every 15 minutes. The interval is a polling schedule,
+`watch-openapi.yml` polls at 06:17 UTC, Monday through Friday. This schedule is
 not a delivery deadline. It reads the current Wildcat `master` SHA, selects a
 successful `openapi.yml` run for that exact commit, and compares its unexpired
 `openapi.json` artifact with `opt/wildcat/openapi.json` at the captured dashboard

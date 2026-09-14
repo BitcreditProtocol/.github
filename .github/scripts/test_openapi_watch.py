@@ -435,7 +435,7 @@ class OpenAPIWatchTests(unittest.TestCase):
         workflow = json.loads(result.stdout)
         self.assertEqual(workflow["permissions"], {})
         self.assertTrue(workflow["on"]["workflow_dispatch"]["inputs"]["dry_run"]["default"])
-        self.assertEqual(workflow["on"]["schedule"], [{"cron": "*/15 * * * *"}])
+        self.assertEqual(workflow["on"]["schedule"], [{"cron": "17 6 * * 1-5"}])
         test, job = workflow["jobs"]["test"], workflow["jobs"]["watch"]
         self.assertEqual(test["permissions"], {"contents": "read"})
         self.assertNotIn("secrets.", json.dumps(test))
