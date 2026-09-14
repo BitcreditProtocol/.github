@@ -286,12 +286,20 @@ def own_pr(cfg, pr, default, states):
 
 
 def readback_write(cfg, path, method, body, readback):
+    write_error = None
     try:
         api(cfg, path, method, body)
-    except ProposalError:
-        pass  # A lost response is resolved from state, never a blind repeat write.
-    if not readback():
-        raise ProposalError("Mutation was not confirmed; rerun the original request")
+    except ProposalError as error:
+        write_error = error  # A lost response still requires readback, never a blind repeat write.
+    message = f"{method} {path}: mutation was not confirmed; rerun the original request"
+    if write_error is not None:
+        message += f"; write response: {write_error}"
+    try:
+        if readback():
+            return
+    except ProposalError as error:
+        raise ProposalError(f"{message}; readback failed: {error}") from error
+    raise ProposalError(message) from write_error
 
 
 def new_commit(cfg, parent, state):

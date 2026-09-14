@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, unquote
 
 sys.dont_write_bytecode = True
@@ -455,6 +455,40 @@ class TransportAndWorkflowTests(unittest.TestCase):
                 with self.assertRaises(minimum.ProposalError):minimum.api(self.cfg,self.cfg['root'])
         with patch.object(subprocess,'run',return_value=subprocess.CompletedProcess([],0,'not-json','')):
             with self.assertRaises(minimum.ProposalError):minimum.api(self.cfg,self.cfg['root'])
+
+    def test_unconfirmed_writes_report_only_sanitized_operation_and_errors(self):
+        path = self.cfg['root'] + '/pulls'
+        private = 'PRIVATE CHANGELOG fixture-write PRIVATE KEY'
+        for rejected, unreadable in ((True, False), (True, True), (False, True)):
+            with self.subTest(rejected=rejected, unreadable=unreadable):
+                read_error = minimum.ProposalError('GitHub request failed (HTTP 503)') if unreadable else None
+                readback = Mock(return_value=False, side_effect=read_error)
+                response = subprocess.CompletedProcess([], 1 if rejected else 0, private if rejected else '{}',
+                                                       private + ' (HTTP 403)')
+                with patch.object(subprocess, 'run', return_value=response) as command:
+                    with self.assertRaises(minimum.ProposalError) as stopped:
+                        minimum.readback_write(self.cfg, path, 'POST', {'body': private}, readback)
+                message = str(stopped.exception)
+                self.assertIn('POST ' + path, message)
+                if rejected:
+                    self.assertIn('HTTP 403', message)
+                if unreadable:
+                    self.assertIn('HTTP 503', message)
+                    self.assertIs(stopped.exception.__cause__, read_error)
+                else:
+                    self.assertIn('HTTP 403', str(stopped.exception.__cause__))
+                for value in ('PRIVATE', 'fixture-write'):
+                    self.assertNotIn(value, message)
+                command.assert_called_once()
+                readback.assert_called_once_with()
+
+    def test_lost_write_response_succeeds_after_matching_readback_without_retry(self):
+        readback = Mock(return_value=True)
+        lost = subprocess.TimeoutExpired(['gh', 'api'], 60, output='PRIVATE CHANGELOG', stderr='PRIVATE KEY')
+        with patch.object(subprocess, 'run', side_effect=lost) as command:
+            minimum.readback_write(self.cfg, self.cfg['root'] + '/pulls', 'POST', {}, readback)
+        command.assert_called_once()
+        readback.assert_called_once_with()
 
     def test_workflow_limits_operational_writes_to_manual_requests(self):
         text=(ROOT.parent/'workflows/propose-wallet-minimum.yml').read_text()
