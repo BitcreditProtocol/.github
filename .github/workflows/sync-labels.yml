@@ -5,6 +5,11 @@ name: Sync labels
 # one needs no change here.
 
 on:
+  pull_request:
+    paths:
+      - '.github/scripts/sync-labels.sh'
+      - '.github/scripts/test_sync_labels.py'
+      - '.github/workflows/sync-labels.yml'
   schedule:
     - cron: '17 6 * * 1'
   workflow_dispatch:
@@ -17,7 +22,18 @@ on:
 permissions: {}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_sync_labels.py
+
   sync:
+    if: github.event_name != 'pull_request'
+    needs: test
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:

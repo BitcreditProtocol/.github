@@ -83,7 +83,11 @@ while IFS= read -r repo; do
       echo "  $repo: rename '$old' -> '$new'"
       apply -X PATCH "repos/$ORG/$repo/labels/$(enc "$old")" -f "new_name=$new"
       n_rename=$((n_rename + 1))
-      [ "$DRY_RUN" = "true" ] || gh api "repos/$ORG/$repo/labels?per_page=100" --jq '.' > "$WORK/current"
+      # Rename it in the cached list rather than re-reading. A re-read is skipped in a dry
+      # run, which left the passes below looking at the old name and made the dry run report
+      # a create the write run never performs. Renaming locally is true in both modes.
+      jq --arg o "$old" --arg n "$new" 'map(if .name == $o then .name = $n else . end)' \
+        "$WORK/current" > "$WORK/next" && mv "$WORK/next" "$WORK/current"
     fi
   done < "$WORK/renames"
 
