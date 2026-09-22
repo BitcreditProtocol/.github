@@ -21,6 +21,9 @@ ORG = os.environ.get("ORG", "BitcreditProtocol")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
 MARKER = "bitcredit-dependency-watch"
+# Applied when the issue is created only. Keeping it out of the payload preserves both
+# the unchanged-issue short circuit and any label a human added to an open issue.
+LABEL = "awaiting triage"
 STATE = "bitcredit-dependency-watch-state"
 WATCHER_BOT = os.environ.get("WATCHER_BOT", "bitcredit-automation[bot]")
 MANIFESTS = {"Cargo.toml", "package.json", "pubspec.yaml", "pubspec_overrides.yaml"}
@@ -516,7 +519,8 @@ def apply_action(action):
     if existing:
         path += f"/{existing['number']}"
     try:
-        result = api(path, "PATCH" if existing else "POST", payload)
+        body = payload if existing else {**payload, "labels": [LABEL]}
+        result = api(path, "PATCH" if existing else "POST", body)
         number = result.get("number") if isinstance(result, dict) else None
         if not isinstance(number, int):
             raise APIError(f"{repo}: invalid issue write response")

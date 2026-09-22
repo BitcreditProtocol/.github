@@ -22,6 +22,10 @@ SPEC_PATH = "opt/wildcat/openapi.json"
 WORKFLOW_PATH = ".github/workflows/openapi.yml"
 ARTIFACT_NAME = "openapi"
 MARKER = "<!-- bitcredit-openapi-watch:Wildcat/master:wildcat-dashboard-ui/dev -->"
+# Applied when the issue is created. Never part of the payload: the API returns labels
+# as objects, so comparing them against this list would fail every verification, and a
+# label on an update would replace whatever a human had added.
+LABEL = "awaiting triage"
 STATE = "bitcredit-openapi-watch-state"
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -356,8 +360,9 @@ def apply_action(action):
     path = f"repos/{ORG}/{CONSUMER}/issues"
     number = action["number"]
     try:
+        body = action["payload"] if number else {**action["payload"], "labels": [LABEL]}
         result = api(path + (f"/{number}" if number else ""),
-                     "PATCH" if number else "POST", action["payload"])
+                     "PATCH" if number else "POST", body)
         require(isinstance(result, dict) and positive_id(result.get("number"))
                 and (number is None or result["number"] == number), "invalid issue write response")
         number = result["number"]

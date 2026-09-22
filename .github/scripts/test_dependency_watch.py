@@ -658,6 +658,28 @@ dev_dependencies:
         self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
         self.assertEqual(watch.plan_actions(edges, {"Consumer": [self.issue(edges=edges)]}, [], set(), []), [])
 
+    def test_triage_label_is_applied_on_creation_only(self):
+        """A label in the payload would be compared against the objects the API returns."""
+        edges = [self.edge()]
+        payload = watch.issue_payload("library", "Producer", "v2.0.0", edges)
+        labelled = dict(self.issue(edges=edges), labels=[{"name": watch.LABEL}, {"name": "needs design"}])
+        pending = self.replies({("GET", "repos/ExampleOrg/Producer/releases/latest"): [self.release()]})
+        # Labels never match a payload of strings, so the unchanged issue would be rewritten every run.
+        self.assertEqual(watch.plan_actions(edges, {"Consumer": [labelled]}, [], set(), []), [])
+        self.consumed(pending)
+        for kind, existing, method, path in (("open", None, "POST", "repos/ExampleOrg/Consumer/issues"),
+                                             ("update", labelled, "PATCH", "repos/ExampleOrg/Consumer/issues/7")):
+            with self.subTest(kind=kind):
+                self.api.reset_mock()
+                pending = self.replies({(method, path): [{"number": 7}],
+                                        ("GET", "repos/ExampleOrg/Consumer/issues/7"): [labelled]})
+                action = dict(repo="Consumer", dep="library", kind=kind, existing=existing, payload=dict(payload))
+                self.assertEqual(watch.apply_action(action), f"{kind} verified: #7")
+                self.consumed(pending)
+                body = next(call.args[2] for call in self.api.call_args_list if call.args[1:2] == (method,))
+                # An update carrying labels would replace the ones a human added.
+                self.assertEqual(body.get("labels"), [watch.LABEL] if existing is None else None)
+
     def test_uncertain_creation_rereads_without_a_second_post(self):
         payload = watch.issue_payload("library", "Producer", "v2.0.0", [self.edge()])
         action = dict(repo="Consumer", dep="library", kind="open", existing=None, payload=payload)
