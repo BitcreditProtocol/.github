@@ -36,6 +36,7 @@ assignees:
   helm-charts: cleot
   infrastructure: cleot
   nostr-postgres-db: cleot
+  Protocol-E2E: stefanbitcr
   ui: JulianVIE
   ui-flutter: JulianVIE
   wallet: JulianVIE

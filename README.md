@@ -49,6 +49,8 @@ Most of it happens on its own. A new repository is picked up by the next schedul
 
 **Operator decisions** — project boards, environment purpose, discussions and the choice of default branch. The audit reports environment protection and reviewer findings; it does not decide which environments should exist or change their settings.
 
+**Crowdin translation PRs** — set `pull_request_assignees: [JulianVIE]` in the Crowdin VCS configuration on the localized source branch (`dev` for `E-Bill-frontend` and `wildcat-dashboard-ui`). This uses Crowdin's native assignment; no additional GitHub workflow is needed.
+
 ## Removing a repository
 
 Archiving is enough for the automation: an archived repository drops out of every sweep on its own, and its entry in `dependabot-assignees.yml` starts being reported as stale.
