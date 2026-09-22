@@ -596,6 +596,9 @@ def main():
                     stream.write(f"- {error}\n")
             if gaps or errors:
                 stream.write("\nThis run does not establish that all exact pins are current.\n")
+    # Same reason as the release train: without this a failed run shows only exit 1.
+    if errors and SUMMARY != "/dev/stdout":
+        print("dependency watch failed: " + "; ".join(sorted(set(errors))), file=sys.stderr)
     return 1 if errors else 0
 
 
