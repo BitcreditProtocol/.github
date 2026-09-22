@@ -1,7 +1,7 @@
 # Clowder development nightly operations
 
 The coordinator prepares one saved candidate, builds missing images, and asks
-`Wildcat-deployment/deploy.yml` to deploy and test it. It never deploys production.
+`Wildcat-deployment/.github/workflows/deploy.yml` to deploy and test it. It never deploys production.
 The schedule is Sunday through Thursday at 23:00 in `Europe/Vienna`, using
 GitHub's [native schedule timezone](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule).
 GitHub may delay a scheduled run.
