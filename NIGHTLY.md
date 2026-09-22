@@ -6,9 +6,25 @@ The schedule is Sunday through Thursday at 23:00 in `Europe/Vienna`, using
 GitHub's [native schedule timezone](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule).
 GitHub may delay a scheduled run.
 
-Keep `CLOWDER_NIGHTLY_ENABLED` unset or `false` until the activation checks below
-are complete. The older deployment `nightly.yml` remains disabled: it targets
-`wildcat-dev` and requests data deletion.
+Keep `CLOWDER_DEV_CANDIDATES_ENABLED` in Wildcat-deployment and
+`CLOWDER_NIGHTLY_ENABLED` in this repository unset or `false` during preparation.
+The activation sequence below enables candidate operations before the schedule.
+The older deployment `nightly.yml` remains disabled: it targets `wildcat-dev`
+and requests data deletion.
+
+## Dev and staging policy
+
+Clowder-dev is a canary for major integration failures and a playground for the
+latest system versions. A full dev backup/restore rehearsal is not a prerequisite
+for nightly activation. Full backup/restore rehearsal and application/database
+compatibility testing remain staging responsibilities; production recovery
+requirements are unchanged. This guide does not establish that either has been
+tested in staging.
+
+Dev data recovery is not guaranteed under this policy. Candidate operations keep
+every deletion flag false and never reset data. Manual rollback still requires
+confirmation that the saved application/configuration can use the current data;
+without that confirmation, stop rather than restore an incompatible version.
 
 ## Before a real candidate
 
@@ -44,9 +60,10 @@ are complete. The older deployment `nightly.yml` remains disabled: it targets
    post step still share a runner; this is not signing-key isolation. Preserve
    immediate parent checks and native token revocation. Regression jobs do not
    receive App keys. Never copy keys into plans, issues, logs or artifacts.
-5. Demonstrate backup and restore for the self-hosted clowder-dev data. A GCP
-   backup or the presence of a backup script does not prove this. Record the
-   restore result and recovery procedure in `infrastructure#246`.
+5. Verify the recipient's [candidate rollout prerequisites](https://github.com/BitcreditProtocol/Wildcat-deployment/blob/master/README.md#candidate-deployment-and-recovery).
+   Its App credentials must be available at repository or accessible organization
+   scope: admission runs before entering an environment. Keep both enablement
+   variables disabled until the separately approved activation sequence below.
 
 These are prerequisites. They are not established by offline regression tests or
 by a successful candidate preparation. This change does not provision credentials
@@ -59,8 +76,11 @@ product test jobs. Existing wallet dispatch credentials and routes stay unchange
 
 ## Read-only operator inventory
 
-Use this checklist to answer the
-[existing operator questions in #246](https://github.com/BitcreditProtocol/infrastructure/issues/246#issuecomment-5617208957).
+This checklist preserves the storage and recovery scope behind the
+[earlier operator questions in #246](https://github.com/BitcreditProtocol/infrastructure/issues/246#issuecomment-5617208957).
+It is a reference for investigation and optional dev recovery work, not a dev
+backup/restore activation gate. When using it, identify the actual environment;
+this dev inventory does not establish staging storage or recovery coverage.
 Record a separate result for each of `clowder-dev-0` through `clowder-dev-4`.
 They share `clowder-dev/docker-compose.yml` and its inherited services, with
 `.env-github` and the corresponding `clowder-dev/env-0` through `env-4`.
@@ -108,7 +128,7 @@ and [formatted inspection](https://docs.docker.com/reference/cli/docker/inspect/
 
 Match each target's observed mounts to these storage responsibilities:
 
-| Source scope | Recovery coverage to establish |
+| Source scope | Recovery scope to check when planning a backup/restore |
 | --- | --- |
 | `DATA_PATH/postgres` | The complete cluster and actual database list, including relay, Clowder and Wildcat database families; not the relay database alone. |
 | `DATA_PATH/surrealdb` | All configured namespaces/databases used by core, quote, aggregator, treasury, ebill, eic and ens. |
@@ -119,21 +139,22 @@ Match each target's observed mounts to these storage responsibilities:
 
 Include additional live mounts and the proxy/certificate configuration if found;
 absence of a child Compose mount does not prove absence of inherited state.
-For each store, record the actual host path or volume, covered databases/files,
-existing backup procedure and destination reference, latest usable recovery
-point in UTC, retention and consistency method, and a linked restore receipt.
+For a backup/restore investigation, record each store's actual host path or
+volume, covered databases/files, existing backup procedure and destination
+reference, latest usable recovery point in UTC, retention and consistency method,
+and a linked restore receipt.
 Keep backup contents and credential values in their existing protected stores.
 A GCP backup script does not establish coverage of these self-hosted targets.
 
-Use the same #246 record for the owners' recovery and compatibility decisions:
-the intended baseline SHA/digests, database/schema versions, which old application
-can read the restored/current data, explicit conditions that block rollback,
-and the separately approved operator and window. Record acceptable data loss
-and downtime as owner decisions, not defaults. A restore receipt must identify
-the source recovery point and isolated destination, prove the required stores
-were restored, and link readiness plus the agreed functional checks. An archive
-listing or healthy container alone is insufficient. This inventory runs no
-backup, restore, service restart or rehearsal and does not enable the schedule.
+Use #246 to record the accepted rollback baseline and its SHA/digests, compatibility
+with current data, explicit conditions that block rollback, and the separately
+approved operator and window. If dev backup/restore work is undertaken, record
+its recovery scope and acceptable data loss/downtime as owner decisions. A restore
+receipt must identify the source recovery point and isolated destination, prove
+the required stores were restored, and link readiness plus the agreed functional
+checks. An archive listing or healthy container alone is insufficient. This
+inventory runs no backup, restore, service restart or rehearsal and does not
+enable the schedule.
 
 ## Prepare and execute
 
@@ -179,11 +200,18 @@ including tests. Individual target jobs use separate locks. Ordinary manual
 clowder-dev deployment and rollback use the same parent group and do not cancel
 the current operation. GitHub keeps its standard one-pending-run limit.
 
-Before any new clowder-dev operation, admission checks the candidate frontend,
+Once `CLOWDER_DEV_CANDIDATES_ENABLED=true`, every new clowder-dev operation,
+including ordinary manual deployments, checks the candidate frontend,
 mint, notifier and wallet workflows. Active runs or unreadable evidence block
 environment mutation. Thus a parent timeout does not authorize deployment over
 tests that are still running. Parent checks also prevent a delayed handoff from
 starting work after its parent has ended or advanced to another attempt.
+
+While candidate operations are disabled, ordinary deployments with an empty
+`candidate_payload` remain available without this cross-repository admission;
+candidate deploy and rollback payloads are rejected. Do not disable the flag to
+bypass a blocked operation. Before intentionally disabling it, stop new candidate
+submissions and confirm that all parent and child runs have finished.
 
 An operation is accepted only after all five target manifests and matching
 functional results succeed. A failed API read, partial matrix, missing manifest,
@@ -262,7 +290,24 @@ run and artifact links in the issue; do not store database backups or secrets in
 these artifacts. Existing mint token transfer stays within the test handoff and
 is not copied into central plans or acceptance records.
 
-Enable `CLOWDER_NIGHTLY_ENABLED=true` only after prerequisite merges, a verified
-self-hosted backup/restore, a complete manual deployment with functional tests,
-and a demonstrated manual rollback. Keep the issue open while any of those
-operational conditions remains unproven.
+Activation is a separate operational step. Record its evidence in
+`infrastructure#246` in this order:
+
+1. Complete the prerequisite merges, checks and verified App access above.
+2. Enable `CLOWDER_DEV_CANDIDATES_ENABLED=true` in Wildcat-deployment for the
+   approved manual rehearsal. Keep `CLOWDER_NIGHTLY_ENABLED` disabled. Enabling
+   only the schedule would leave candidate deployment blocked by the recipient.
+3. Complete a manual deployment with all five target manifests and the existing
+   13 dev Playwright groups, mint0/mint1 and wallet Intermint, then demonstrate
+   manual rollback to a compatible earlier accepted candidate A. Retain A's
+   accepted run ID, configuration SHA and complete digest locks. If no accepted
+   baseline exists, first establish A with a successful full manual run; then
+   deploy candidate B and verify the compatible B-to-A rollback. Reapplying A
+   does not demonstrate return from a different candidate. Missing compatibility
+   confirmation blocks rollback; do not reset data to make the rehearsal pass.
+4. Only after those results are verified, enable `CLOWDER_NIGHTLY_ENABLED=true`
+   in this repository for Sunday–Thursday, 23:00 Europe/Vienna.
+
+Keep the issue open while any of these activation conditions remains unproven.
+Documentation, dry runs and CI checks do not enable either variable or establish
+a real deployment, rollback or staging backup/restore result.
