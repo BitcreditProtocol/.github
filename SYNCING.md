@@ -45,11 +45,11 @@ automatically install it elsewhere. Each repository needs the small caller.
 Pinning a full commit SHA keeps updates reviewable: change a caller's pin to
 adopt a newer version. See [GitHub's reusable workflow documentation](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
 
-When upgrading a caller that passes `AUTOMATION_APP_ID`, change both the shared
-workflow SHA and the secret mapping to `AUTOMATION_APP_CLIENT_ID` in the same
-commit. Set the organization variable to the App's Client ID from its settings.
-The existing `AUTOMATION_APP_PRIVATE_KEY` continues to work. Keep the older
-`AUTOMATION_APP_ID` variable while other workflows still use it.
+A caller passes the App's Client ID through the shared workflow's secret
+interface, reading it from the organization variable `AUTOMATION_APP_CLIENT_ID`.
+The existing `AUTOMATION_APP_PRIVATE_KEY` continues to work. No workflow reads
+the older numeric `AUTOMATION_APP_ID` any more; it is kept only for a caller
+that has not been upgraded.
 
 ## Setup and first run
 

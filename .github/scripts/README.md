@@ -210,7 +210,7 @@ Cross-repository operations require an organisation-scoped App token.
 `GITHUB_TOKEN` remains scoped to this repository and is used for its own Actions
 artifacts, including saved release-train candidates.
 
-- organisation **variable** `AUTOMATION_APP_ID` — the App's numeric ID
+- organisation **variable** `AUTOMATION_APP_CLIENT_ID` — the App's Client ID
 - organisation **secret** `AUTOMATION_APP_PRIVATE_KEY` — the App's private key
 
 The App is `bitcredit-automation`, installed on **all** repositories. Adding a
