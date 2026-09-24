@@ -43,6 +43,7 @@ SNAPSHOT_REPO, SNAPSHOT_PATH = "wildcat-dashboard-ui", "opt/wildcat/openapi.json
 API_REPO, API_PATH = "Wildcat", "crates/bcr-wdc-admin-aggregator"
 
 WIRE_CRATE = "bcr-common"
+LABEL = "awaiting triage"
 MARKER = "bitcredit-openapi-snapshot"
 ARTIFACT = "release-train-plan"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -234,7 +235,8 @@ def notify_stale_snapshot(snap, code, tag, existing):
     if existing:
         path += f"/{existing['number']}"
         method = "PATCH"
-    result = api(path, method, payload)
+    # Label a new issue only; an update would replace labels a human had added.
+    result = api(path, method, payload if existing else {**payload, "labels": [LABEL]})
     if not isinstance(result, dict) or not isinstance(result.get("number"), int):
         raise APIError("invalid snapshot issue response")
     return f"snapshot issue #{result['number']}"

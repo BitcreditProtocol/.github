@@ -434,6 +434,20 @@ class ReleaseTrainTests(unittest.TestCase):
         notify.assert_not_called()
         builds.assert_not_called()
 
+    def test_snapshot_issue_is_labelled_on_creation_only(self):
+        """An update carrying labels would replace the ones a human added."""
+        path = f"repos/ExampleOrg/{train.SNAPSHOT_REPO}/issues"
+        for existing, method, target in ((None, "POST", path), ({"number": 7}, "PATCH", f"{path}/7")):
+            with self.subTest(method=method):
+                self.api.reset_mock()
+                pending = self.replies({(method, target): [{"number": 7}]})
+                self.assertEqual(train.notify_stale_snapshot("2026-09-07", "2026-09-08",
+                                                             self.plan["tag"], existing),
+                                 "snapshot issue #7")
+                self.consumed(pending)
+                body = self.api.call_args.args[2]
+                self.assertEqual(body.get("labels"), [train.LABEL] if existing is None else None)
+
     def test_workflow_keeps_pr_jobs_and_dry_runs_out_of_write_steps(self):
         test_job, separator, train_job = WORKFLOW.partition("\n  train:\n")
         self.assertTrue(separator)

@@ -103,7 +103,12 @@ class Fixture:
             else:
                 number = int(route.rsplit("/", 1)[-1])
                 current = next(item for item in self.issues if item["number"] == number)
-            current.update(copy.deepcopy(body))
+            written = copy.deepcopy(body)
+            # The API stores label names and returns them as objects. A fixture that
+            # echoed the payload back would hide a payload label from every verification.
+            if "labels" in written:
+                written["labels"] = [{"name": name} for name in written["labels"]]
+            current.update(written)
             if current["state"] == "closed":
                 current["closed_by"] = dict(BOT)
             if self.lost_response:
@@ -211,6 +216,22 @@ class OpenAPIWatchTests(unittest.TestCase):
         first_write = next(index for index, call in enumerate(fixture.calls) if call[0] != "GET")
         self.assertEqual(sum(call[1].startswith("repos/ExampleOrg/wildcat-dashboard-ui/issues?") for call in fixture.calls[:first_write]), 2)
         self.assertEqual(fixture.calls[-1][0], "GET")
+
+    def test_triage_label_is_applied_on_creation_only(self):
+        """A label in the payload would be verified against the objects the API returns."""
+        fixture = Fixture(changed=True)
+        code, result = self.execute(fixture)
+        self.assertEqual((code, result["verified_writes"]), (0, 1))
+        self.assertEqual(fixture.writes()[0][2]["labels"], [watch.LABEL])
+        self.assertEqual(fixture.issues[0]["labels"], [{"name": watch.LABEL}])
+        fixture = Fixture(changed=True)
+        kept = [{"name": watch.LABEL}, {"name": "needs design"}]
+        fixture.issues = [dict(fixture.issue(target="0" * 64), labels=copy.deepcopy(kept))]
+        code, result = self.execute(fixture)
+        self.assertEqual((code, result["proposed_actions"][0]["kind"]), (0, "update"))
+        # An update carrying labels would replace the ones a human added.
+        self.assertNotIn("labels", fixture.writes()[0][2])
+        self.assertEqual(fixture.issues[0]["labels"], kept)
 
     def test_same_digest_does_not_refresh_an_open_issue(self):
         fixture = Fixture(changed=True)
