@@ -595,7 +595,12 @@ def main(argv=None):
                 for gap in sorted(set(gaps)):
                     stream.write(f"- {gap}\n")
     # Diagnostic gaps are visible but do not add wire/OpenAPI admission gates.
-    return 1 if failed or (args.apply and gaps) else 0
+    stopped = failed or (args.apply and gaps)
+    # The summary is not in the run log and not in the REST API, so a non-zero exit
+    # would otherwise carry no reason. Skip when the summary already is stdout.
+    if stopped and SUMMARY != "/dev/stdout":
+        print("release train stopped: " + "; ".join(sorted(set(gaps))), file=sys.stderr)
+    return 1 if stopped else 0
 
 
 if __name__ == "__main__":
