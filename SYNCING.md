@@ -47,9 +47,7 @@ adopt a newer version. See [GitHub's reusable workflow documentation](https://do
 
 A caller passes the App's Client ID through the shared workflow's secret
 interface, reading it from the organization variable `AUTOMATION_APP_CLIENT_ID`.
-The existing `AUTOMATION_APP_PRIVATE_KEY` continues to work. No workflow reads
-the older numeric `AUTOMATION_APP_ID` any more; it is kept only for a caller
-that has not been upgraded.
+The existing `AUTOMATION_APP_PRIVATE_KEY` continues to work.
 
 ## Setup and first run
 
