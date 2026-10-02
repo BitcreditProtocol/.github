@@ -28,6 +28,7 @@ with patch.dict(os.environ, ENV, clear=True):
     watch = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(watch)
 REAL_RUN = subprocess.run
+REAL_OWNER = watch.owner
 S, C = "a" * 40, "b" * 40
 BOT = {"type": "Bot", "login": ENV["WATCHER_BOT"]}
 HUMAN = {"type": "User", "login": "maintainer"}
@@ -108,6 +109,8 @@ class Fixture:
             # echoed the payload back would hide a payload label from every verification.
             if "labels" in written:
                 written["labels"] = [{"name": name} for name in written["labels"]]
+            if "assignees" in written:
+                written["assignees"] = [{"login": name} for name in written["assignees"]]
             current.update(written)
             if current["state"] == "closed":
                 current["closed_by"] = dict(BOT)
@@ -177,6 +180,7 @@ class OpenAPIWatchTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, ENV, clear=True))
         self.enterContext(patch.object(watch, "DRY_RUN", False))
         self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("unexpected real command")))
+        self.enterContext(patch.object(watch, "owner", return_value=None))
 
     def execute(self, fixture, *, dry=False):
         output = io.StringIO()
@@ -232,6 +236,21 @@ class OpenAPIWatchTests(unittest.TestCase):
         # An update carrying labels would replace the ones a human added.
         self.assertNotIn("labels", fixture.writes()[0][2])
         self.assertEqual(fixture.issues[0]["labels"], kept)
+
+    def test_owner_is_assigned_on_creation_only(self):
+        """The owner comes from dependabot-assignees.yml; an update would undo a hand reassignment."""
+        with patch.object(subprocess, "run", side_effect=REAL_RUN):
+            self.assertIsInstance(REAL_OWNER(), str)
+        with patch.object(watch, "owner", return_value="maintainer"):
+            fixture = Fixture(changed=True)
+            code, result = self.execute(fixture)
+            self.assertEqual((code, result["verified_writes"]), (0, 1))
+            self.assertEqual(fixture.writes()[0][2]["assignees"], ["maintainer"])
+            fixture = Fixture(changed=True)
+            fixture.issues = [fixture.issue(target="0" * 64)]
+            code, result = self.execute(fixture)
+            self.assertEqual((code, result["proposed_actions"][0]["kind"]), (0, "update"))
+            self.assertNotIn("assignees", fixture.writes()[0][2])
 
     def test_same_digest_does_not_refresh_an_open_issue(self):
         fixture = Fixture(changed=True)

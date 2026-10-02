@@ -26,6 +26,9 @@ MARKER = "<!-- bitcredit-openapi-watch:Wildcat/master:wildcat-dashboard-ui/dev -
 # as objects, so comparing them against this list would fail every verification, and a
 # label on an update would replace whatever a human had added.
 LABEL = "awaiting triage"
+# Read when the issue is opened, so it lands with the dashboard's owner. Never sent on
+# updates, which would undo a reassignment made by hand.
+ASSIGNEES = Path(__file__).resolve().parents[2] / "dependabot-assignees.yml"
 STATE = "bitcredit-openapi-watch-state"
 SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -356,11 +359,27 @@ def plan_action(source, consumer, issues):
                 payload=payload), "drift"
 
 
+def owner():
+    """The login dependabot-assignees.yml names for CONSUMER, or None. Assigning is a
+    courtesy: a missing or unreadable map never stops a run."""
+    try:
+        result = subprocess.run(["yq", "-o=json", ".", "-"], input=ASSIGNEES.read_text(),
+                                capture_output=True, text=True, timeout=30, check=True)
+        login = json.loads(result.stdout)["assignees"].get(CONSUMER)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+        return None
+    return login if isinstance(login, str) else None
+
+
 def apply_action(action):
     path = f"repos/{ORG}/{CONSUMER}/issues"
     number = action["number"]
     try:
-        body = action["payload"] if number else {**action["payload"], "labels": [LABEL]}
+        body = action["payload"]
+        if not number:
+            body = {**body, "labels": [LABEL]}
+            if login := owner():
+                body["assignees"] = [login]
         result = api(path + (f"/{number}" if number else ""),
                      "PATCH" if number else "POST", body)
         require(isinstance(result, dict) and positive_id(result.get("number"))

@@ -680,6 +680,26 @@ dev_dependencies:
                 # An update carrying labels would replace the ones a human added.
                 self.assertEqual(body.get("labels"), [watch.LABEL] if existing is None else None)
 
+    def test_owner_is_assigned_on_creation_only(self):
+        """The owner comes from dependabot-assignees.yml; an update would undo a hand reassignment."""
+        self.assertIsInstance(watch.owner("E-Bill-frontend"), str)
+        self.assertIsNone(watch.owner("not-a-repository"))
+        edges = [self.edge()]
+        payload = watch.issue_payload("library", "Producer", "v2.0.0", edges)
+        issue = self.issue(edges=edges)
+        with patch.object(watch, "owner", return_value="maintainer"):
+            for kind, existing, method, path in (("open", None, "POST", "repos/ExampleOrg/Consumer/issues"),
+                                                 ("update", issue, "PATCH", "repos/ExampleOrg/Consumer/issues/7")):
+                with self.subTest(kind=kind):
+                    self.api.reset_mock()
+                    pending = self.replies({(method, path): [{"number": 7}],
+                                            ("GET", "repos/ExampleOrg/Consumer/issues/7"): [issue]})
+                    action = dict(repo="Consumer", dep="library", kind=kind, existing=existing, payload=dict(payload))
+                    self.assertEqual(watch.apply_action(action), f"{kind} verified: #7")
+                    self.consumed(pending)
+                    body = next(call.args[2] for call in self.api.call_args_list if call.args[1:2] == (method,))
+                    self.assertEqual(body.get("assignees"), ["maintainer"] if existing is None else None)
+
     def test_uncertain_creation_rereads_without_a_second_post(self):
         payload = watch.issue_payload("library", "Producer", "v2.0.0", [self.edge()])
         action = dict(repo="Consumer", dep="library", kind="open", existing=None, payload=payload)
