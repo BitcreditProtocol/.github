@@ -14,8 +14,8 @@ publish a release train, a package, or a production deployment.
 `wildcat-dashboard-ui`.
 
 **A package release** is a single repository publishing an artifact on its own
-schedule — the WASM SDK from `Bitcredit-Core`, the component library from `ui`,
-mobile builds from `wallet`, precompiled binaries from `Wallet-Core`.
+schedule — the component library from `ui`, mobile builds from `wallet`,
+precompiled binaries from `Wallet-Core` and `Bitcredit-Core`.
 
 ## Two version numbers, and they are not the same number
 
@@ -65,24 +65,25 @@ whole tag fails to parse. `type=semver` would produce nothing.
 
 ### Prepare, cut and resume
 
-**Prepare each new candidate with the native `release-train.yml` workflow from
-`master` and `dry_run=true`.** Inspect its summary and saved candidate before
-enabling writes. The automation GitHub App must be configured.
-
-Preparation does not write tags, releases or issues:
+**Cut a train with one dispatch of the native `release-train.yml` workflow from
+`master`, with the product version and `dry_run=false`.** That run prepares the
+candidate, gates all five commits and only then writes tags and releases. The
+automation GitHub App must be configured.
 
 ```bash
 gh workflow run release-train.yml --repo BitcreditProtocol/.github --ref master \
-  -f product=0.5.0 -f dry_run=true
+  -f product=0.5.0 -f dry_run=false
 ```
 
-The run records the tag, UTC initiator timestamp, exactly five immutable commit
-SHAs, previous dated train and original Actions run ID in
+A new dispatch, dry or not, records the tag, UTC initiator timestamp, exactly
+five immutable commit SHAs, previous dated train and original Actions run ID in
 `release-train-plan.json`. It stores this as the immutable `release-train-plan`
 Actions artifact, with overwrite disabled and 90-day retention, before any
 release writes.
 
-To cut that verified candidate, set `RESUME_RUN_ID` to the original dry-run ID:
+To inspect a candidate first, dispatch with `dry_run=true`, the default. It
+writes no tags, releases or issues. To cut exactly that candidate later, set
+`RESUME_RUN_ID` to its run ID:
 
 ```bash
 : "${RESUME_RUN_ID:?Set the original candidate Actions run ID}"
@@ -236,10 +237,10 @@ then fix forward. Keep the original train tags as the release record.
 | Line | Workflow | Version/source identity | Saved output | First publication write |
 |---|---|---|---|---|
 | Wildcat train | `.github/release-train.yml` | Product input, UTC tag, five saved SHAs | `release-train-plan` Actions artifact, 90 days | First missing annotated tag |
-| WASM | `Bitcredit-Core/wasm_release.yml` | Workspace Cargo version, matching generated npm manifest, saved SHA | `release-package`: tarball, release assets and checksums, 90 days | First missing tag |
+| WASM (retired) | `Bitcredit-Core/wasm_release.yml`, removed from `master` by [Bitcredit-Core#961](https://github.com/BitcreditProtocol/Bitcredit-Core/pull/961) on 2026-09-28; 0.5.16 is the last version apart from hotfixes, which dispatch it from a ref that still has it | Workspace Cargo version, matching generated npm manifest, saved SHA | `release-package`: tarball, release assets and checksums, 90 days | First missing tag |
 | UI library | `ui/npm_release.yml` | SemVer tag applied to the two staged package manifests, saved SHA | `release-package`: separate npmjs/GitHub tarballs and checksums, 90 days | First missing registry version |
 | Mobile candidate | `wallet/build-candidate.yml` | Tag marketing version, resolved build number and original run/SHA | Original APK/IPA Actions artifacts; `candidate-manifest.json` in GitHub release | Store candidate upload, before the later GitHub asset job |
-| Precompiled binaries | `Wallet-Core/cd_precompiled.yml` | Cargokit content-derived key and the tag's original build SHA | `precompiled_<hash>` release with binary/signature pairs | Release creation or metadata update, before target reconciliation |
+| Precompiled binaries | `Wallet-Core/cd_precompiled.yml`, `Bitcredit-Core/cd_precompiled.yml` | Cargokit content-derived key and the tag's original build SHA | `precompiled_<hash>` release with binary/signature pairs | Release creation or metadata update, before target reconciliation |
 
 Workflow filenames above live under each repository's `.github/workflows/`.
 For every package candidate, inspect that repository's CI at the source SHA and
