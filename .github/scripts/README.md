@@ -330,7 +330,7 @@ nothing next to an update that does not run.
 | --- | --- | --- | --- |
 | `release-train.yml` | `release-train.py` | annotated tags and releases in the five members; dashboard snapshot issue | exact candidate, master checks, shared-crate revisions, migrations and image-build starts |
 
-See [the release contract](https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md). Prepare each candidate with a native dry-run dispatch from `master` and inspect its saved composition before cutting a real train.
+See [the release contract](https://github.com/BitcreditProtocol/.github/blob/master/RELEASING.md). One dispatch from `master` with `dry_run=false` prepares, gates and cuts a train. A dry run first is optional, to inspect the saved composition before cutting.
 
 A new dispatch takes `product`; recovery takes the original `resume_run_id` and leaves `product` blank. `dry_run` defaults to true. Preparation records all five full SHAs and the UTC tag in the immutable `release-train-plan` Actions artifact before any tags are written. Its retention is 90 days; an expired or missing plan stops recovery instead of recapturing current heads. Rerunning an attempt restores that run's original candidate. A new dispatch can resume the original dry-run to cut exactly what was inspected.
 
