@@ -39,6 +39,7 @@ assignees:
   Protocol-E2E: stefanbitcr
   review-server: cleot
   security-reports: cleot
+  static-assets: cleot
   ui: JulianVIE
   ui-flutter: JulianVIE
   wallet: JulianVIE
@@ -62,3 +63,5 @@ assignees:
 upstream_config:
   - repository: crowdin-sdk
     upstream: crowdin/flutter-sdk
+  - repository: nostr
+    upstream: nostrdevkit/nostr
