@@ -4,8 +4,10 @@ This contract covers the product release workflows below. Update it when their
 behaviour changes. Governance retains its separate process.
 
 The clowder-dev nightly deployment and its manual rollback are described in
-[NIGHTLY.md](NIGHTLY.md). They use saved candidates and digest locks; they do not
-publish a release train, a package, or a production deployment.
+[NIGHTLY.md](NIGHTLY.md). The active temporary process uses `nightly` image tags.
+The separate candidate coordinator uses saved SHAs, digest locks and functional
+test results; its schedule remains disabled. Neither process publishes a train
+or package, and neither deploys production.
 
 ## The two kinds
 
@@ -101,6 +103,18 @@ Do not recreate the candidate from current heads to complete the old train.
 A fresh dispatch refuses a tag already present in any member. A conflicting or
 lightweight tag stops recovery; it is not deleted or moved.
 
+On 2026-10-06, [dry-run recovery](https://github.com/BitcreditProtocol/.github/actions/runs/37443892186)
+succeeded with `resume_run_id=37006374375`. Its restore step used the original
+[`release-train-plan` artifact 11224889742](https://github.com/BitcreditProtocol/.github/actions/runs/37006374375/artifacts/11224889742),
+saved on 2026-10-02. The run created no new artifact. Artifact upload, write-token
+creation and release reconciliation were skipped. The original artifact remained
+unchanged and unexpired. Candidate tags and releases remained absent in all five
+repositories.
+
+The evidence includes the validated original JSON and the successful restore
+step. The runtime JSON was not read back directly. This rehearsal proves the
+read-only recovery path; it does not prove publication or recovery after a write.
+
 ### Build, then deploy
 
 Pushing the tags starts four image builders: `Wildcat/build.yml`,
@@ -125,12 +139,20 @@ gh workflow run deploy.yml --repo BitcreditProtocol/Wildcat-deployment \
 a new run does not cancel the active deployment. The standard GitHub concurrency
 limit keeps only one pending run per target.
 
-Application and reverse-proxy startup use bounded Compose readiness waits and
-independent state checks. Existing healthchecks must pass; a service without a
-healthcheck is confirmed only as running. Success also requires a complete saved
-image manifest. Inspect actual image IDs, available registry digests and capture
-errors in the deployment summary/artifact. Missing digests remain unmeasured.
-These checks do not establish application acceptance or rollback compatibility.
+For non-mainnet targets, application and reverse-proxy startup use bounded
+Compose readiness waits and independent state checks. Existing healthchecks must
+pass. A service without a healthcheck is confirmed only as running. Success also
+requires a complete saved image manifest.
+
+Current GCP mainnet targets use `DEPLOY_VERIFICATION_MODE=advisory`. Their startup
+commands omit `--wait`. Preflight, readiness reporting, manifest capture and
+artifact upload can continue after errors. A green Actions run therefore does
+not prove service readiness or a complete saved manifest. Mandatory mainnet
+readiness and manifest checks remain a separate planned change.
+
+Inspect actual image IDs, available registry digests and capture errors in the
+deployment summary/artifact. Missing digests remain unmeasured. These checks do
+not establish application acceptance or rollback compatibility.
 
 ### Manual fallback
 
@@ -237,7 +259,7 @@ then fix forward. Keep the original train tags as the release record.
 | Line | Workflow | Version/source identity | Saved output | First publication write |
 |---|---|---|---|---|
 | Wildcat train | `.github/release-train.yml` | Product input, UTC tag, five saved SHAs | `release-train-plan` Actions artifact, 90 days | First missing annotated tag |
-| WASM (retired) | `Bitcredit-Core/wasm_release.yml`, removed from `master` by [Bitcredit-Core#961](https://github.com/BitcreditProtocol/Bitcredit-Core/pull/961) on 2026-09-28; 0.5.16 is the last version apart from hotfixes, which dispatch it from a ref that still has it | Workspace Cargo version, matching generated npm manifest, saved SHA | `release-package`: tarball, release assets and checksums, 90 days | First missing tag |
+| Historical WASM hotfix | `Bitcredit-Core/wasm_release.yml` on an eligible historical 0.5 ref only; removed from `master` by [#961](https://github.com/BitcreditProtocol/Bitcredit-Core/pull/961) | Workspace Cargo version and matching generated npm manifest on the selected ref | Inspect the selected historical workflow; current `master` has no WASM publication artifact | Inspect the selected historical workflow before execution |
 | UI library | `ui/npm_release.yml` | SemVer tag applied to the two staged package manifests, saved SHA | `release-package`: separate npmjs/GitHub tarballs and checksums, 90 days | First missing registry version |
 | Mobile candidate | `wallet/build-candidate.yml` | Tag marketing version, resolved build number and original run/SHA | Original APK/IPA Actions artifacts; `candidate-manifest.json` in GitHub release | Store candidate upload, before the later GitHub asset job |
 | Precompiled binaries | `Wallet-Core/cd_precompiled.yml`, `Bitcredit-Core/cd_precompiled.yml` | Cargokit content-derived key and the tag's original build SHA | `precompiled_<hash>` release with binary/signature pairs | Release creation or metadata update, before target reconciliation |
@@ -248,20 +270,29 @@ its workflow-specific evidence before approving publication. The train gate does
 not validate independent packages. Environment settings are the source of truth
 for required reviewers; repository instructions describe their release inputs.
 
+Core now publishes Flutter Native FFI binaries. Its current matrix covers iOS,
+Android, macOS, Windows and Linux. The removed WASM workflow is not a current
+release path. [Bitcredit-Core#999](https://github.com/BitcreditProtocol/Bitcredit-Core/pull/999)
+closed without merge after the FFI transition; its proposed recovery changes
+must not be assumed available on a historical hotfix ref.
+
+[ui#96](https://github.com/BitcreditProtocol/ui/pull/96) is merged. Its local and CI
+checks do not prove real registry authentication or recovery after partial
+publication. Record that evidence with the first separately approved UI release.
+
 ### Package channels and prepared bytes
 
-WASM and UI prepare their exact publication bytes before the first write and
-retain immutable artifacts with original run identity and checksums. A repeat
+UI prepares its exact publication bytes before the first write and retains an
+immutable artifact with the original run identity and checksums. A repeat
 verifies existing remote content; matching results are preserved, missing results
 are added, and conflicts or unreadable state stop the operation. Never substitute
 fresh build output to complete a version that has already been published.
 
-Stable packages use npm `latest`. WASM prereleases use `next`. UI prereleases with
+Stable UI packages use npm `latest`. UI prereleases with
 first identifier `alpha`, `beta`, `rc` or `test` use that named channel; other UI
 prereleases use `next`. SemVer build metadata stays in source tags and package
 manifests, but does not create a distinct npm registry version identity.
 
-WASM keeps its GitHub release draft until assets and npm integrity are confirmed.
 UI's GitHub release is still created and documented separately. Package versions
 use repository-owned SemVer tags without the train date suffix. Cargokit's
 `precompiled_<hash>` tags are a separate existing content-derived convention.
@@ -272,7 +303,7 @@ For a train, dispatch `release-train.yml` with the original `resume_run_id` whil
 its 90-day candidate artifact remains available. This is a new dispatch restoring
 saved state, so it does not rely on the native rerun window.
 
-For WASM and UI, rerun only the failed publication job on the original run to
+For UI, rerun only the failed publication job on the original run to
 restore saved archives. Do not use **Re-run all jobs**: a full rerun removes
 previous artifacts despite their retention period. Preserve successful package
 preparation. For wallet, if both mobile jobs succeeded, rerun
@@ -286,9 +317,14 @@ an operator recovery decision; a fresh run must not silently adopt a previous
 publication. Native regression and packaging checks do not exercise production
 registry authentication, store delivery or a hosted deployment.
 
-For Wallet-Core, complete platform targets are preserved during retries;
-incomplete targets are rebuilt by existing Cargokit behaviour. Verify the expected
-three iOS and four Android binary/signature pairs. A retry may update release
+For a historical WASM hotfix, read the workflow and release state at that ref.
+Use only the recovery procedure that the selected workflow implements. Do not
+apply UI's artifact procedure to a historical workflow without verification.
+
+For precompiled binaries, complete platform targets are preserved during retries;
+incomplete targets are rebuilt by existing Cargokit behaviour. Verify every
+binary/signature pair in the selected workflow's matrix. Use that matrix as the
+required target list, including desktop targets where specified. A retry may update release
 metadata even when all target assets are complete. Consumers verify signatures;
 handled HTTP failures and rejected signatures fall back to a local build, while
 transport errors may stop the build. The vendored

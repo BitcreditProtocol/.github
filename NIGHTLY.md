@@ -1,16 +1,29 @@
 # Clowder development nightly operations
 
-The coordinator prepares one saved candidate, builds missing images, and asks
-`Wildcat-deployment/.github/workflows/deploy.yml` to deploy and test it. It never deploys production.
-The schedule is Sunday through Thursday at 23:00 in `Europe/Vienna`, using
-GitHub's [native schedule timezone](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule).
-GitHub may delay a scheduled run.
+Two workflows can deploy clowder-dev. They have different completion criteria.
+
+| Repository / workflow | Current state | Source and schedule | Completion evidence |
+| --- | --- | --- | --- |
+| `Wildcat-deployment/nightly.yml` | Active temporary process, added by [#173](https://github.com/BitcreditProtocol/Wildcat-deployment/pull/173) | Scheduled runs use `master` and the `nightly` image tag; Monday through Thursday, 04:00 `Europe/Vienna` | Readiness and manifests for all five targets; no central candidate acceptance |
+| `.github/clowder-dev-nightly.yml` | Candidate coordinator; schedule disabled | Saved `master` SHAs and image digests; Sunday through Thursday, 23:00 `Europe/Vienna` | All five target manifests and the matching functional test chain |
+
+The table gives the repository and workflow filename. Each workflow is in that
+repository's `.github/workflows/` directory.
+Both schedules use GitHub's [native schedule timezone](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule).
+GitHub can delay a scheduled run. Neither workflow deploys production.
+
+The temporary process deploys `clowder-dev-0` through `clowder-dev-4` without
+deleting data. It holds the shared `operation-clowder-dev` lock and does not cancel
+an active operation. It skips when `CLOWDER_DEV_CANDIDATES_ENABLED=true` in
+Wildcat-deployment. A successful temporary run does not prove candidate
+acceptance, the full test chain, or rollback.
+
+The coordinator saves one candidate, builds missing images, and calls
+`Wildcat-deployment/.github/workflows/deploy.yml` to deploy and test it.
 
 Keep `CLOWDER_DEV_CANDIDATES_ENABLED` in Wildcat-deployment and
 `CLOWDER_NIGHTLY_ENABLED` in this repository unset or `false` during preparation.
 The activation sequence below enables candidate operations before the schedule.
-The older deployment `nightly.yml` remains disabled: it targets `wildcat-dev`
-and requests data deletion.
 
 ## Dev and staging policy
 
@@ -28,11 +41,14 @@ without that confirmation, stop rather than restore an incompatible version.
 
 ## Before a real candidate
 
-1. Verify the merged PostgreSQL restoration in `Wildcat-deployment#154`, then
-   merge and verify readiness changes in `#156` and their dependent nightly integration.
-2. Merge the four producer interfaces, frontend correlation, wallet receipt,
-   and central coordinator changes linked from `infrastructure#246`. Run their
-   ordinary checks on the merged commits.
+1. Check the current merged revisions and their CI results. PostgreSQL
+   restoration, deployment readiness and the central coordinator are merged.
+   Use `infrastructure#246` for the remaining integration and test results;
+   do not treat an earlier PR result as proof for a different commit.
+2. Integrate wallet's candidate changes from `dev` into `master` through its
+   normal branch process. Check the four producer interfaces, frontend
+   correlation and wallet receipt on the selected revisions. Resolve current
+   functional test failures before the full manual candidate rehearsal.
 3. Verify the existing `wildcat-deployment-app` installation covers Wildcat,
    Clowder, Wildcat-Auxiliary, wildcat-dashboard-ui, Wildcat-deployment,
    E-Bill-frontend and wallet. Preserve other existing grants. Do not add Governance.
@@ -42,19 +58,27 @@ without that confirmation, stop rather than restore an incompatible version.
    current stage's targets. Frontend and wallet parent checks use the existing
    `private-repo-access-for-ci` App instead, requesting only Actions read for
    `Wildcat-deployment`. The frontend candidate uses
-   `PRIVATE_REPO_ACCESS_APP_ID`; wallet's `dev` candidate in `wallet#1115` uses
+   `PRIVATE_REPO_ACCESS_APP_ID`; wallet's `dev` candidate uses
    `PRIVATE_REPO_ACCESS_CLIENT_ID`. Both use the existing
    `PRIVATE_REPO_ACCESS_APP_PRIVATE_KEY`; preserve these identifier names.
-   Merge the explicit Contents-read limits for all 19 Git-token creation sites
-   before adding Actions read to this CI App. For wallet, the default-branch
-   dispatch handler must receive the `dev` changes through normal branch
-   integration. A merge into `dev` alone does not activate that handler.
-   Preserve the approved nine selected
-   repositories; they already include the parent deployment and exclude Governance.
-   Add only E-Bill-frontend to the existing organisation ID/key recipients,
-   preserving all seven current recipients and the existing key value. Read back
-   the permissions and grants, then verify parent-run access with GET requests
-   from frontend and wallet without dispatching tests or deployment.
+   The deployment App ID/key remain an operator prerequisite for `.github`
+   and `Wildcat-deployment`. Environment-only credentials cannot satisfy admission.
+   For wallet, the default-branch dispatch handler must receive the `dev`
+   changes through normal branch integration. A merge into `dev` alone does
+   not activate that handler.
+   Actions read is now enabled for the CI App, and frontend has access to its
+   existing organisation ID/key. Public Git reads in Core and Wildcat no longer
+   require this App. Preserve the current installation and recipient lists.
+   GET-only access was verified on 2026-10-06 in
+   [frontend](https://github.com/BitcreditProtocol/E-Bill-frontend/actions/runs/37443275262)
+   and [wallet](https://github.com/BitcreditProtocol/wallet/actions/runs/37443175475).
+   Both checks read the existing completed deployment
+   [37403345396](https://github.com/BitcreditProtocol/Wildcat-deployment/actions/runs/37403345396).
+   They verified its repository, run ID, completion and successful conclusion.
+   Each token requested only Actions read for Wildcat-deployment. The native
+   post step revoked both tokens. These runs did not build, dispatch child
+   workflows, deploy or upload to a store. Repeat this check after a relevant
+   App or workflow change. It does not prove wallet branch integration.
    The CI App remains read-only, but a holder of its key can request Actions read
    across its installed repositories. Product jobs and the App-token Action's
    post step still share a runner; this is not signing-key isolation. Preserve
@@ -69,9 +93,9 @@ These are prerequisites. They are not established by offline regression tests or
 by a successful candidate preparation. This change does not provision credentials
 or claim that backup/restore has already been demonstrated.
 
-If the new CI App access must be rolled back, remove only its added Actions-read
-permission and the newly added frontend ID/key grants. Keep the Git-token limits
-and the nightly schedule disabled; do not restore a deployment-writing key to
+If the CI App access must be rolled back, remove only its added Actions-read
+permission and the added frontend ID/key grants. Keep the Git-token limits
+and the candidate schedule disabled; do not restore a deployment-writing key to
 product test jobs. Existing wallet dispatch credentials and routes stay unchanged.
 
 ## Read-only operator inventory
