@@ -528,6 +528,7 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete, errors):
 
 def apply_action(action):
     repo, existing, payload = action["repo"], action["existing"], action["payload"]
+    login = owner(repo) if not existing else None
     path = f"repos/{ORG}/{repo}/issues"
     if existing:
         path += f"/{existing['number']}"
@@ -535,7 +536,7 @@ def apply_action(action):
         body = payload
         if not existing:
             body = {**payload, "labels": [LABEL]}
-            if login := owner(repo):
+            if login:
                 body["assignees"] = [login]
         result = api(path, "PATCH" if existing else "POST", body)
         number = result.get("number") if isinstance(result, dict) else None
@@ -555,6 +556,12 @@ def apply_action(action):
     if (not isinstance(result, dict) or not own_issue(result) or result.get("body") != payload["body"]
             or result.get("state") != payload.get("state", "open")):
         raise APIError(f"{repo} issue #{number}: write could not be verified")
+    if login:
+        assignees = result.get("assignees")
+        if (not isinstance(assignees, list)
+                or not all(isinstance(item, dict) and isinstance(item.get("login"), str) for item in assignees)
+                or not any(item["login"].casefold() == login.casefold() for item in assignees)):
+            raise APIError(f"{repo} issue #{number}: requested assignee could not be verified")
     return f"{action['kind']} verified: #{number}"
 
 

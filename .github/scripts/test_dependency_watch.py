@@ -681,12 +681,12 @@ dev_dependencies:
                 self.assertEqual(body.get("labels"), [watch.LABEL] if existing is None else None)
 
     def test_owner_is_assigned_on_creation_only(self):
-        """The owner comes from dependabot-assignees.yml; an update would undo a hand reassignment."""
+        """Assign the owner on creation. Keep manual assignments on updates."""
         self.assertIsInstance(watch.owner("E-Bill-frontend"), str)
         self.assertIsNone(watch.owner("not-a-repository"))
         edges = [self.edge()]
         payload = watch.issue_payload("library", "Producer", "v2.0.0", edges)
-        issue = self.issue(edges=edges)
+        issue = dict(self.issue(edges=edges), assignees=[{"login": "MAINTAINER"}])
         with patch.object(watch, "owner", return_value="maintainer"):
             for kind, existing, method, path in (("open", None, "POST", "repos/ExampleOrg/Consumer/issues"),
                                                  ("update", issue, "PATCH", "repos/ExampleOrg/Consumer/issues/7")):
@@ -699,6 +699,79 @@ dev_dependencies:
                     self.consumed(pending)
                     body = next(call.args[2] for call in self.api.call_args_list if call.args[1:2] == (method,))
                     self.assertEqual(body.get("assignees"), ["maintainer"] if existing is None else None)
+
+    def test_creation_requires_the_requested_assignee_after_readback(self):
+        payload = watch.issue_payload("library", "Producer", "v2.0.0", [self.edge()])
+        action = dict(repo="Consumer", dep="library", kind="open", existing=None, payload=payload)
+        base = dict(payload, number=7, state="open", user=BOT)
+        assignees = ({}, {"assignees": None}, {"assignees": []}, {"assignees": {}},
+                     {"assignees": ["maintainer"]}, {"assignees": [{}]},
+                     {"assignees": [{"login": 1}]}, {"assignees": [{"login": "other"}]},
+                     {"assignees": [{"login": "maintainer"}, None]},
+                     {"assignees": [{"login": "MAINTAINER"}, {"login": "other"}]})
+        with patch.object(watch, "owner", return_value="maintainer"):
+            for lost in (False, True):
+                for assignment in assignees:
+                    with self.subTest(lost_response=lost, assignment=assignment):
+                        self.api.reset_mock()
+                        issue = dict(base, **assignment)
+                        responses = {
+                            ("POST", "repos/ExampleOrg/Consumer/issues"):
+                                [subprocess.TimeoutExpired("mock gh", 60) if lost else {"number": 7}],
+                            ("GET", "repos/ExampleOrg/Consumer/issues/7"): [issue],
+                        }
+                        if lost:
+                            responses["GET", "repos/ExampleOrg/Consumer/issues?state=all&per_page=100&page=1"] = [[issue]]
+                        pending = self.replies(responses)
+                        if assignment == assignees[-1]:
+                            self.assertEqual(watch.apply_action(action), "open verified: #7")
+                        else:
+                            with self.assertRaisesRegex(watch.APIError, "requested assignee"):
+                                watch.apply_action(action)
+                        self.consumed(pending)
+                        writes = [c for c in self.api.call_args_list if c.args[1:2] in (("POST",), ("PATCH",))]
+                        self.assertEqual(len(writes), 1)
+                        self.assertEqual(writes[0].args[1], "POST")
+                        self.assertEqual(writes[0].args[2]["assignees"], ["maintainer"])
+
+    def test_issue_changes_do_not_read_or_replace_manual_assignees(self):
+        for change in ("update", "close", "reopen"):
+            for assignment in ({}, {"assignees": [{"login": "manual-owner"}]}):
+                with self.subTest(change=change, assignment=assignment):
+                    self.api.reset_mock()
+                    payload = watch.issue_payload("library", "Producer", "v2.0.0", [self.edge()],
+                                                  resolved=change == "close")
+                    payload["state"] = "closed" if change == "close" else "open"
+                    existing = dict(self.issue(state="closed" if change == "reopen" else "open",
+                                               resolved=change == "reopen"), **assignment)
+                    current = dict(payload, number=7, user=BOT, **assignment)
+                    pending = self.replies({
+                        ("PATCH", "repos/ExampleOrg/Consumer/issues/7"): [{"number": 7}],
+                        ("GET", "repos/ExampleOrg/Consumer/issues/7"): [current],
+                    })
+                    kind = "close" if change == "close" else "update"
+                    action = dict(repo="Consumer", dep="library", kind=kind, existing=existing, payload=payload)
+                    with patch.object(watch, "owner", return_value="maintainer") as owner:
+                        self.assertEqual(watch.apply_action(action), f"{kind} verified: #7")
+                        owner.assert_not_called()
+                    self.consumed(pending)
+                    self.assertNotIn("assignees", self.api.call_args_list[0].args[2])
+                    self.assertEqual(current.get("assignees"), existing.get("assignees"))
+
+    def test_missing_or_unreadable_owner_map_does_not_block_creation(self):
+        payload = watch.issue_payload("library", "Producer", "v2.0.0", [self.edge()])
+        action = dict(repo="Consumer", dep="library", kind="open", existing=None, payload=payload)
+        for failure in (FileNotFoundError("missing map"), PermissionError("unreadable map")):
+            with self.subTest(failure=failure), patch.object(Path, "read_text", side_effect=failure):
+                self.api.reset_mock()
+                pending = self.replies({
+                    ("POST", "repos/ExampleOrg/Consumer/issues"): [{"number": 7}],
+                    ("GET", "repos/ExampleOrg/Consumer/issues/7"): [dict(payload, number=7, state="open", user=BOT)],
+                })
+                self.assertIsNone(watch.owner("Consumer"))
+                self.assertEqual(watch.apply_action(action), "open verified: #7")
+                self.consumed(pending)
+                self.assertNotIn("assignees", self.api.call_args_list[0].args[2])
 
     def test_uncertain_creation_rereads_without_a_second_post(self):
         payload = watch.issue_payload("library", "Producer", "v2.0.0", [self.edge()])

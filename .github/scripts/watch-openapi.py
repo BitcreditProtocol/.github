@@ -374,11 +374,12 @@ def owner():
 def apply_action(action):
     path = f"repos/{ORG}/{CONSUMER}/issues"
     number = action["number"]
+    login = owner() if not number else None
     try:
         body = action["payload"]
         if not number:
             body = {**body, "labels": [LABEL]}
-            if login := owner():
+            if login:
                 body["assignees"] = [login]
         result = api(path + (f"/{number}" if number else ""),
                      "PATCH" if number else "POST", body)
@@ -397,6 +398,12 @@ def apply_action(action):
             and current["state"] == action["payload"].get("state", "open")
             and all(current.get(key) == value for key, value in action["payload"].items()),
             "issue write could not be verified")
+    if login:
+        assignees = current.get("assignees")
+        require(isinstance(assignees, list)
+                and all(isinstance(item, dict) and isinstance(item.get("login"), str) for item in assignees)
+                and any(item["login"].casefold() == login.casefold() for item in assignees),
+                "requested assignee could not be verified")
     return number
 
 
