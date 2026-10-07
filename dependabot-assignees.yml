@@ -37,6 +37,8 @@ assignees:
   infrastructure: cleot
   nostr-postgres-db: cleot
   Protocol-E2E: stefanbitcr
+  review-server: cleot
+  security-reports: cleot
   ui: JulianVIE
   ui-flutter: JulianVIE
   wallet: JulianVIE
