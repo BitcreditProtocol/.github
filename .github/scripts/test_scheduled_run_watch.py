@@ -62,8 +62,10 @@ class FakeGitHub:
             return {"jobs": [{"name": "dev-0 / deploy", "conclusion": "failure"}, {"name": "dev-1 / deploy", "conclusion": "success"}]}
         if "/assignees/" in path:
             if path.rsplit("/", 1)[1] in self.not_assignable:
-                raise watch.APIError("GET assignees: HTTP 404")
+                raise watch.APIError("GET assignees: Not Found (HTTP 404)")
             return None
+        if "/issues?state=" in path:
+            assert "&creator=run-watch%5Bbot%5D" in path, path  # only the watcher's own issues are read
         if "/issues?state=open" in path:
             return [i for i in self.issues if i["state"] == "open"] if "page=1" in path else []
         if "/issues?state=closed" in path:
@@ -109,6 +111,9 @@ class WatchTest(unittest.TestCase):
         with patch.object(watch, "DEFAULT", ["mtbitcr", "gone"]):
             self.pass_once(gh)
         self.assertEqual(gh.writes[0][2]["assignees"], ["mtbitcr"])
+        with patch.object(watch, "api", side_effect=watch.APIError("GET assignees: (HTTP 503)")), \
+                self.assertRaises(watch.APIError):
+            watch.assignable("deploy", "mtbitcr")  # an outage is not a "no"
 
     def test_a_new_failed_run_comments_and_a_green_run_closes(self):
         gh = FakeGitHub([run(42, "failure")], [own(9, 41)])

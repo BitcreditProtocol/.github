@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+from urllib.parse import quote
 
 ORG = os.environ.get("ORG", "BitcreditProtocol")
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
@@ -82,8 +83,10 @@ def assignable(repo, user):
     try:  # a login that left the organisation would make GitHub refuse the whole issue
         api(f"repos/{ORG}/{repo}/assignees/{user}")
         return True
-    except APIError:
-        return False
+    except APIError as exc:
+        if "(HTTP 404)" in str(exc):
+            return False
+        raise  # an outage is not a "no"
 
 
 def own_issue(issue):
@@ -152,7 +155,7 @@ def plan(runs, issues):
 
 def closed_report(repo, workflow, run):
     """True when a person closed this watcher's issue about this very run: do not open it again."""
-    for issue in pages(f"repos/{ORG}/{repo}/issues?state=closed&since={run['created_at']}"):
+    for issue in pages(f"repos/{ORG}/{repo}/issues?state=closed&creator={quote(WATCHER_BOT)}&since={run['created_at']}"):
         if (own_issue(issue) and f"<!-- {MARKER}:{workflow['path']} -->" in issue["body"]
                 and reported_run(issue) == run["id"]):
             return True
@@ -194,7 +197,7 @@ def main():
                     if any(run["conclusion"] in FAILED for _, run in runs):
                         notes.append(f"{name}: issues are off, so a failed run cannot be reported")
                     continue
-                for kind, workflow, run, issue in plan(runs, pages(f"repos/{ORG}/{name}/issues?state=open")):
+                for kind, workflow, run, issue in plan(runs, pages(f"repos/{ORG}/{name}/issues?state=open&creator={quote(WATCHER_BOT)}")):
                     if kind == "open" and closed_report(name, workflow, run):
                         continue
                     done = f"would {kind}" if DRY_RUN else apply(name, kind, workflow, run, issue)
