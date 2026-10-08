@@ -2,7 +2,8 @@
 """Open one issue per workflow whose newest scheduled run failed; close it when a later run passes.
 
 GitHub tells only the person who last changed a cron line about a failed scheduled run. This
-watcher opens an issue in the workflow's repository and assigns ASSIGNEES, so the team hears of it.
+watcher opens an issue in the workflow's repository and assigns the repository's group in GROUPS,
+so the people who own it hear of it.
 """
 import json
 import os
@@ -16,16 +17,34 @@ SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/stdout")
 WATCHER_BOT = os.environ.get("WATCHER_BOT", "bitcredit-automation[bot]")
 MARKER = "bitcredit-scheduled-run-watch"
 LABEL = "awaiting triage"
-# The owner's choice of 2026-10-08: the people who hear of every failed scheduled run.
-ASSIGNEES = ["mtbitcr", "cleot", "zupzup", "stefanbitcr", "codingpeanut157"]
 FAILED = {"failure", "timed_out", "startup_failure"}
+# The watcher's own workflow is not watched: an error that fails every pass would comment every
+# hour. Its own failure reaches its cron author through GitHub.
+SELF_PATH = ".github/workflows/watch-scheduled-runs.yml"
+# The owner's choice of 2026-10-08: who hears of a failed scheduled run, by repository.
+GROUPS = [
+    (["JulianVIE", "ABBitcredit", "cleot"],  # frontend
+     ["E-Bill-frontend", "ui", "ui-flutter", "wildcat-dashboard-ui", "wildcat-dashboard-flutter", "wallet",
+      "eBill", "static-assets"]),
+    (["codingpeanut157", "cleot", "stefanbitcr"], ["Clowder", "Wildcat", "Wildcat-Auxiliary", "Protocol-E2E"]),
+    (["cleot", "zupzup", "stefanbitcr"], ["Wallet-Core"]),
+    (["zupzup", "cleot"], ["Bitcredit-Core", "bcr-load-tests"]),
+    (["cleot", "zupzup", "stefanbitcr", "codingpeanut157"],  # infrastructure
+     ["infrastructure", "Wildcat-deployment", "helm-charts", "docker-external", "bcr-common", "bcr-relay",
+      "nostr-postgres-db"]),
+    (["tobomobo", "cleot"], ["bitcr-chat-widget", "bitcredit-lab", "AI-Credit"]),
+    (["cleot", "zupzup", "stefanbitcr", "codingpeanut157", "mtbitcr"], ["docs-bitcr", "Governance", "cats", "internal_cats"]),
+    (["cleot"], ["crowdin-sdk", "nostr"]),  # forks
+    (["mtbitcr", "cleot"], [".github", "review-server", "security-reports", "bit.cr", "bitcr.org", "bitcredit-tools"]),
+]
+DEFAULT = ["mtbitcr", "cleot"]  # a repository that no group names yet
 
 
 class APIError(RuntimeError):
     pass
 
 
-def api(path, method="GET", body=None, *, missing=False):
+def api(path, method="GET", body=None):
     if method != "GET" and DRY_RUN:
         raise APIError("dry-run refused a write")
     command = ["gh", "api", "-X", method, path]
@@ -34,9 +53,9 @@ def api(path, method="GET", body=None, *, missing=False):
     result = subprocess.run(command, input=json.dumps(body) if body is not None else None,
                             capture_output=True, text=True, timeout=60)
     if result.returncode:
-        if missing and re.search(r"\(HTTP 404\)", result.stderr):
-            return None
         raise APIError(f"{method} {path}: {result.stderr.strip()[:500] or 'request failed'}")
+    if not result.stdout.strip():  # 204 No Content
+        return None
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -53,6 +72,18 @@ def pages(path):
         if len(rows) < 100:
             return result
         page += 1
+
+
+def assignees_for(repo):
+    return next((people for people, repos in GROUPS if repo in repos), DEFAULT)
+
+
+def assignable(repo, user):
+    try:  # a login that left the organisation would make GitHub refuse the whole issue
+        api(f"repos/{ORG}/{repo}/assignees/{user}")
+        return True
+    except APIError:
+        return False
 
 
 def own_issue(issue):
@@ -84,7 +115,8 @@ def issue_body(workflow, run, failed_jobs):
 def scheduled_runs(repo):
     """Yield (workflow, newest completed scheduled run) for each active workflow file of repo."""
     for workflow in api(f"repos/{ORG}/{repo}/actions/workflows?per_page=100")["workflows"]:
-        if workflow["state"] != "active" or not workflow["path"].startswith(".github/workflows/"):
+        if (workflow["state"] != "active" or not workflow["path"].startswith(".github/workflows/")
+                or (repo == ".github" and workflow["path"] == SELF_PATH)):
             continue
         runs = api(f"repos/{ORG}/{repo}/actions/workflows/{workflow['id']}/runs"
                    "?event=schedule&status=completed&per_page=1")["workflow_runs"]
@@ -107,6 +139,8 @@ def plan(runs, issues):
     actions = []
     for workflow, run in runs:
         issue = open_issues.get(workflow["path"])
+        if issue is not None and run["id"] < (reported_run(issue) or 0):
+            continue  # an older run, for example while the reported one is re-run
         if run["conclusion"] in FAILED and issue is None:
             actions.append(("open", workflow, run, None))
         elif run["conclusion"] in FAILED and reported_run(issue) != run["id"]:
@@ -116,12 +150,22 @@ def plan(runs, issues):
     return actions
 
 
+def closed_report(repo, workflow, run):
+    """True when a person closed this watcher's issue about this very run: do not open it again."""
+    for issue in pages(f"repos/{ORG}/{repo}/issues?state=closed&since={run['created_at']}"):
+        if (own_issue(issue) and f"<!-- {MARKER}:{workflow['path']} -->" in issue["body"]
+                and reported_run(issue) == run["id"]):
+            return True
+    return False
+
+
 def apply(repo, kind, workflow, run, issue):
     path = f"repos/{ORG}/{repo}/issues"
     if kind == "open":
         body = issue_body(workflow, run, failed_jobs(repo, run))
+        people = [user for user in assignees_for(repo) if assignable(repo, user)]
         result = api(path, "POST", {"title": f"Scheduled run failed: {workflow['name']}", "body": body,
-                                    "labels": [LABEL], "assignees": ASSIGNEES})
+                                    "labels": [LABEL], "assignees": people})
         return f"opened #{result['number']}"
     number = issue["number"]
     if kind == "comment":
@@ -138,7 +182,7 @@ def apply(repo, kind, workflow, run, issue):
 
 
 def main():
-    failing, actions, errors = [], [], []
+    failing, actions, notes, errors = [], [], [], []
     try:
         repos = [r for r in pages(f"orgs/{ORG}/repos?type=all") if not r.get("archived") and not r.get("disabled")]
         for repo in repos:
@@ -148,9 +192,11 @@ def main():
                 failing += [(name, workflow, run) for workflow, run in runs if run["conclusion"] in FAILED]
                 if not repo.get("has_issues", True):
                     if any(run["conclusion"] in FAILED for _, run in runs):
-                        errors.append(f"{name}: issues are off, so a failed run cannot be reported")
+                        notes.append(f"{name}: issues are off, so a failed run cannot be reported")
                     continue
                 for kind, workflow, run, issue in plan(runs, pages(f"repos/{ORG}/{name}/issues?state=open")):
+                    if kind == "open" and closed_report(name, workflow, run):
+                        continue
                     done = f"would {kind}" if DRY_RUN else apply(name, kind, workflow, run, issue)
                     actions.append(f"{name} {workflow['path']}: {done}")
             except (APIError, KeyError, TypeError, subprocess.SubprocessError) as exc:
@@ -165,6 +211,8 @@ def main():
         for name, workflow, run in failing:
             stream.write(f"- {name} `{workflow['path']}`: {run['conclusion']} {run['html_url']}\n")
         stream.write("\n### Issue actions\n\n" + ("".join(f"- {a}\n" for a in actions) or "None.\n"))
+        if notes:
+            stream.write("\n### Not reported\n\n" + "".join(f"- {n}\n" for n in sorted(notes)))
         if errors:
             stream.write("\n### Errors\n\n" + "".join(f"- {e}\n" for e in sorted(errors)))
     if errors and SUMMARY != "/dev/stdout":

@@ -19,6 +19,7 @@ with patch.dict(os.environ, ENV, clear=True):
 BOT = {"type": "Bot", "login": ENV["WATCHER_BOT"]}
 HUMAN = {"type": "User", "login": "maintainer"}
 NIGHTLY = {"id": 7, "name": "deploy nightly", "path": ".github/workflows/nightly.yml", "state": "active"}
+SELF = {"id": 9, "name": "Watch scheduled runs", "path": watch.SELF_PATH, "state": "active"}
 
 
 def run(number, conclusion):
@@ -27,12 +28,13 @@ def run(number, conclusion):
 
 
 class FakeGitHub:
-    """The API calls of one pass: repositories, workflows, the newest scheduled run, jobs and issues."""
+    """The API calls of one pass, for repositories named in `repos`; a repository named "broken" fails."""
 
-    def __init__(self, runs, issues=()):
+    def __init__(self, runs, issues=(), repos=("deploy",), issues_on=True, workflows=(NIGHTLY,)):
         self.runs, self.issues, self.writes, self.next_number = runs, list(issues), [], 100
+        self.repos, self.issues_on, self.workflows, self.not_assignable = repos, issues_on, workflows, {"gone"}
 
-    def api(self, path, method="GET", body=None, *, missing=False):
+    def api(self, path, method="GET", body=None):
         if method != "GET":
             if watch.DRY_RUN:
                 raise watch.APIError("dry-run refused a write")
@@ -48,23 +50,29 @@ class FakeGitHub:
                 return issue
             return {"id": 1}
         if path.startswith("orgs/ExampleOrg/repos"):
-            return [{"name": "deploy", "archived": False, "disabled": False, "has_issues": True}] if "page=1" in path else []
+            listing = [{"name": r, "archived": False, "disabled": False, "has_issues": self.issues_on} for r in self.repos]
+            return listing if "page=1" in path else []
+        if "/repos/ExampleOrg/broken/" in "/" + path:
+            raise watch.APIError("GET broken: HTTP 500")
         if path.endswith("/actions/workflows?per_page=100"):
-            return {"workflows": [NIGHTLY, {"id": 8, "name": "Copilot", "path": "dynamic/copilot", "state": "active"}]}
-        if "/actions/workflows/7/runs" in path:
+            return {"workflows": [*self.workflows, {"id": 8, "name": "Copilot", "path": "dynamic/copilot", "state": "active"}]}
+        if "/actions/workflows/" in path and "/runs" in path:
             return {"workflow_runs": self.runs}
         if "/jobs" in path:
             return {"jobs": [{"name": "dev-0 / deploy", "conclusion": "failure"}, {"name": "dev-1 / deploy", "conclusion": "success"}]}
+        if "/assignees/" in path:
+            if path.rsplit("/", 1)[1] in self.not_assignable:
+                raise watch.APIError("GET assignees: HTTP 404")
+            return None
         if "/issues?state=open" in path:
             return [i for i in self.issues if i["state"] == "open"] if "page=1" in path else []
+        if "/issues?state=closed" in path:
+            return [i for i in self.issues if i["state"] == "closed"] if "page=1" in path else []
         raise AssertionError(path)
 
-    def bodies(self):
-        return [body for _, _, body in self.writes]
 
-
-def own(number, run_id, user=BOT):
-    return {"number": number, "state": "open", "user": user, "title": "Scheduled run failed: deploy nightly",
+def own(number, run_id, user=BOT, state="open"):
+    return {"number": number, "state": state, "user": user, "title": "Scheduled run failed: deploy nightly",
             "body": watch.issue_body(NIGHTLY, run(run_id, "failure"), ["dev-0 / deploy"])}
 
 
@@ -81,7 +89,7 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(code, 0)
         (method, path, body), = gh.writes
         self.assertEqual((method, path), ("POST", "repos/ExampleOrg/deploy/issues"))
-        self.assertEqual(body["assignees"], ["mtbitcr", "cleot", "zupzup", "stefanbitcr", "codingpeanut157"])
+        self.assertEqual(body["assignees"], ["mtbitcr", "cleot"])  # a repository no group names
         self.assertEqual(body["labels"], ["awaiting triage"])
         self.assertIn("runs/41", body["body"])
         self.assertIn("dev-0 / deploy", body["body"])
@@ -89,6 +97,18 @@ class WatchTest(unittest.TestCase):
         self.assertIn("deploy", summary)
         self.assertEqual(self.pass_once(gh)[0], 0)
         self.assertEqual(len(gh.writes), 1)  # the same failed run: nothing more
+
+    def test_each_repository_has_its_group(self):
+        self.assertEqual(watch.assignees_for("Wildcat-deployment"), ["cleot", "zupzup", "stefanbitcr", "codingpeanut157"])
+        self.assertEqual(watch.assignees_for("E-Bill-frontend"), ["JulianVIE", "ABBitcredit", "cleot"])
+        self.assertEqual(watch.assignees_for("docs-bitcr"), ["cleot", "zupzup", "stefanbitcr", "codingpeanut157", "mtbitcr"])
+        self.assertEqual(watch.assignees_for("a-new-repository"), ["mtbitcr", "cleot"])
+
+    def test_a_login_that_cannot_be_assigned_is_left_out(self):
+        gh = FakeGitHub([run(41, "failure")])
+        with patch.object(watch, "DEFAULT", ["mtbitcr", "gone"]):
+            self.pass_once(gh)
+        self.assertEqual(gh.writes[0][2]["assignees"], ["mtbitcr"])
 
     def test_a_new_failed_run_comments_and_a_green_run_closes(self):
         gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
@@ -102,10 +122,45 @@ class WatchTest(unittest.TestCase):
                          [("POST", "repos/ExampleOrg/deploy/issues/9/comments"), ("PATCH", "repos/ExampleOrg/deploy/issues/9")])
         self.assertEqual(gh.writes[1][2], {"state": "closed", "state_reason": "completed"})
 
-    def test_a_cancelled_run_and_issues_of_others_are_left_alone(self):
-        gh = FakeGitHub([run(44, "cancelled")], [own(9, 41), own(10, 41, user=HUMAN)])
+    def test_an_issue_that_a_person_closed_is_not_opened_again_for_the_same_run(self):
+        gh = FakeGitHub([run(41, "failure")], [own(9, 41, state="closed")])
         self.pass_once(gh)
         self.assertEqual(gh.writes, [])
+        gh.runs = [run(42, "failure")]  # a later failure is news again
+        self.pass_once(gh)
+        self.assertEqual([(m, p) for m, p, _ in gh.writes], [("POST", "repos/ExampleOrg/deploy/issues")])
+
+    def test_a_run_older_than_the_reported_one_changes_nothing(self):
+        # While run 41 is re-run, the newest completed run is an older one.
+        gh = FakeGitHub([run(40, "success")], [own(9, 41)])
+        self.pass_once(gh)
+        self.assertEqual(gh.writes, [])
+
+    def test_a_cancelled_run_and_issues_of_others_are_left_alone(self):
+        gh = FakeGitHub([run(44, "cancelled")], [own(9, 41)])
+        self.pass_once(gh)
+        self.assertEqual(gh.writes, [])
+        gh = FakeGitHub([run(41, "failure")], [own(10, 41, user=HUMAN)])  # a person's copy of the marker
+        self.pass_once(gh)
+        self.assertEqual([(m, p) for m, p, _ in gh.writes], [("POST", "repos/ExampleOrg/deploy/issues")])
+
+    def test_the_watcher_does_not_watch_itself(self):
+        gh = FakeGitHub([run(46, "failure")], repos=(".github",), workflows=(SELF,))
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual(gh.writes, [])
+
+    def test_one_broken_repository_does_not_stop_the_others(self):
+        gh = FakeGitHub([run(41, "failure")], repos=("broken", "deploy"))
+        code, summary = self.pass_once(gh)
+        self.assertEqual(code, 1)  # the run shows the error
+        self.assertEqual([(m, p) for m, p, _ in gh.writes], [("POST", "repos/ExampleOrg/deploy/issues")])
+        self.assertIn("broken", summary)
+
+    def test_a_repository_without_issues_is_named_in_the_summary(self):
+        gh = FakeGitHub([run(41, "failure")], issues_on=False)
+        code, summary = self.pass_once(gh)
+        self.assertEqual((code, gh.writes), (0, []))
+        self.assertIn("issues are off", summary)
 
     def test_a_dry_run_writes_nothing_and_says_what_it_would_do(self):
         gh = FakeGitHub([run(45, "startup_failure")])
