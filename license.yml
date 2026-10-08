@@ -16,3 +16,5 @@ third_party:
     holder: Rust Nostr Developers
   - repository: crowdin-sdk
     holder: Crowdin
+  - repository: nostr
+    holder: Yuki Kishimoto
