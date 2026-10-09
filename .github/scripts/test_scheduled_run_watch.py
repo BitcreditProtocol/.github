@@ -164,7 +164,7 @@ class WatchTest(unittest.TestCase):
         self.assertEqual((method, path), ("POST", "repos/ExampleOrg/Wildcat-deployment/issues"))
         self.assertIn(STAGING["path"], body["body"])
         self.assertIn("Wildcat-deployment `.github/workflows/nightly.yml`: failure", summary)  # still listed
-        self.assertIn("its ticket workflow reports the failure", summary)
+        self.assertIn("in OWN_TICKETS, left to its ticket workflow", summary)
         gh = FakeGitHub([run(41, "failure")], repos=("Wildcat-deployment",), issues_on=False, workflows=(TICKETED,))
         code, summary = self.pass_once(gh)
         self.assertEqual((code, gh.writes), (0, []))

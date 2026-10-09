@@ -22,12 +22,11 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 # The watcher's own workflow is not watched: an error that fails every pass would comment every
 # hour. Its own failure reaches its cron author through GitHub.
 SELF_PATH = ".github/workflows/watch-scheduled-runs.yml"
-# A ticket workflow reports the failed runs of these workflows, so the watcher lists them but does not
-# open or comment on an issue: one outage gets one issue. Wildcat-deployment#182 added the ticket
-# workflow for its nightly. The key holds the name, so the watcher reports the nightly again after a
-# rename. A rename can silence the ticket workflow, which finds the nightly by name; a second issue is
-# the safer failure. Update the entry after a rename.
-# shortcut: an entry stays when its ticket workflow is removed; remove the entry then.
+# The watcher does not open or comment on an issue for these workflows. A ticket workflow in the same
+# repository reports their failures (Wildcat-deployment#182). The ticket workflow finds the nightly
+# by name, so the entry holds the name. When the names differ, the watcher reports the nightly.
+# Change or remove an entry only together with its ticket workflow.
+# shortcut: nothing checks that the ticket workflow still exists; add a check if the set grows.
 OWN_TICKETS = {("Wildcat-deployment", ".github/workflows/nightly.yml", "deploy nightly (clowder-dev)")}
 # The owner's choice of 2026-10-08: who hears of a failed scheduled run, by repository.
 GROUPS = [
@@ -206,7 +205,7 @@ def main():
                     continue
                 for kind, workflow, run, issue in plan(runs, pages(f"repos/{ORG}/{name}/issues?state=open&creator={quote(WATCHER_BOT)}")):
                     if kind != "close" and (name, workflow["path"], workflow["name"]) in OWN_TICKETS:
-                        notes.append(f"{name} `{workflow['path']}`: its ticket workflow reports the failure")
+                        notes.append(f"{name} `{workflow['path']}`: in OWN_TICKETS, left to its ticket workflow")
                         continue
                     if kind == "open" and closed_report(name, workflow, run):
                         continue
