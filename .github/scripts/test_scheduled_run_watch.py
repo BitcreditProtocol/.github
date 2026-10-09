@@ -154,6 +154,17 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(self.pass_once(gh)[0], 0)
         self.assertEqual(gh.writes, [])
 
+    def test_a_workflow_with_its_own_ticket_workflow_is_listed_but_gets_no_issue(self):
+        staging = {"id": 11, "name": "deploy staging", "path": ".github/workflows/staging.yml", "state": "active"}
+        gh = FakeGitHub([run(41, "failure")], repos=("Wildcat-deployment",), workflows=(NIGHTLY, staging))
+        code, summary = self.pass_once(gh)
+        self.assertEqual(code, 0)
+        (method, path, body), = gh.writes  # only the other workflow gets an issue
+        self.assertEqual((method, path), ("POST", "repos/ExampleOrg/Wildcat-deployment/issues"))
+        self.assertIn(staging["path"], body["body"])
+        self.assertIn("Wildcat-deployment `.github/workflows/nightly.yml`: failure", summary)  # still listed
+        self.assertIn("its own ticket workflow", summary)
+
     def test_one_broken_repository_does_not_stop_the_others(self):
         gh = FakeGitHub([run(41, "failure")], repos=("broken", "deploy"))
         code, summary = self.pass_once(gh)

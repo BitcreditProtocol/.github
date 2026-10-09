@@ -22,6 +22,9 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 # The watcher's own workflow is not watched: an error that fails every pass would comment every
 # hour. Its own failure reaches its cron author through GitHub.
 SELF_PATH = ".github/workflows/watch-scheduled-runs.yml"
+# These workflows report their own failed runs. The watcher lists them but opens no issue, so one
+# outage does not get two issues. Wildcat-deployment#182 added a ticket workflow for its nightly.
+OWN_TICKETS = {("Wildcat-deployment", ".github/workflows/nightly.yml")}
 # The owner's choice of 2026-10-08: who hears of a failed scheduled run, by repository.
 GROUPS = [
     (["JulianVIE", "ABBitcredit", "cleot"],  # frontend
@@ -193,6 +196,9 @@ def main():
             try:  # one repository that cannot be read must not stop the others
                 runs = list(scheduled_runs(name))
                 failing += [(name, workflow, run) for workflow, run in runs if run["conclusion"] in FAILED]
+                notes += [f"{name} `{workflow['path']}`: its own ticket workflow reports the failure"
+                          for workflow, run in runs if (name, workflow["path"]) in OWN_TICKETS and run["conclusion"] in FAILED]
+                runs = [(workflow, run) for workflow, run in runs if (name, workflow["path"]) not in OWN_TICKETS]
                 if not repo.get("has_issues", True):
                     if any(run["conclusion"] in FAILED for _, run in runs):
                         notes.append(f"{name}: issues are off, so a failed run cannot be reported")
