@@ -24,8 +24,9 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 SELF_PATH = ".github/workflows/watch-scheduled-runs.yml"
 # A ticket workflow reports the failed runs of these workflows, so the watcher lists them but does not
 # open or comment on an issue: one outage gets one issue. Wildcat-deployment#182 added the ticket
-# workflow for its nightly. The key holds the name, because the ticket workflow finds the nightly by
-# its name: after a rename the ticket workflow is silent, and the watcher reports again.
+# workflow for its nightly. The key holds the name, so the watcher reports the nightly again after a
+# rename. A rename can silence the ticket workflow, which finds the nightly by name; a second issue is
+# the safer failure. Update the entry after a rename.
 # shortcut: an entry stays when its ticket workflow is removed; remove the entry then.
 OWN_TICKETS = {("Wildcat-deployment", ".github/workflows/nightly.yml", "deploy nightly (clowder-dev)")}
 # The owner's choice of 2026-10-08: who hears of a failed scheduled run, by repository.
