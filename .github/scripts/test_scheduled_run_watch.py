@@ -20,6 +20,8 @@ BOT = {"type": "Bot", "login": ENV["WATCHER_BOT"]}
 HUMAN = {"type": "User", "login": "maintainer"}
 NIGHTLY = {"id": 7, "name": "deploy nightly", "path": ".github/workflows/nightly.yml", "state": "active"}
 SELF = {"id": 9, "name": "Watch scheduled runs", "path": watch.SELF_PATH, "state": "active"}
+TICKETED = {**NIGHTLY, "name": "deploy nightly (clowder-dev)"}  # Wildcat-deployment's nightly-ticket.yml reports it
+STAGING = {"id": 11, "name": "deploy staging", "path": ".github/workflows/staging.yml", "state": "active"}
 
 
 def run(number, conclusion):
@@ -154,16 +156,35 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(self.pass_once(gh)[0], 0)
         self.assertEqual(gh.writes, [])
 
-    def test_a_workflow_with_its_own_ticket_workflow_is_listed_but_gets_no_issue(self):
-        staging = {"id": 11, "name": "deploy staging", "path": ".github/workflows/staging.yml", "state": "active"}
-        gh = FakeGitHub([run(41, "failure")], repos=("Wildcat-deployment",), workflows=(NIGHTLY, staging))
+    def test_a_workflow_with_a_ticket_workflow_is_listed_but_gets_no_issue(self):
+        gh = FakeGitHub([run(41, "failure")], repos=("Wildcat-deployment",), workflows=(TICKETED, STAGING))
         code, summary = self.pass_once(gh)
         self.assertEqual(code, 0)
         (method, path, body), = gh.writes  # only the other workflow gets an issue
         self.assertEqual((method, path), ("POST", "repos/ExampleOrg/Wildcat-deployment/issues"))
-        self.assertIn(staging["path"], body["body"])
+        self.assertIn(STAGING["path"], body["body"])
         self.assertIn("Wildcat-deployment `.github/workflows/nightly.yml`: failure", summary)  # still listed
-        self.assertIn("its own ticket workflow", summary)
+        self.assertIn("its ticket workflow reports the failure", summary)
+        gh = FakeGitHub([run(41, "failure")], repos=("Wildcat-deployment",), issues_on=False, workflows=(TICKETED,))
+        code, summary = self.pass_once(gh)
+        self.assertEqual((code, gh.writes), (0, []))
+        self.assertIn("issues are off", summary)  # then the ticket workflow cannot report it either
+        self.assertNotIn("its ticket workflow", summary)
+
+    def test_a_renamed_ticketed_workflow_is_reported_again(self):
+        # The ticket workflow finds the nightly by its name, so after a rename it is silent.
+        gh = FakeGitHub([run(41, "failure")], repos=("Wildcat-deployment",), workflows=(NIGHTLY,))
+        self.pass_once(gh)
+        self.assertEqual([(m, p) for m, p, _ in gh.writes], [("POST", "repos/ExampleOrg/Wildcat-deployment/issues")])
+
+    def test_an_older_watcher_issue_of_a_ticketed_workflow_still_closes(self):
+        gh = FakeGitHub([run(42, "failure")], [own(9, 41)], repos=("Wildcat-deployment",), workflows=(TICKETED,))
+        self.pass_once(gh)
+        self.assertEqual(gh.writes, [])  # no comment: the ticket workflow reports the failure
+        gh.runs = [run(43, "success")]
+        self.pass_once(gh)
+        self.assertEqual([(m, p) for m, p, _ in gh.writes], [("POST", "repos/ExampleOrg/Wildcat-deployment/issues/9/comments"),
+                                                             ("PATCH", "repos/ExampleOrg/Wildcat-deployment/issues/9")])
 
     def test_one_broken_repository_does_not_stop_the_others(self):
         gh = FakeGitHub([run(41, "failure")], repos=("broken", "deploy"))
