@@ -9,7 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import json
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from posixpath import normpath
 import re
 import subprocess
@@ -24,6 +24,9 @@ MARKER = "bitcredit-dependency-watch"
 # Applied when the issue is created only. Keeping it out of the payload preserves both
 # the unchanged-issue short circuit and any label a human added to an open issue.
 LABEL = "awaiting triage"
+# Read when an issue is opened, so it lands with the repository's owner. Never sent on
+# updates, which would undo a reassignment made by hand.
+ASSIGNEES = Path(__file__).resolve().parents[2] / "dependabot-assignees.yml"
 STATE = "bitcredit-dependency-watch-state"
 WATCHER_BOT = os.environ.get("WATCHER_BOT", "bitcredit-automation[bot]")
 MANIFESTS = {"Cargo.toml", "package.json", "pubspec.yaml", "pubspec_overrides.yaml"}
@@ -159,6 +162,16 @@ def parse_manifest(path, text):
     if not isinstance(data, dict):
         raise ValueError(f"{path}: manifest must be a mapping")
     return data
+
+
+def owner(repo):
+    """The login dependabot-assignees.yml names for repo, or None. Assigning is a courtesy:
+    a missing or unreadable map never stops a run."""
+    try:
+        login = parse_manifest(ASSIGNEES.name, ASSIGNEES.read_text())["assignees"].get(repo)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+        return None
+    return login if isinstance(login, str) else None
 
 
 def declarations(doc):
@@ -515,11 +528,16 @@ def plan_actions(edges, issues_by_repo, gaps, incomplete, errors):
 
 def apply_action(action):
     repo, existing, payload = action["repo"], action["existing"], action["payload"]
+    login = owner(repo) if not existing else None
     path = f"repos/{ORG}/{repo}/issues"
     if existing:
         path += f"/{existing['number']}"
     try:
-        body = payload if existing else {**payload, "labels": [LABEL]}
+        body = payload
+        if not existing:
+            body = {**payload, "labels": [LABEL]}
+            if login:
+                body["assignees"] = [login]
         result = api(path, "PATCH" if existing else "POST", body)
         number = result.get("number") if isinstance(result, dict) else None
         if not isinstance(number, int):
@@ -538,6 +556,12 @@ def apply_action(action):
     if (not isinstance(result, dict) or not own_issue(result) or result.get("body") != payload["body"]
             or result.get("state") != payload.get("state", "open")):
         raise APIError(f"{repo} issue #{number}: write could not be verified")
+    if login:
+        assignees = result.get("assignees")
+        if (not isinstance(assignees, list)
+                or not all(isinstance(item, dict) and isinstance(item.get("login"), str) for item in assignees)
+                or not any(item["login"].casefold() == login.casefold() for item in assignees)):
+            raise APIError(f"{repo} issue #{number}: requested assignee could not be verified")
     return f"{action['kind']} verified: #{number}"
 
 
