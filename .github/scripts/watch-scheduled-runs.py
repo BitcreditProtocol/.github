@@ -22,9 +22,10 @@ FAILED = {"failure", "timed_out", "startup_failure"}
 # The watcher's own workflow is not watched: an error that fails every pass would comment every
 # hour. Its own failure reaches its cron author through GitHub.
 SELF_PATH = ".github/workflows/watch-scheduled-runs.yml"
-# The watcher does not open or comment on an issue for these workflows. A ticket workflow in the same
-# repository reports their failures (Wildcat-deployment#182). The ticket workflow finds the nightly
-# by name, so the entry holds the name. When the names differ, the watcher reports the nightly.
+# For a failure of these workflows the watcher opens no issue and adds no comment. A ticket workflow
+# in the same repository reports their failures (Wildcat-deployment#182). The ticket workflow finds
+# the nightly by name, so the entry holds the name. When the names differ, the watcher reports the
+# nightly.
 # Change or remove an entry only together with its ticket workflow.
 # shortcut: nothing checks that the ticket workflow still exists; add a check if the set grows.
 OWN_TICKETS = {("Wildcat-deployment", ".github/workflows/nightly.yml", "deploy nightly (clowder-dev)")}
