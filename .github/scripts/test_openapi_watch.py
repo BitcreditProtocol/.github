@@ -28,6 +28,7 @@ with patch.dict(os.environ, ENV, clear=True):
     watch = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(watch)
 REAL_RUN = subprocess.run
+REAL_OWNER = watch.owner
 S, C = "a" * 40, "b" * 40
 BOT = {"type": "Bot", "login": ENV["WATCHER_BOT"]}
 HUMAN = {"type": "User", "login": "maintainer"}
@@ -108,6 +109,8 @@ class Fixture:
             # echoed the payload back would hide a payload label from every verification.
             if "labels" in written:
                 written["labels"] = [{"name": name} for name in written["labels"]]
+            if "assignees" in written:
+                written["assignees"] = [{"login": name} for name in written["assignees"]]
             current.update(written)
             if current["state"] == "closed":
                 current["closed_by"] = dict(BOT)
@@ -177,6 +180,7 @@ class OpenAPIWatchTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, ENV, clear=True))
         self.enterContext(patch.object(watch, "DRY_RUN", False))
         self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("unexpected real command")))
+        self.enterContext(patch.object(watch, "owner", return_value=None))
 
     def execute(self, fixture, *, dry=False):
         output = io.StringIO()
@@ -233,6 +237,54 @@ class OpenAPIWatchTests(unittest.TestCase):
         self.assertNotIn("labels", fixture.writes()[0][2])
         self.assertEqual(fixture.issues[0]["labels"], kept)
 
+    def test_owner_is_assigned_on_creation_only(self):
+        """Assign the owner on creation. Keep manual assignments on updates."""
+        with patch.object(subprocess, "run", side_effect=REAL_RUN):
+            self.assertIsInstance(REAL_OWNER(), str)
+        with patch.object(watch, "owner", return_value="maintainer"):
+            fixture = Fixture(changed=True)
+            code, result = self.execute(fixture)
+            self.assertEqual((code, result["verified_writes"]), (0, 1))
+            self.assertEqual(fixture.writes()[0][2]["assignees"], ["maintainer"])
+            fixture = Fixture(changed=True)
+            fixture.issues = [fixture.issue(target="0" * 64)]
+            code, result = self.execute(fixture)
+            self.assertEqual((code, result["proposed_actions"][0]["kind"]), (0, "update"))
+            self.assertNotIn("assignees", fixture.writes()[0][2])
+
+    def test_creation_requires_the_requested_assignee_after_readback(self):
+        assignments = ({}, {"assignees": None}, {"assignees": []}, {"assignees": {}},
+                       {"assignees": ["maintainer"]}, {"assignees": [{}]},
+                       {"assignees": [{"login": 1}]}, {"assignees": [{"login": "other"}]},
+                       {"assignees": [{"login": "maintainer"}, None]},
+                       {"assignees": [{"login": "MAINTAINER"}, {"login": "other"}]})
+        with patch.object(watch, "owner", return_value="maintainer"):
+            for lost in (False, True):
+                for assignment in assignments:
+                    with self.subTest(lost_response=lost, assignment=assignment):
+                        fixture = Fixture(changed=True)
+                        fixture.lost_response = lost
+                        fixture.overrides["issue_detail"] = lambda data, fields=assignment: {
+                            **{key: value for key, value in data.items() if key != "assignees"}, **fields}
+                        code, result = self.execute(fixture)
+                        accepted = assignment == assignments[-1]
+                        self.assertEqual((code, result["verified_writes"]), (0, 1) if accepted else (1, 0))
+                        if not accepted:
+                            self.assertIn("requested assignee", result["gaps"][0])
+                        self.assertEqual(result["write_attempts"], 1)
+                        self.assertEqual([call[0] for call in fixture.writes()], ["POST"])
+                        self.assertEqual(fixture.writes()[0][2]["assignees"], ["maintainer"])
+
+    def test_missing_or_unreadable_owner_map_does_not_block_creation(self):
+        for failure in (FileNotFoundError("missing map"), PermissionError("unreadable map")):
+            with self.subTest(failure=failure), patch.object(Path, "read_text", side_effect=failure), \
+                    patch.object(watch, "owner", side_effect=REAL_OWNER):
+                fixture = Fixture(changed=True)
+                self.assertIsNone(watch.owner())
+                code, result = self.execute(fixture)
+                self.assertEqual((code, result["verified_writes"]), (0, 1))
+                self.assertNotIn("assignees", fixture.writes()[0][2])
+
     def test_same_digest_does_not_refresh_an_open_issue(self):
         fixture = Fixture(changed=True)
         issue = fixture.issue()
@@ -259,18 +311,23 @@ class OpenAPIWatchTests(unittest.TestCase):
         self.assertEqual(fixture.issues[0]["state"], "closed")
 
     def test_new_digest_updates_and_sync_closes_then_regression_reopens(self):
-        fixture = Fixture(changed=True)
-        fixture.issues = [fixture.issue(target="0" * 64)]
-        code, result = self.execute(fixture)
-        self.assertEqual((code, result["proposed_actions"][0]["kind"]), (0, "update"))
-        fixture.consumer_bytes = fixture.source_bytes
-        code, result = self.execute(fixture)
-        self.assertEqual((code, result["proposed_actions"][0]["kind"]), (0, "close"))
-        self.assertTrue(watch.issue_state(fixture.issues[0])["resolved"])
-        fixture.consumer_bytes = json.dumps(DOCUMENT).encode()
-        code, result = self.execute(fixture)
-        self.assertEqual((code, result["proposed_actions"][0]), (0, {"kind": "update", "number": 7}))
-        self.assertEqual(fixture.issues[0]["state"], "open")
+        for assignment in ({}, {"assignees": [{"login": "manual-owner"}]}):
+            with self.subTest(assignment=assignment), patch.object(watch, "owner", return_value="maintainer") as owner:
+                fixture = Fixture(changed=True)
+                fixture.issues = [dict(fixture.issue(target="0" * 64), **assignment)]
+                code, result = self.execute(fixture)
+                self.assertEqual((code, result["proposed_actions"][0]["kind"]), (0, "update"))
+                fixture.consumer_bytes = fixture.source_bytes
+                code, result = self.execute(fixture)
+                self.assertEqual((code, result["proposed_actions"][0]["kind"]), (0, "close"))
+                self.assertTrue(watch.issue_state(fixture.issues[0])["resolved"])
+                fixture.consumer_bytes = json.dumps(DOCUMENT).encode()
+                code, result = self.execute(fixture)
+                self.assertEqual((code, result["proposed_actions"][0]), (0, {"kind": "update", "number": 7}))
+                self.assertEqual(fixture.issues[0]["state"], "open")
+                owner.assert_not_called()
+                self.assertEqual(fixture.issues[0].get("assignees"), assignment.get("assignees"))
+                self.assertTrue(all("assignees" not in call[2] for call in fixture.writes()))
 
     def test_only_owned_marked_issues_are_managed_and_duplicates_stop(self):
         fixture = Fixture(changed=True)
