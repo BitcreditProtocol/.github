@@ -160,12 +160,17 @@ def plan(runs, issues):
     return actions
 
 
+def notification_marker(workflow, run):
+    return f"<!-- {MARKER}-notification:{workflow['path']}:{run['id']} -->"
+
+
 def closed_report(repo, workflow, run):
     """True when a person closed this watcher's issue about this very run: do not open it again."""
     for issue in pages(f"repos/{ORG}/{repo}/issues?state=closed&creator={quote(WATCHER_BOT)}&since={run['created_at']}"):
-        if (own_issue(issue) and f"<!-- {MARKER}:{workflow['path']} -->" in issue["body"]
-                and reported_run(issue) == run["id"]):
-            return True
+        if own_issue(issue) and f"<!-- {MARKER}:{workflow['path']} -->" in issue["body"]:
+            if (reported_run(issue) == run["id"] or notification_exists(
+                    f"repos/{ORG}/{repo}/issues/{issue['number']}/comments", notification_marker(workflow, run))):
+                return True
     return False
 
 
@@ -188,7 +193,7 @@ def apply(repo, kind, workflow, run, issue):
     if kind == "comment":
         jobs = failed_jobs(repo, run)
         comments = f"{path}/{number}/comments"
-        marker = f"<!-- {MARKER}-notification:{workflow['path']}:{run['id']} -->"
+        marker = notification_marker(workflow, run)
         if not notification_exists(comments, marker):
             try:
                 api(comments, "POST",

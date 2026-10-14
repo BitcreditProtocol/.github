@@ -178,6 +178,51 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(self.pass_once(gh)[0], 0)
         self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
 
+    def test_manual_close_after_partial_delivery_does_not_open_another_issue(self):
+        gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+        api = gh.api
+
+        def unavailable(path, method="GET", body=None):
+            if method == "PATCH":
+                raise watch.APIError("PATCH issue: HTTP 503")
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=unavailable):
+            self.assertEqual(self.pass_once(gh)[0], 1)
+        self.assertEqual(watch.reported_run(gh.issues[0]), 41)
+        self.assertEqual(len(gh.comments["repos/ExampleOrg/deploy/issues/9/comments"]), 1)
+        gh.issues[0]["state"] = "closed"
+        gh.writes.clear()
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual(gh.writes, [])
+        self.assertEqual(len(gh.issues), 1)
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual(gh.writes, [])
+
+    def test_closed_issue_comment_read_failure_is_not_absence(self):
+        gh = FakeGitHub([run(42, "failure")], [own(9, 41, state="closed")])
+        api = gh.api
+
+        def unavailable(path, method="GET", body=None):
+            if method == "GET" and "/comments?" in path:
+                raise watch.APIError("GET comments: HTTP 503")
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=unavailable):
+            self.assertEqual(self.pass_once(gh)[0], 1)
+        self.assertEqual(gh.writes, [])
+        self.assertEqual(len(gh.issues), 1)
+
+    def test_closed_issue_does_not_trust_another_authors_notification(self):
+        for user in (HUMAN, {"type": "Bot", "login": "other[bot]"}):
+            with self.subTest(user=user):
+                gh = FakeGitHub([run(42, "failure")], [own(9, 41, state="closed")])
+                gh.comments["repos/ExampleOrg/deploy/issues/9/comments"] = [
+                    {"user": user, "body": watch.notification_marker(NIGHTLY, run(42, "failure"))}]
+                self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual([(m, p) for m, p, _ in gh.writes],
+                                 [("POST", "repos/ExampleOrg/deploy/issues")])
+
     def test_an_unclear_post_result_is_read_back_before_the_body_update(self):
         for failure in (watch.APIError("POST comments: invalid JSON"),
                         subprocess.TimeoutExpired("gh", 60)):
