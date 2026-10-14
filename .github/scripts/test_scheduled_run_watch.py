@@ -3,6 +3,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -35,6 +36,7 @@ class FakeGitHub:
     def __init__(self, runs, issues=(), repos=("deploy",), issues_on=True, workflows=(NIGHTLY,)):
         self.runs, self.issues, self.writes, self.next_number = runs, list(issues), [], 100
         self.repos, self.issues_on, self.workflows, self.not_assignable = repos, issues_on, workflows, {"gone"}
+        self.comments = {}
 
     def api(self, path, method="GET", body=None):
         if method != "GET":
@@ -50,6 +52,11 @@ class FakeGitHub:
                 issue = next(i for i in self.issues if i["number"] == number)
                 issue.update(body)
                 return issue
+            if method == "POST" and path.endswith("/comments"):
+                comments = self.comments.setdefault(path, [])
+                comment = {"id": len(comments) + 1, "user": BOT, **body}
+                comments.append(comment)
+                return comment
             return {"id": 1}
         if path.startswith("orgs/ExampleOrg/repos"):
             listing = [{"name": r, "archived": False, "disabled": False, "has_issues": self.issues_on} for r in self.repos]
@@ -66,6 +73,9 @@ class FakeGitHub:
             if path.rsplit("/", 1)[1] in self.not_assignable:
                 raise watch.APIError("GET assignees: Not Found (HTTP 404)")
             return None
+        if "/comments?" in path:
+            page = int(path.rsplit("&page=", 1)[1])
+            return self.comments.get(path.split("?", 1)[0], [])[100 * (page - 1):100 * page]
         if "/issues?state=" in path:
             assert "&creator=run-watch%5Bbot%5D" in path, path  # only the watcher's own issues are read
         if "/issues?state=open" in path:
@@ -121,13 +131,141 @@ class WatchTest(unittest.TestCase):
         gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
         self.pass_once(gh)
         self.assertEqual([(m, p) for m, p, _ in gh.writes],
-                         [("PATCH", "repos/ExampleOrg/deploy/issues/9"), ("POST", "repos/ExampleOrg/deploy/issues/9/comments")])
-        self.assertIn("runs/42", gh.writes[1][2]["body"])  # a comment notifies the assignees again
+                         [("POST", "repos/ExampleOrg/deploy/issues/9/comments"), ("PATCH", "repos/ExampleOrg/deploy/issues/9")])
+        self.assertIn("runs/42", gh.writes[0][2]["body"])  # a comment notifies the assignees again
         gh.runs, gh.writes = [run(43, "success")], []
         self.pass_once(gh)
         self.assertEqual([(m, p) for m, p, _ in gh.writes],
                          [("POST", "repos/ExampleOrg/deploy/issues/9/comments"), ("PATCH", "repos/ExampleOrg/deploy/issues/9")])
         self.assertEqual(gh.writes[1][2], {"state": "closed", "state_reason": "completed"})
+
+    def test_a_failed_notification_does_not_advance_the_reported_run(self):
+        gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+        api = gh.api
+
+        def unavailable(path, method="GET", body=None):
+            if method == "POST" and path.endswith("/comments"):
+                raise watch.APIError("POST comments: HTTP 503")
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=unavailable):
+            self.assertEqual(self.pass_once(gh)[0], 1)
+        self.assertEqual(watch.reported_run(gh.issues[0]), 41)
+        self.assertEqual(gh.writes, [])
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual(watch.reported_run(gh.issues[0]), 42)
+        self.assertEqual(len(gh.comments["repos/ExampleOrg/deploy/issues/9/comments"]), 1)
+        writes = len(gh.writes)
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual(len(gh.writes), writes)
+
+    def test_a_failed_body_update_does_not_duplicate_the_notification(self):
+        gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+        api = gh.api
+
+        def unavailable(path, method="GET", body=None):
+            if method == "PATCH":
+                raise watch.APIError("PATCH issue: HTTP 503")
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=unavailable):
+            self.assertEqual(self.pass_once(gh)[0], 1)
+        self.assertEqual(watch.reported_run(gh.issues[0]), 41)
+        self.assertEqual(len(gh.comments["repos/ExampleOrg/deploy/issues/9/comments"]), 1)
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual(watch.reported_run(gh.issues[0]), 42)
+        self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+
+    def test_an_unclear_post_result_is_read_back_before_the_body_update(self):
+        for failure in (watch.APIError("POST comments: invalid JSON"),
+                        subprocess.TimeoutExpired("gh", 60)):
+            with self.subTest(failure=type(failure).__name__):
+                gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+                api = gh.api
+
+                def unclear(path, method="GET", body=None):
+                    result = api(path, method, body)
+                    if method == "POST" and path.endswith("/comments"):
+                        raise failure
+                    return result
+
+                with patch.object(gh, "api", side_effect=unclear):
+                    self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual(watch.reported_run(gh.issues[0]), 42)
+                self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+
+    def test_comment_read_failure_does_not_allow_a_new_post_or_body_update(self):
+        gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+        api = gh.api
+
+        def unavailable(path, method="GET", body=None):
+            if method == "GET" and "/comments?" in path:
+                raise watch.APIError("GET comments: HTTP 503")
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=unavailable):
+            self.assertEqual(self.pass_once(gh)[0], 1)
+        self.assertEqual(watch.reported_run(gh.issues[0]), 41)
+        self.assertEqual(gh.writes, [])
+
+    def test_failed_readback_keeps_the_marker_and_the_next_pass_uses_the_comment(self):
+        for unclear in (False, True):
+            with self.subTest(unclear=unclear):
+                gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+                api, posted = gh.api, False
+
+                def unavailable(path, method="GET", body=None):
+                    nonlocal posted
+                    if method == "GET" and "/comments?" in path and posted:
+                        raise watch.APIError("GET comments: HTTP 503")
+                    result = api(path, method, body)
+                    if method == "POST" and path.endswith("/comments"):
+                        posted = True
+                        if unclear:
+                            raise subprocess.TimeoutExpired("gh", 60)
+                    return result
+
+                with patch.object(gh, "api", side_effect=unavailable):
+                    self.assertEqual(self.pass_once(gh)[0], 1)
+                self.assertEqual(watch.reported_run(gh.issues[0]), 41)
+                self.assertEqual([m for m, _, _ in gh.writes], ["POST"])
+                self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual(watch.reported_run(gh.issues[0]), 42)
+                self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+
+    def test_an_unconfirmed_post_does_not_advance_the_reported_run(self):
+        gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+        api = gh.api
+
+        def not_saved(path, method="GET", body=None):
+            if method == "POST" and path.endswith("/comments"):
+                return {"id": 1}
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=not_saved):
+            self.assertEqual(self.pass_once(gh)[0], 1)
+        self.assertEqual(watch.reported_run(gh.issues[0]), 41)
+        self.assertEqual(gh.writes, [])
+
+    def test_only_the_app_comment_for_this_workflow_and_run_counts(self):
+        marker = f"<!-- {watch.MARKER}-notification:{NIGHTLY['path']}:42 -->"
+        for found in (False, True):
+            with self.subTest(found=found):
+                gh = FakeGitHub([run(42, "failure")], [own(9, 41)])
+                comments = [{"user": HUMAN, "body": marker},
+                            {"user": {"type": "Bot", "login": "other[bot]"}, "body": marker},
+                            {"user": {"type": "User", "login": BOT["login"]}, "body": marker},
+                            {"user": BOT, "body": marker.replace(":42 -->", ":43 -->")},
+                            {"user": BOT, "body": marker.replace(NIGHTLY["path"], STAGING["path"])},
+                            {"user": BOT, "body": "quoted " + marker}]
+                comments += [{"user": HUMAN, "body": "Unrelated comment."}] * 94
+                if found:
+                    comments.append({"user": BOT, "body": marker})
+                gh.comments["repos/ExampleOrg/deploy/issues/9/comments"] = comments
+                self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual([m for m, _, _ in gh.writes], ["PATCH"] if found else ["POST", "PATCH"])
 
     def test_an_issue_that_a_person_closed_is_not_opened_again_for_the_same_run(self):
         gh = FakeGitHub([run(41, "failure")], [own(9, 41, state="closed")])

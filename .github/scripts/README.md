@@ -126,6 +126,17 @@ cannot read a wiki, so for an internal or private repository "no content" and "n
 access" are indistinguishable — checking those reported the repositories that
 actually use their wiki as empty.
 
+## Scheduled run notifications
+
+The watcher confirms a failure comment before it updates the reported run in
+the issue body. Each comment has a workflow/run marker. Only a comment from
+the automation App counts. If a write has an unknown result, the watcher reads
+the comments before it retries. A failed body update can then resume without
+another notification. A failed comment leaves the previous run marker intact.
+
+This change does not enable the watcher. Keep its existing activation and
+manual-close rules.
+
 ## Dependency notifications
 
 The watcher reads nested Cargo, npm and pubspec manifests from immutable snapshots of each default branch and dev, where present. It skips archived repositories, forks and the same generated/vendor paths as the audit. Package declarations identify producers; local workspace dependencies within one repository do not create cross-repository notifications. Cargo uses Python 3.11+ tomllib, JSON uses the standard library, and YAML uses the yq tool already used by the audit.

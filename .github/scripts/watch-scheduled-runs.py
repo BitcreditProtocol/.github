@@ -169,6 +169,13 @@ def closed_report(repo, workflow, run):
     return False
 
 
+def notification_exists(path, marker):
+    return any(comment.get("user", {}).get("type") == "Bot"
+               and comment.get("user", {}).get("login") == WATCHER_BOT
+               and marker in (comment.get("body") or "").splitlines()
+               for comment in pages(path))
+
+
 def apply(repo, kind, workflow, run, issue):
     path = f"repos/{ORG}/{repo}/issues"
     if kind == "open":
@@ -180,11 +187,21 @@ def apply(repo, kind, workflow, run, issue):
     number = issue["number"]
     if kind == "comment":
         jobs = failed_jobs(repo, run)
+        comments = f"{path}/{number}/comments"
+        marker = f"<!-- {MARKER}-notification:{workflow['path']}:{run['id']} -->"
+        if not notification_exists(comments, marker):
+            try:
+                api(comments, "POST",
+                    {"body": f"{marker}\nFailed again: {run['html_url']} ({run['created_at']}, `{run['conclusion']}`). "
+                             f"Failed jobs: {', '.join(jobs) or 'none listed'}."})
+            except (APIError, subprocess.SubprocessError):
+                # A timeout can occur after GitHub saves the comment.
+                if not notification_exists(comments, marker):
+                    raise
+            else:
+                if not notification_exists(comments, marker):
+                    raise APIError(f"{comments}: notification was not confirmed")
         api(f"{path}/{number}", "PATCH", {"body": issue_body(workflow, run, jobs)})
-        # A comment, not only the edit: it notifies the assignees of the new failure.
-        api(f"{path}/{number}/comments", "POST",
-            {"body": f"Failed again: {run['html_url']} ({run['created_at']}, `{run['conclusion']}`). "
-                     f"Failed jobs: {', '.join(jobs) or 'none listed'}."})
         return f"commented on #{number}"
     api(f"{path}/{number}/comments", "POST", {"body": f"The scheduled run {run['html_url']} ({run['created_at']}) passed."})
     api(f"{path}/{number}", "PATCH", {"state": "closed", "state_reason": "completed"})
