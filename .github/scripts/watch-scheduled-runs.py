@@ -181,6 +181,20 @@ def notification_exists(path, marker):
                for comment in pages(path))
 
 
+def confirm_notification(path, marker, body):
+    if notification_exists(path, marker):
+        return
+    try:
+        api(path, "POST", {"body": f"{marker}\n{body}"})
+    except (APIError, subprocess.SubprocessError):
+        # A timeout can occur after GitHub saves the comment.
+        if not notification_exists(path, marker):
+            raise
+    else:
+        if not notification_exists(path, marker):
+            raise APIError(f"{path}: notification was not confirmed")
+
+
 def apply(repo, kind, workflow, run, issue):
     path = f"repos/{ORG}/{repo}/issues"
     if kind == "open":
@@ -190,25 +204,16 @@ def apply(repo, kind, workflow, run, issue):
                                     "labels": [LABEL], "assignees": people})
         return f"opened #{result['number']}"
     number = issue["number"]
+    comments = f"{path}/{number}/comments"
     if kind == "comment":
         jobs = failed_jobs(repo, run)
-        comments = f"{path}/{number}/comments"
-        marker = notification_marker(workflow, run)
-        if not notification_exists(comments, marker):
-            try:
-                api(comments, "POST",
-                    {"body": f"{marker}\nFailed again: {run['html_url']} ({run['created_at']}, `{run['conclusion']}`). "
-                             f"Failed jobs: {', '.join(jobs) or 'none listed'}."})
-            except (APIError, subprocess.SubprocessError):
-                # A timeout can occur after GitHub saves the comment.
-                if not notification_exists(comments, marker):
-                    raise
-            else:
-                if not notification_exists(comments, marker):
-                    raise APIError(f"{comments}: notification was not confirmed")
+        confirm_notification(comments, notification_marker(workflow, run),
+                             f"Failed again: {run['html_url']} ({run['created_at']}, `{run['conclusion']}`). "
+                             f"Failed jobs: {', '.join(jobs) or 'none listed'}.")
         api(f"{path}/{number}", "PATCH", {"body": issue_body(workflow, run, jobs)})
         return f"commented on #{number}"
-    api(f"{path}/{number}/comments", "POST", {"body": f"The scheduled run {run['html_url']} ({run['created_at']}) passed."})
+    confirm_notification(comments, f"<!-- {MARKER}-recovery:{workflow['path']}:{run['id']} -->",
+                         f"The scheduled run {run['html_url']} ({run['created_at']}) passed.")
     api(f"{path}/{number}", "PATCH", {"state": "closed", "state_reason": "completed"})
     return f"closed #{number}"
 

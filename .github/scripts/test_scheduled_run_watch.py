@@ -312,6 +312,153 @@ class WatchTest(unittest.TestCase):
                 self.assertEqual(self.pass_once(gh)[0], 0)
                 self.assertEqual([m for m, _, _ in gh.writes], ["PATCH"] if found else ["POST", "PATCH"])
 
+    def test_failed_closing_retries_reuse_one_recovery_comment(self):
+        gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+        api, failures = gh.api, 0
+
+        def unavailable(path, method="GET", body=None):
+            nonlocal failures
+            if method == "PATCH" and failures < 2:
+                failures += 1
+                raise watch.APIError("PATCH issue: HTTP 503")
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=unavailable):
+            for _ in range(2):
+                self.assertEqual(self.pass_once(gh)[0], 1)
+                self.assertEqual(gh.issues[0]["state"], "open")
+            self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual(failures, 2)
+        self.assertEqual(gh.issues[0]["state"], "closed")
+        self.assertEqual(len(gh.comments["repos/ExampleOrg/deploy/issues/9/comments"]), 1)
+        self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+
+    def test_unclear_recovery_post_is_read_back_before_closing(self):
+        for failure in (watch.APIError("POST comments: invalid JSON"),
+                        subprocess.TimeoutExpired("gh", 60)):
+            with self.subTest(failure=type(failure).__name__):
+                gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+                api = gh.api
+
+                def unclear(path, method="GET", body=None):
+                    result = api(path, method, body)
+                    if method == "POST" and path.endswith("/comments"):
+                        raise failure
+                    return result
+
+                with patch.object(gh, "api", side_effect=unclear):
+                    self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual(gh.issues[0]["state"], "closed")
+                self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+
+    def test_failed_recovery_readback_leaves_closing_pending(self):
+        for unclear in (False, True):
+            with self.subTest(unclear=unclear):
+                gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+                api, posted = gh.api, False
+
+                def unavailable(path, method="GET", body=None):
+                    nonlocal posted
+                    if method == "GET" and "/comments?" in path and posted:
+                        raise watch.APIError("GET comments: HTTP 503")
+                    result = api(path, method, body)
+                    if method == "POST" and path.endswith("/comments"):
+                        posted = True
+                        if unclear:
+                            raise subprocess.TimeoutExpired("gh", 60)
+                    return result
+
+                with patch.object(gh, "api", side_effect=unavailable):
+                    self.assertEqual(self.pass_once(gh)[0], 1)
+                self.assertEqual(gh.issues[0]["state"], "open")
+                self.assertEqual([m for m, _, _ in gh.writes], ["POST"])
+                self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual(gh.issues[0]["state"], "closed")
+                self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+
+    def test_unconfirmed_recovery_post_does_not_close(self):
+        for failure in (None, watch.APIError("POST comments: HTTP 503"),
+                        subprocess.TimeoutExpired("gh", 60)):
+            with self.subTest(failure=type(failure).__name__):
+                gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+                api = gh.api
+
+                def not_saved(path, method="GET", body=None):
+                    if method == "POST" and path.endswith("/comments"):
+                        if failure is not None:
+                            raise failure
+                        return {"id": 1}
+                    return api(path, method, body)
+
+                with patch.object(gh, "api", side_effect=not_saved):
+                    self.assertEqual(self.pass_once(gh)[0], 1)
+                self.assertEqual(gh.issues[0]["state"], "open")
+                self.assertEqual(gh.writes, [])
+                self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual(gh.issues[0]["state"], "closed")
+                self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+
+    def test_recovery_comment_read_failure_does_not_post_or_close(self):
+        gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+        api = gh.api
+
+        def unavailable(path, method="GET", body=None):
+            if method == "GET" and "/comments?" in path:
+                raise watch.APIError("GET comments: HTTP 503")
+            return api(path, method, body)
+
+        with patch.object(gh, "api", side_effect=unavailable):
+            self.assertEqual(self.pass_once(gh)[0], 1)
+        self.assertEqual(gh.issues[0]["state"], "open")
+        self.assertEqual(gh.writes, [])
+
+    def test_only_the_app_recovery_comment_for_this_workflow_and_run_counts(self):
+        marker = f"<!-- {watch.MARKER}-recovery:{NIGHTLY['path']}:42 -->"
+        for found in (False, True):
+            with self.subTest(found=found):
+                gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+                comments = [{"user": HUMAN, "body": marker},
+                            {"user": {"type": "Bot", "login": "other[bot]"}, "body": marker},
+                            {"user": {"type": "User", "login": BOT["login"]}, "body": marker},
+                            {"user": BOT, "body": marker.replace(":42 -->", ":43 -->")},
+                            {"user": BOT, "body": marker.replace(NIGHTLY["path"], STAGING["path"])},
+                            {"user": BOT, "body": "quoted " + marker},
+                            {"user": BOT, "body": watch.notification_marker(NIGHTLY, run(42, "success"))}]
+                comments += [{"user": HUMAN, "body": "Unrelated comment."}] * 93
+                if found:
+                    comments.append({"user": BOT, "body": marker})
+                gh.comments["repos/ExampleOrg/deploy/issues/9/comments"] = comments
+                self.assertEqual(self.pass_once(gh)[0], 0)
+                self.assertEqual([m for m, _, _ in gh.writes], ["PATCH"] if found else ["POST", "PATCH"])
+
+    def test_recovery_reuses_the_comment_only_for_the_same_issue_and_run(self):
+        gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        gh.writes.clear()
+        gh.issues[0]["state"] = "open"
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual([m for m, _, _ in gh.writes], ["PATCH"])
+        gh.writes.clear()
+        gh.runs = [run(43, "success")]
+        gh.issues[0]["state"] = "open"
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+        gh.writes.clear()
+        gh.issues = [own(10, 41)]
+        self.assertEqual(self.pass_once(gh)[0], 0)
+        self.assertEqual([m for m, _, _ in gh.writes], ["POST", "PATCH"])
+        self.assertEqual(gh.writes[0][1], "repos/ExampleOrg/deploy/issues/10/comments")
+
+    def test_recovery_dry_run_does_not_post_or_close(self):
+        gh = FakeGitHub([run(42, "success")], [own(9, 41)])
+        code, summary = self.pass_once(gh, dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertIn("would close", summary)
+        self.assertEqual(gh.issues[0]["state"], "open")
+        self.assertEqual(gh.writes, [])
+
     def test_an_issue_that_a_person_closed_is_not_opened_again_for_the_same_run(self):
         gh = FakeGitHub([run(41, "failure")], [own(9, 41, state="closed")])
         self.pass_once(gh)
