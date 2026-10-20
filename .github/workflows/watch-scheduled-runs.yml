@@ -1,0 +1,63 @@
+name: Watch scheduled runs
+
+# GitHub tells only the person who last changed a cron line about a failed scheduled run.
+# This watcher opens an issue for each failed one, assigns the team, and closes it after a pass.
+
+on:
+  pull_request:
+    paths:
+      - '.github/scripts/watch-scheduled-runs.py'
+      - '.github/scripts/test_scheduled_run_watch.py'
+      - '.github/workflows/watch-scheduled-runs.yml'
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: List the failed scheduled runs without changing an issue
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 .github/scripts/test_scheduled_run_watch.py
+
+  watch:
+    if: github.event_name != 'pull_request'
+    needs: test
+    name: Watch scheduled runs
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    concurrency:
+      group: watch-scheduled-runs
+      cancel-in-progress: false
+    env:
+      DRY_RUN: ${{ ((github.event_name == 'workflow_dispatch' && inputs.dry_run == false) || (github.event_name == 'schedule' && vars.SCHEDULED_RUN_WATCH_ENABLED == 'true')) && 'false' || 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Mint an org-scoped token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOMATION_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-actions: read
+          permission-metadata: read
+          permission-issues: ${{ env.DRY_RUN == 'true' && 'read' || 'write' }}
+
+      - name: Report failed scheduled runs
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          WATCHER_BOT: ${{ steps.token.outputs.app-slug }}[bot]
+        run: python3 .github/scripts/watch-scheduled-runs.py

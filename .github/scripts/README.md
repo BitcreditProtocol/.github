@@ -11,6 +11,7 @@ Scheduled workflows maintain organisation settings and watch cross-repository de
 | `watch-openapi.yml` | `watch-openapi.py` | one open dashboard issue | exact Wildcat/master artifact compared with dashboard/dev |
 | `propose-wallet-minimum.yml` | `propose-wallet-minimum.py` | a proposal branch and PR in static-assets | explicit wallet minimum and release provenance |
 | `watch-dependency-graph.yml` | `watch-dependency-graph.py` | dependency issues, after explicit activation | exact pins, ranges, revisions, overrides and incomplete reads |
+| `watch-scheduled-runs.yml` | `watch-scheduled-runs.py` | one issue per workflow whose newest scheduled run failed, assigned to the team; closed after a later pass; after explicit activation (`SCHEDULED_RUN_WATCH_ENABLED`) | failed scheduled runs in every active repository. The watcher only lists a workflow in `OWN_TICKETS`, because a ticket workflow reports its failures |
 | `sync-labels.yml` | `sync-labels.sh` | label names, colours, descriptions | labels not in `labels.yml` |
 | `audit-repo-settings.yml` | `audit-repo-settings.sh` | organisation topics, merge settings | configuration findings, coverage metrics and a list of what it could not read — see below |
 
@@ -124,6 +125,17 @@ The empty-wiki check runs on public repositories only. An App installation token
 cannot read a wiki, so for an internal or private repository "no content" and "no
 access" are indistinguishable — checking those reported the repositories that
 actually use their wiki as empty.
+
+## Scheduled run notifications
+
+The watcher confirms a failure comment before it updates the reported run in
+the issue body. Each comment has a workflow/run marker. Only a comment from
+the automation App counts. If a write has an unknown result, the watcher reads
+the comments before it retries. A failed body update can then resume without
+another notification. A failed comment leaves the previous run marker intact.
+
+This change does not enable the watcher. Keep its existing activation and
+manual-close rules.
 
 ## Dependency notifications
 
