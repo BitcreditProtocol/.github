@@ -206,8 +206,9 @@ raise RuntimeError('The audit must not execute this file')
         files = {'.github/workflows/publish.yml': self.oidc_workflow('python3 helper.py'),
                  'helper.py': '# npm publish\nprint("hello")\n'}
         summary = self.run_audit(files=files)
-        self.assertIn('no known token consumer', summary)
-        self.assertNotIn('Not measured on this run', summary)
+        self.assertIn('Not measured on this run', summary)
+        self.assertIn('script delegation is unverified', summary)
+        self.assertNotIn('id-token: write with ', summary)
 
     def test_oidc_unverified_python_delegation_is_not_an_unused_finding(self):
         commands = ('python3 missing.py', 'python3 "$SCRIPT"', 'python3 -m publisher',
@@ -225,6 +226,32 @@ raise RuntimeError('The audit must not execute this file')
         summary = self.run_audit(files={'.github/workflows/publish.yml': workflow})
         self.assertIn('OIDC token consumers', summary)
         self.assertNotIn('id-token: write with ', summary)
+
+    def test_oidc_computed_commands_and_second_python_helpers_are_unverified(self):
+        helpers = ('import os, subprocess\nsubprocess.run(os.environ["RELEASE_COMMAND"].split())\n',
+                   'import subprocess\nsubprocess.run(["python3", "nested.py"])\n')
+        for helper in helpers:
+            with self.subTest(helper=helper):
+                files = {'.github/workflows/publish.yml': self.oidc_workflow('python3 helper.py'),
+                         'helper.py': helper,
+                         'nested.py': 'import subprocess\nsubprocess.run(["npm", "publish"])\n'}
+                summary = self.run_audit(files=files)
+                self.assertIn('Not measured on this run', summary)
+                self.assertIn('script delegation is unverified', summary)
+                self.assertNotIn('id-token: write with ', summary)
+
+    def test_oidc_shell_delegation_is_unverified(self):
+        commands = ('bash -c "python3 helper.py"', 'sh -c "python3 helper.py"',
+                    'source helper.sh', '. helper.sh')
+        for command in commands:
+            with self.subTest(command=command):
+                files = {'.github/workflows/publish.yml': self.oidc_workflow(command),
+                         'helper.sh': 'python3 helper.py\n',
+                         'helper.py': 'import subprocess\nsubprocess.run(["npm", "publish"])\n'}
+                summary = self.run_audit(files=files)
+                self.assertIn('Not measured on this run', summary)
+                self.assertIn('script delegation is unverified', summary)
+                self.assertNotIn('id-token: write with ', summary)
 
     def test_oidc_helper_rejects_unsafe_tree_rows_and_unreadable_blobs(self):
         path = 'helper.py'

@@ -670,7 +670,9 @@ for job in workflow.get('jobs', {}).values():
                 continue
             if not words:
                 continue
-            if re.fullmatch(r'python(?:3(?:\.\d+)?)?', words[0]):
+            if words[0].rsplit('/', 1)[-1] in ('bash', 'sh', 'source', '.'):
+                unknown = True
+            elif re.fullmatch(r'python(?:3(?:\.\d+)?)?', words[0]):
                 path = words[1] if len(words) > 1 else ''
                 path = path[2:] if path.startswith('./') else path
                 if (directory not in ('.', './') or moved
@@ -738,13 +740,13 @@ publish = any(isinstance(node, (ast.List, ast.Tuple)) and node.elts
               and (node.elts[0].value == 'publish' or
                    (node.elts[0].value == 'npm' and any(isinstance(word, ast.Constant)
                     and word.value == 'publish' for word in node.elts[1:]))) for node in nodes)
-sys.exit(0 if npm and publish else 1)
+sys.exit(0 if npm and publish else 2)
 PY
             case "$helper_status" in 0) oidc_consumer=1 ;; 1) ;; *) oidc_unknown=1 ;; esac
           done < "$WORK/python-helpers"
           if [ -z "$oidc_consumer" ]; then
             if [ -n "$oidc_unknown" ]; then
-              gap "$repo OIDC token consumers in $wf — Python delegation is unverified"
+              gap "$repo OIDC token consumers in $wf — script delegation is unverified"
             else
               printf '%s\n' "$wf" >> "$WORK/idtoken"
             fi
