@@ -2,6 +2,7 @@
 """Run the actual audit with a fake gh executable; no network or write access."""
 import base64
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,9 @@ meta = dict(name='demo', archived=False, default_branch='master', fork=False,
             allow_update_branch=True)
 raw = any('application/vnd.github.raw' in arg for arg in args)
 status = 200
-if route in faults:
+if path in faults:
+    status, data = faults[path]
+elif route in faults:
     status, data = faults[route]
 elif route == 'orgs/Fixture/repos':
     data = [meta, dict(name='archived', archived=True)]
@@ -98,12 +101,25 @@ else:
 '''
 
 
+def blob_sha(body):
+    content = body.encode()
+    return hashlib.sha1(b'blob '+str(len(content)).encode()+b'\0'+content).hexdigest()
+
+
 class AuditTests(unittest.TestCase):
     def run_audit(self, faults=None, disable_corpus_guards=False, files=None, dry_run=True, assignees=None):
         responses = {}
         if files is not None:
+            tree = []
+            for path, body in files.items():
+                content = body.encode()
+                sha = blob_sha(body) if path.endswith('.py') or path.startswith('.github/workflows/') else 'a'*40
+                tree.append(dict(type='blob', path=path, sha=sha, mode='100644', size=len(content)))
+                if path.endswith('.py'):
+                    responses['repos/Fixture/demo/git/blobs/'+sha] = [200, {
+                        'content': base64.b64encode(content).decode(), 'encoding': 'base64', 'size': len(content)}]
             responses['repos/Fixture/demo/git/trees/master'] = [200, {
-                'truncated': False, 'tree': [dict(type='blob', path=path, sha='a'*40) for path in files]}]
+                'truncated': False, 'tree': tree}]
             responses.update({'repos/Fixture/demo/contents/'+path: [200, body] for path, body in files.items()})
         responses.update(faults or {})
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,6 +169,135 @@ jobs:
         summary = self.run_audit({'repos/Fixture/demo/contents/.github/workflows/one.yml': [200, workflow]})
         self.assertNotIn('no .github/dependabot.yml', summary)
         self.assertNotIn('Not measured on this run', summary)
+
+    def oidc_workflow(self, command):
+        return ('on: push\npermissions:\n  id-token: write\njobs:\n  publish:\n'
+                '    runs-on: ubuntu-latest\n    steps:\n      - run: |\n' +
+                ''.join('          '+line+'\n' for line in command.splitlines()) + '# secrets.KEEP_ME\n')
+
+    def test_oidc_direct_consumers_and_python_publish_helper(self):
+        helper = '''import subprocess
+def command(args):
+    return subprocess.run(args, check=True)
+def npm(target, args):
+    return command(['npm', *args])
+def publish(archive):
+    args = ['publish', archive]
+    npm('npmjs', args)
+raise RuntimeError('The audit must not execute this file')
+'''
+        path = '.github/scripts/package_release.py'
+        cases = [('npm publish', {}), ('python3 '+path+' publish archive npmjs', {path: helper})]
+        for command, scripts in cases:
+            with self.subTest(command=command):
+                files = {'.github/workflows/publish.yml': self.oidc_workflow(command), **scripts}
+                summary = self.run_audit(files=files)
+                self.assertNotIn('id-token: write with ', summary)
+                self.assertNotIn('Not measured on this run', summary)
+
+    def test_oidc_comments_and_strings_are_not_python_invocations(self):
+        for command in ('# python3 .github/scripts/publish.py',
+                        'echo "python3 .github/scripts/publish.py"'):
+            with self.subTest(command=command):
+                files = {'.github/workflows/publish.yml': self.oidc_workflow(command)}
+                summary = self.run_audit(files=files)
+                self.assertIn('no known token consumer', summary)
+                self.assertNotIn('Not measured on this run', summary)
+        files = {'.github/workflows/publish.yml': self.oidc_workflow('python3 helper.py'),
+                 'helper.py': '# npm publish\nprint("hello")\n'}
+        summary = self.run_audit(files=files)
+        self.assertIn('Not measured on this run', summary)
+        self.assertIn('script delegation is unverified', summary)
+        self.assertNotIn('id-token: write with ', summary)
+
+    def test_oidc_unverified_python_delegation_is_not_an_unused_finding(self):
+        commands = ('python3 missing.py', 'python3 "$SCRIPT"', 'python3 -m publisher',
+                    'python3 -c "import publisher"', '${{ inputs.command }}',
+                    'python3 ../publish.py', 'python3 https://example.test/publish.py',
+                    'cd package\npython3 helper.py', 'env python3 helper.py',
+                    'echo "$(python3 helper.py)"')
+        for command in commands:
+            with self.subTest(command=command):
+                summary = self.run_audit(files={'.github/workflows/publish.yml': self.oidc_workflow(command)})
+                self.assertIn('OIDC token consumers', summary)
+                self.assertIn('Not measured on this run', summary)
+                self.assertNotIn('id-token: write with ', summary)
+        workflow = self.oidc_workflow('print("hello")').replace('- run: |', '- shell: python\n        run: |')
+        summary = self.run_audit(files={'.github/workflows/publish.yml': workflow})
+        self.assertIn('OIDC token consumers', summary)
+        self.assertNotIn('id-token: write with ', summary)
+
+    def test_oidc_computed_commands_and_second_python_helpers_are_unverified(self):
+        helpers = ('import os, subprocess\nsubprocess.run(os.environ["RELEASE_COMMAND"].split())\n',
+                   'import subprocess\nsubprocess.run(["python3", "nested.py"])\n')
+        for helper in helpers:
+            with self.subTest(helper=helper):
+                files = {'.github/workflows/publish.yml': self.oidc_workflow('python3 helper.py'),
+                         'helper.py': helper,
+                         'nested.py': 'import subprocess\nsubprocess.run(["npm", "publish"])\n'}
+                summary = self.run_audit(files=files)
+                self.assertIn('Not measured on this run', summary)
+                self.assertIn('script delegation is unverified', summary)
+                self.assertNotIn('id-token: write with ', summary)
+
+    def test_oidc_shell_delegation_is_unverified(self):
+        commands = ('bash -c "python3 helper.py"', 'sh -c "python3 helper.py"',
+                    'source helper.sh', '. helper.sh')
+        for command in commands:
+            with self.subTest(command=command):
+                files = {'.github/workflows/publish.yml': self.oidc_workflow(command),
+                         'helper.sh': 'python3 helper.py\n',
+                         'helper.py': 'import subprocess\nsubprocess.run(["npm", "publish"])\n'}
+                summary = self.run_audit(files=files)
+                self.assertIn('Not measured on this run', summary)
+                self.assertIn('script delegation is unverified', summary)
+                self.assertNotIn('id-token: write with ', summary)
+
+    def test_oidc_helper_rejects_unsafe_tree_rows_and_unreadable_blobs(self):
+        path = 'helper.py'
+        files = {'.github/workflows/publish.yml': self.oidc_workflow('python3 '+path),
+                 path: 'import subprocess\nsubprocess.run(["npm", "publish"])\n'}
+        valid = dict(type='blob', path=path, sha='b'*40, mode='100644', size=len(files[path].encode()))
+        rows = [{**valid, 'mode': mode} for mode in ('120000', '160000', None)]
+        rows += [{**valid, 'size': size} for size in (None, -1, 1048577)]
+        failures = [{'repos/Fixture/demo/git/trees/master': [200, {'truncated': False, 'tree': [
+            dict(type='blob', path='.github/workflows/publish.yml', sha=blob_sha(files['.github/workflows/publish.yml'])), row]}]} for row in rows]
+        failures += [{'repos/Fixture/demo/git/blobs/'+blob_sha(files[path]): response}
+            for response in ([403, {}], [404, {}], [503, {}], [200, {'content': '%%%'}],
+                             [200, {'content': '', 'encoding': 'base64', 'size': 0}])]
+        for faults in failures:
+            with self.subTest(faults=faults):
+                summary = self.run_audit(faults, files=files)
+                self.assertIn('OIDC token consumers', summary)
+                self.assertNotIn('id-token: write with ', summary)
+
+    def test_oidc_workflow_and_helper_use_the_tree_snapshot(self):
+        workflow = self.oidc_workflow('python3 helper.py')
+        files = {'.github/workflows/publish.yml': workflow,
+                 'helper.py': 'import subprocess\nsubprocess.run(["npm", "publish"])\n'}
+        faults = {'repos/Fixture/demo/contents/helper.py': [200, 'print("changed")\n']}
+        summary = self.run_audit(faults, files=files)
+        self.assertNotIn('id-token: write with ', summary)
+        self.assertNotIn('Not measured on this run', summary)
+        faults['repos/Fixture/demo/contents/.github/workflows/publish.yml?ref=master'] = [200, self.oidc_workflow('echo changed')]
+        summary = self.run_audit(faults, files=files)
+        self.assertNotIn('id-token: write with ', summary)
+        self.assertIn('workflow differs from the tree snapshot', summary)
+
+    def test_oidc_reusable_workflow_permission_is_preserved(self):
+        workflow = ('on: push\npermissions:\n  id-token: write\n  attestations: write\njobs:\n'
+                    '  publish:\n    uses: ./.github/workflows/called.yml\n# secrets.KEEP_ME\n')
+        summary = self.run_audit(files={'.github/workflows/publish.yml': workflow})
+        self.assertNotIn('id-token: write with ', summary)
+        self.assertNotIn('no attest step', summary)
+        self.assertNotIn('Not measured on this run', summary)
+
+    def test_oidc_helper_checks_keep_dry_run_free_of_writes(self):
+        files = {'.github/workflows/publish.yml': self.oidc_workflow('python3 helper.py'),
+                 'helper.py': 'import subprocess\nsubprocess.run(["npm", "publish"])\n'}
+        summary = self.run_audit({'repos/Fixture/demo/topics': [200, {'names': []}]}, files=files)
+        self.assertIn('topics corrected: **1**', summary)
+        self.assertNotIn('id-token: write with ', summary)
 
     def test_external_steps_and_reusable_workflows_require_dependabot(self):
         jobs = [
