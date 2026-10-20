@@ -620,9 +620,7 @@ while IFS= read -r repo; do
         printf '%s\n' "$wf" >> "$WORK/prt" ;;
     esac
 
-    # id-token: write lets a workflow mint an OIDC identity. Granted and never
-    # used it is a capability nobody asked for, and the consumers are a closed
-    # list: a cloud login, an npm or PyPI publish with provenance, buildx
+    # These markers identify potential token consumers, not a completed publish.
     # A file whose jobs call a reusable workflow has delegated the work, and with
     # it the reason for the permission: a called workflow's token is the
     # INTERSECTION of the caller's and its own, so a caller that omits the grant
@@ -637,8 +635,121 @@ while IFS= read -r repo; do
     # provenance, an attestation, cosign. Nine files grant it without one.
     [ -n "$delegates" ] || case "$body" in
       *"id-token: write"*)
-        printf '%s\n' "$body" | grep -qE 'npm publish|--provenance|provenance:[[:space:]]*true|google-github-actions/auth|aws-actions/configure-aws-credentials|azure/login|attest-build-provenance|cosign|sigstore|pypa/gh-action-pypi|dart-lang/setup-dart' \
-          || printf '%s\n' "$wf" >> "$WORK/idtoken"
+        workflow_sha=$(jq -r --arg path "$wf" '.tree[] | select(.path == $path) | .sha' "$WORK/tree.json")
+        if [ "$(git hash-object "$cached")" != "$workflow_sha" ]; then
+          gap "$repo OIDC token consumers in $wf — workflow differs from the tree snapshot"
+        elif ! printf '%s\n' "$body" | grep -qE 'npm publish|--provenance|provenance:[[:space:]]*true|google-github-actions/auth|aws-actions/configure-aws-credentials|azure/login|attest-build-provenance|cosign|sigstore|pypa/gh-action-pypi|dart-lang/setup-dart'; then
+          oidc_consumer=""; oidc_unknown=""
+          # shortcut: inspect direct Python files once; review other delegation manually.
+          if ! python3 - "$cached.json" > "$WORK/python-helpers" 2>/dev/null <<'PY'
+import json, re, shlex, sys
+with open(sys.argv[1]) as source:
+    workflow = json.load(source)
+paths = set()
+unknown = False
+for job in workflow.get('jobs', {}).values():
+    for step in job.get('steps', []):
+        run = step.get('run', '')
+        if not isinstance(run, str):
+            unknown = True
+            continue
+        lines = run.replace('\\\n', '').splitlines()
+        directory = step.get('working-directory', job.get('defaults', {}).get('run', {}).get(
+            'working-directory', workflow.get('defaults', {}).get('run', {}).get('working-directory', '.')))
+        shell = step.get('shell', job.get('defaults', {}).get('run', {}).get(
+            'shell', workflow.get('defaults', {}).get('run', {}).get('shell', 'bash')))
+        if run and not re.match(r'^(bash|sh)(\s|$)', shell):
+            unknown = True
+            continue
+        moved = any(re.match(r'\s*cd\b', line) for line in lines)
+        for line in lines:
+            try:
+                words = shlex.split(line, comments=True)
+            except ValueError:
+                unknown = True
+                continue
+            if not words:
+                continue
+            if re.fullmatch(r'python(?:3(?:\.\d+)?)?', words[0]):
+                path = words[1] if len(words) > 1 else ''
+                path = path[2:] if path.startswith('./') else path
+                if (directory not in ('.', './') or moved
+                        or not re.fullmatch(r'[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.py', path)
+                        or any(part in ('.', '..') for part in path.split('/'))):
+                    unknown = True
+                else:
+                    paths.add(path)
+            elif ('$' in words[0] or any('$(' in word or '`' in word for word in words)
+                  or (words[0] != 'echo' and any(re.fullmatch(r'python(?:3(?:\.\d+)?)?', word) for word in words[1:]))):
+                unknown = True
+if unknown:
+    print('?')
+for path in sorted(paths):
+    print(path)
+PY
+          then oidc_unknown=1; fi
+          while IFS= read -r helper; do
+            [ -n "$helper" ] || continue
+            if [ "$helper" = '?' ] || ! jq -er --arg path "$helper" '
+                .tree[] | select(.path == $path and .type == "blob"
+                  and (.mode == "100644" or .mode == "100755")
+                  and (.size | type == "number") and .size >= 0
+                  and .size == (.size | floor) and .size <= 1048576)
+                | [.sha, .size] | @tsv' "$WORK/tree.json" > "$WORK/helper-meta" 2>/dev/null; then
+              oidc_unknown=1
+              continue
+            fi
+            read -r helper_sha helper_size < "$WORK/helper-meta"
+            if [ ! -f "$WORK/blob-$helper_sha" ]; then
+              if ! read_api "repos/$ORG/$repo/git/blobs/$helper_sha" "$WORK/blob-response.json" ||
+                 ! jq -er '.content | select(type == "string")' "$WORK/blob-response.json" > "$WORK/blob.b64" 2>/dev/null ||
+                 ! base64 -d < "$WORK/blob.b64" > "$WORK/blob-$helper_sha" 2>/dev/null; then
+                rm -f "$WORK/blob-$helper_sha"
+                oidc_unknown=1
+                continue
+              fi
+            fi
+            if [ "$(wc -c < "$WORK/blob-$helper_sha" | tr -d ' ')" != "$helper_size" ] ||
+               [ "$(git hash-object "$WORK/blob-$helper_sha")" != "$helper_sha" ]; then
+              rm -f "$WORK/blob-$helper_sha"
+              oidc_unknown=1
+              continue
+            fi
+            helper_status=0
+            python3 - "$WORK/blob-$helper_sha" 2>/dev/null <<'PY' || helper_status=$?
+import ast, sys
+try:
+    with open(sys.argv[1], 'rb') as source:
+        nodes = list(ast.walk(ast.parse(source.read())))
+except (OSError, SyntaxError, ValueError, UnicodeError, RecursionError, MemoryError):
+    sys.exit(2)
+process_calls = {node for node in nodes if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)
+                 and node.func.attr in ('run', 'Popen', 'call', 'check_call', 'check_output')}
+wrappers = {node.name for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(child in process_calls for child in ast.walk(node))}
+calls = process_calls | {node for node in nodes if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name) and node.func.id in wrappers}
+commands = [arg for call in calls for arg in call.args if isinstance(arg, (ast.List, ast.Tuple))]
+npm = any(command.elts and isinstance(command.elts[0], ast.Constant)
+          and command.elts[0].value == 'npm' for command in commands)
+publish = any(isinstance(node, (ast.List, ast.Tuple)) and node.elts
+              and isinstance(node.elts[0], ast.Constant)
+              and (node.elts[0].value == 'publish' or
+                   (node.elts[0].value == 'npm' and any(isinstance(word, ast.Constant)
+                    and word.value == 'publish' for word in node.elts[1:]))) for node in nodes)
+sys.exit(0 if npm and publish else 1)
+PY
+            case "$helper_status" in 0) oidc_consumer=1 ;; 1) ;; *) oidc_unknown=1 ;; esac
+          done < "$WORK/python-helpers"
+          if [ -z "$oidc_consumer" ]; then
+            if [ -n "$oidc_unknown" ]; then
+              gap "$repo OIDC token consumers in $wf — Python delegation is unverified"
+            else
+              printf '%s\n' "$wf" >> "$WORK/idtoken"
+            fi
+          fi
+        fi
         ;;
     esac
 
@@ -698,7 +809,7 @@ while IFS= read -r repo; do
     echo "$repo|$n_float uses: reference(s) not pinned to a commit, e.g. $eg" >> "$WORK/findings"
   fi
   if [ -s "$WORK/idtoken" ]; then
-    echo "$repo|id-token: write with nothing that mints a token, in: $(tr '\n' ' ' < "$WORK/idtoken" | sed 's/ $//')" >> "$WORK/findings"
+    echo "$repo|id-token: write with no known token consumer, in: $(tr '\n' ' ' < "$WORK/idtoken" | sed 's/ $//')" >> "$WORK/findings"
   fi
   if [ -s "$WORK/noperm" ]; then
     echo "$repo|public repository, pull_request workflow with no permissions block: $(tr '\n' ' ' < "$WORK/noperm" | sed 's/ $//')" >> "$WORK/findings"
