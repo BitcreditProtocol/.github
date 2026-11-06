@@ -54,7 +54,7 @@ jobs:
         run: test "$GITHUB_REF" = refs/heads/master
       - name: Read saved candidates and participant commits
         id: token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.AUTOMATION_APP_CLIENT_ID }}
           private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
@@ -90,7 +90,7 @@ jobs:
         run: python3 .github/scripts/nightly-candidate.py prepare candidate.json
       - name: Preserve the plan before build dispatches
         if: steps.plan.outputs.created == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: clowder-nightly-plan
           path: candidate.json
@@ -109,12 +109,12 @@ jobs:
       complete: ${{ steps.images.outputs.complete }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: clowder-nightly-plan
       - name: Read producer evidence
         id: read
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.AUTOMATION_APP_CLIENT_ID }}
           private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
@@ -135,7 +135,7 @@ jobs:
       - name: Scope build dispatches to the four producers
         if: env.DRY_RUN == 'false' && steps.inspect.outputs.dispatch_needed == 'true'
         id: write
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.WILDCAT_DEPLOYMENT_APP_CLIENT_ID }}
           private-key: ${{ secrets.WILDCAT_DEPLOYMENT_APP_PRIVATE_KEY }}
@@ -192,7 +192,7 @@ jobs:
         run: python3 .github/scripts/nightly-candidate.py images candidate.json images.json
       - name: Preserve images before deployment
         if: steps.images.outputs.complete == 'true' && steps.images.outputs.created == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: clowder-nightly-images
           path: images.json
@@ -220,15 +220,15 @@ jobs:
       actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: clowder-nightly-plan
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: clowder-nightly-images
       - name: Scope execution access to deployment
         id: token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.WILDCAT_DEPLOYMENT_APP_CLIENT_ID }}
           private-key: ${{ secrets.WILDCAT_DEPLOYMENT_APP_PRIVATE_KEY }}
@@ -244,7 +244,7 @@ jobs:
         run: python3 .github/scripts/nightly-operations.py deploy-intent candidate.json images.json dispatch-intent.json
       - name: Save dispatch intent before submitting the recipient
         if: steps.intent.outputs.created == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: clowder-dispatch-intent
           path: dispatch-intent.json
@@ -258,7 +258,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/nightly-operations.py deploy candidate.json images.json result.json
       - name: Save acceptance only after verified deployment and tests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: clowder-nightly-result-${{ github.run_attempt }}
           path: result.json
